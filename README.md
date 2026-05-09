@@ -13,12 +13,14 @@ tidy long-format CSVs suitable for spreadsheets, pandas, or plotting tools.
 ## Usage
 
 ```sh
-python3 solectrac-analyze.py file1.csv [file2.csv ...]
+python3 solectrac-analyze.py [-o OUTDIR] file1.csv [file2.csv ...]
 ```
 
-The script writes its outputs alongside the first input file, prints a
-per-file summary table (one row per input file), and prints a decoded
-catalog of every unique CAN ID it saw.
+The script writes its outputs into the current working directory by
+default, or into `OUTDIR` if `-o` / `--output-dir` is given (the
+directory is created if it doesn't exist). It prints a per-file summary
+table (one row per input file) and a decoded catalog of every unique
+CAN ID it saw.
 
 ## Input format
 

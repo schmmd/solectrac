@@ -3,14 +3,14 @@
 Decode J1939-style CAN logs from a small electric tractor BMS / charger.
 
 Usage:
-    python3 solectrac-analyze.py file1.asc [file2.blf ...]
+    python3 solectrac-analyze.py [-o OUTDIR] file1.asc [file2.blf ...]
 
 Inputs are read via python-can's LogReader, so any format python-can
 understands works: .asc (Vector ASCII), .blf, .log (canutils), .trc, and
 python-can's own .csv format. (SavvyCAN's CSV export is *not* supported
 because python-can doesn't read that dialect.)
 
-Outputs (written next to the inputs):
+Outputs (written into OUTDIR, default: current working directory):
     signals.csv   one tidy row per scalar measurement:
                   file, timestamp, frame_index, signal, value, unit
     frames.csv    one row per decoded frame (frames that produced >=1 signal):
@@ -91,6 +91,7 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
     Frame is suppressed entirely while charging (contactors open for traction).
 """
 
+import argparse
 import csv
 import sys
 from pathlib import Path
@@ -594,14 +595,22 @@ def summarize(counts: dict, rows: list):
 # --- main --------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) <= 1:
-        print(f"usage: {sys.argv[0]} file1.asc [file2.blf ...]",
-              file=sys.stderr)
-        print("supported formats: any python-can LogReader format "
-              "(.asc, .blf, .log, .trc, python-can .csv)", file=sys.stderr)
-        sys.exit(2)
-    inputs = [Path(a) for a in sys.argv[1:]]
-    out_dir = inputs[0].parent
+    parser = argparse.ArgumentParser(
+        description="Decode J1939-style CAN logs from a Solectrac tractor.",
+        epilog="supported formats: any python-can LogReader format "
+               "(.asc, .blf, .log, .trc, python-can .csv)",
+    )
+    parser.add_argument("inputs", nargs="+", metavar="FILE",
+                        help="CAN log file(s) to decode")
+    parser.add_argument("-o", "--output-dir", type=Path, default=Path.cwd(),
+                        metavar="DIR",
+                        help="directory to write output CSVs into "
+                             "(default: current working directory)")
+    args = parser.parse_args()
+
+    inputs = [Path(p) for p in args.inputs]
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
     frames = []
