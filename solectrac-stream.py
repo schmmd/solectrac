@@ -322,7 +322,7 @@ def render_pack(state: State, mains_v: float, efficiency: float,
     t.add_column(justify="left")
     t.add_column(justify="left")
 
-    t.add_row("V (est)", fmt(state.pack_v_est, "{:.2f}", "V", now))
+    t.add_row("voltage", fmt(state.pack_v_est, "{:.2f}", "V", now))
 
     pi = state.pack_i_a.value
     chgr_active = ((state.chgr_status.value or 0) != 0
@@ -337,7 +337,7 @@ def render_pack(state: State, mains_v: float, efficiency: float,
             i_text = Text(f"-{pi:.1f} A (drawing)", style="red")
         else:
             i_text = Text(f"{pi:.1f} A")
-    t.add_row("|I|", i_text)
+    t.add_row("current", i_text)
 
     if state.pack_v_est.value is not None and pi is not None:
         signed_i = pi if chgr_active else (-pi if state.vc_state_raw.value == 0x0C else pi)
