@@ -3,7 +3,12 @@
 Decode J1939-style CAN logs from a small electric tractor BMS / charger.
 
 Usage:
-    python3 parse_solectrac_can.py file1.csv [file2.csv ...]
+    python3 parse_solectrac_can.py file1.asc [file2.blf ...]
+
+Inputs are read via python-can's LogReader, so any format python-can
+understands works: .asc (Vector ASCII), .blf, .log (canutils), .trc, and
+python-can's own .csv format. (SavvyCAN's CSV export is *not* supported
+because python-can doesn't read that dialect.)
 
 Each input row is tagged with its source filename, so the output CSVs
 combine all captures into a single tidy long-format dataset that's easy
@@ -39,6 +44,12 @@ import csv
 import sys
 from pathlib import Path
 
+try:
+    import can
+except ImportError:
+    print("python-can is required: pip install python-can", file=sys.stderr)
+    sys.exit(1)
+
 # --- bus map -----------------------------------------------------------------
 SRC_BMS = 0xF3
 SRC_CHARGER = 0xE5
@@ -70,9 +81,8 @@ CHARGER_I_LSB_A = 0.1
 
 # --- helpers -----------------------------------------------------------------
 
-def parse_id(id_hex: str):
-    """Return (priority, pgn, source) from a 29-bit J1939 ID in hex."""
-    can_id = int(id_hex, 16)
+def parse_id(can_id: int):
+    """Return (priority, pgn, source) from a 29-bit J1939 ID."""
     src = can_id & 0xFF
     pf = (can_id >> 16) & 0xFF
     ps = (can_id >> 8) & 0xFF
@@ -116,11 +126,9 @@ def describe_pgn(pgn: int) -> str:
     return ""
 
 
-def describe_id(id_hex: str) -> dict:
+def describe_id(can_id: int, is_extended: bool) -> dict:
     """Decode a CAN ID (11- or 29-bit) into J1939 fields."""
-    can_id = int(id_hex, 16)
-    is_29bit = can_id > 0x7FF or len(id_hex.strip()) > 3
-    if not is_29bit:
+    if not is_extended:
         return {
             "id": f"{can_id:03X}",
             "ext": False,
@@ -159,16 +167,12 @@ def describe_id(id_hex: str) -> dict:
     }
 
 
-def data_bytes(row):
-    """Return 8 ints, padding with 0 for short or missing fields."""
-    out = []
-    for i in range(1, 9):
-        v = row.get(f"D{i}") or "00"
-        try:
-            out.append(int(v, 16))
-        except ValueError:
-            out.append(0)
-    return out
+def data_bytes(msg_data) -> list:
+    """Return 8 ints, padding with 0 for short payloads."""
+    out = list(msg_data)
+    while len(out) < 8:
+        out.append(0)
+    return out[:8]
 
 
 def be16(hi, lo):
@@ -183,31 +187,31 @@ def le16(lo, hi):
 
 def decode_file(path: Path, scenario: str, sinks: dict, counts: dict,
                 id_counts: dict):
-    """Stream one CSV; append decoded rows to the sinks dict in-place."""
+    """Stream one log via python-can; append decoded rows to sinks in-place."""
     sc = counts.setdefault(scenario, {
         "total": 0, "cells": 0, "temps": 0, "f100": 0, "f102": 0,
         "charger": 0, "vc": 0, "skipped_zero": 0, "extended_false": 0,
     })
 
-    with path.open() as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+    reader = can.LogReader(str(path))
+    try:
+        for msg in reader:
             sc["total"] += 1
-            id_hex = (row.get("ID") or "").strip()
-            if id_hex:
-                id_counts[id_hex] = id_counts.get(id_hex, 0) + 1
-            ext = (row.get("Extended") or "").strip().lower()
-            if ext == "false":
+            can_id = msg.arbitration_id
+            is_ext = bool(msg.is_extended_id)
+
+            # Track every unique (id, ext) pair we see.
+            id_key = (can_id, is_ext)
+            id_counts[id_key] = id_counts.get(id_key, 0) + 1
+
+            if not is_ext:
                 # 11-bit IDs aren't J1939; leave them out of the BMS decode.
                 sc["extended_false"] += 1
                 continue
-            try:
-                _, pgn, src = parse_id(row["ID"])
-            except (KeyError, ValueError):
-                continue
 
-            ts = row.get("Time Stamp", "")
-            data = data_bytes(row)
+            _, pgn, src = parse_id(can_id)
+            ts = msg.timestamp                # seconds, float
+            data = data_bytes(msg.data)
 
             if src == SRC_BMS:
                 if PGN_CELL_FIRST <= pgn <= PGN_CELL_LAST:
@@ -288,6 +292,12 @@ def decode_file(path: Path, scenario: str, sinks: dict, counts: dict,
                     i_raw, round(i_raw * CHARGER_I_LSB_A, 1),
                 ))
                 sc["charger"] += 1
+    finally:
+        if hasattr(reader, "stop"):
+            try:
+                reader.stop()
+            except Exception:
+                pass
 
 
 # --- writers / summary -------------------------------------------------------
@@ -335,8 +345,8 @@ def write_ids(id_counts: dict, out_dir: Path):
     """Emit the per-unique-ID J1939 decode table as ids.csv and stdout."""
     path = out_dir / "ids.csv"
     decoded = []
-    for id_hex, n in id_counts.items():
-        d = describe_id(id_hex)
+    for (can_id, is_ext), n in id_counts.items():
+        d = describe_id(can_id, is_ext)
         decoded.append((d, n))
     # Sort: 29-bit before 11-bit, then by numeric ID value.
     decoded.sort(key=lambda dn: (not dn[0]["ext"], int(dn[0]["id"], 16)))
@@ -405,8 +415,10 @@ def summarize(counts: dict, sinks: dict):
 
 def main():
     if len(sys.argv) <= 1:
-        print(f"usage: {sys.argv[0]} file1.csv [file2.csv ...]",
+        print(f"usage: {sys.argv[0]} file1.asc [file2.blf ...]",
               file=sys.stderr)
+        print("supported formats: any python-can LogReader format "
+              "(.asc, .blf, .log, .trc, python-can .csv)", file=sys.stderr)
         sys.exit(2)
     inputs = [Path(a) for a in sys.argv[1:]]
     out_dir = inputs[0].parent
