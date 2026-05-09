@@ -1,10 +1,8 @@
-# parse_solectrac_can
+# solectrac-analyze
 
 A small, dependency-free Python 3 script that decodes J1939 CAN-bus logs
 exported from a Solectrac electric tractor's diagnostic port and writes
 tidy long-format CSVs suitable for spreadsheets, pandas, or plotting tools.
-
-For findings specific to the captures in this directory, see `NOTES.txt`.
 
 ## Requirements
 
@@ -15,7 +13,7 @@ For findings specific to the captures in this directory, see `NOTES.txt`.
 ## Usage
 
 ```sh
-python3 parse_solectrac_can.py file1.csv [file2.csv ...]
+python3 solectrac-analyze.py file1.csv [file2.csv ...]
 ```
 
 The script writes its outputs alongside the first input file, prints a
@@ -71,7 +69,7 @@ The Parameter Group Number (PGN) is reconstructed as:
 * PDU1: `PGN = (DP << 16) | (PF << 8)` (DA is **not** part of the PGN).
 * PDU2: `PGN = (DP << 16) | (PF << 8) | PS`.
 
-The script's `describe_id()` helper performs this decoding for every unique
+The script's `decode_can_id()` helper performs this decoding for every unique
 ID it sees, populating the `ids.csv` catalog.
 
 ## Decoders
@@ -79,7 +77,7 @@ ID it sees, populating the `ids.csv` catalog.
 The parser has decoders for a fixed set of PGN/source combinations. Each
 decoder produces rows in the corresponding output CSV. The list of
 recognized PGNs and their source addresses lives in constants near the top
-of `parse_solectrac_can.py`:
+of `solectrac-analyze.py`:
 
 * Cell-voltage PGN window: `PGN_CELL_FIRST` … `PGN_CELL_LAST`.
 * Module-temperature PGN window: `PGN_TEMP_FIRST` … `PGN_TEMP_LAST`.
