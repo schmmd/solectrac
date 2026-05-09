@@ -515,7 +515,7 @@ def render_motor(state: State, now: float) -> Panel:
         t.add_row("throttle", Text("---", style="dim"))
     else:
         # Approximate full-scale 0x34 = 52 raw seen in captures.
-        pct = min(100, int(round(thr * 100 / 52)))
+        pct = int(round(thr * 100 / 52))
         bar_w = 20
         filled = int(round(pct * bar_w / 100))
         bar = Text("█" * filled + "░" * (bar_w - filled))
