@@ -26,8 +26,14 @@ Tractor / pack context
     - Rated discharge current: 300 A
     - Rated DC charge: 78 A
     - Rated AC charge: 39 A
-* SOC at time of capture: ~40% (operator-reported).
+* SOC at time of capture: ~40% (operator-reported) for the original
+  recorded-data/*.csv set, ~100% for the asc/*.asc set.
 * Ambient: ~55 °F (~13 °C); tractor was outdoors.
+* Drive-train state: all asc/*.asc captures were taken with the tractor
+  in **neutral**. "Full throttle" in those filenames refers to throttle
+  pedal position, not actual mechanical load on the wheels — so they
+  do NOT exercise high traction current and cannot disambiguate
+  current-scale candidates that differ by 10× (see F100 byte 4).
 * The PTO/drive inverter and motor controller do **not** appear on the bus
   we logged. The diagnostic port we tapped is the BMS/charger CAN bus
   (sometimes called the "accessory" or "vehicle" bus). The dashboard is
@@ -57,6 +63,25 @@ Captures used
                       generating at the same time. Not part of the BMS/
                       charger conversation we're trying to characterize.
 
+A second batch of captures (Vector ASC format, in `asc/`), taken at
+~100% SOC with the tractor in neutral, is also referenced below:
+
+* `normal-ignition.asc`           — wake-up baseline, no charger.
+* `ignition-with-charger-inserted.asc` — wake-up with charger plug
+                                          inserted in the tractor's
+                                          charge port BUT no AC power
+                                          to the charger. Useful for
+                                          isolating "charger detected"
+                                          flags vs. "actively charging".
+* `full-throttle.asc`             — throttle pedal pressed, in neutral.
+* `full-throttle-hydraulics.asc`  — full throttle plus hydraulics
+                                     actuated; tractor still in neutral.
+* `accellerate-decelerate.asc`    — varying throttle, in neutral.
+
+Unlike the recorded-data/*.csv captures, the ASC files carry real
+microsecond-resolution per-frame timestamps, which unblocks all
+time-domain analysis (rate, dV/dt, integrated current, etc.).
+
 
 Source-address (SA) map observed in these captures
 --------------------------------------------------
@@ -71,9 +96,18 @@ Source-address (SA) map observed in these captures
 | 0xD0 | Vehicle controller / dashboard accessory | Periodic F100D0 heartbeat;     |
 |      |                                          | byte-0 transitions 0x00 → 0x0C |
 |      |                                          | at wake-up.                    |
-| 0xCA | Sender of DM1 (FECA) frames              | DM1 payloads observed but no   |
-|      |                                          | active SPN/FMI codes set.      |
-| 0x12 | Sender of FF21 proprietary B traffic     | Function unknown.              |
+| 0xCA | Diagnostic / gateway controller          | Sends DM1 (FECA) AND a high-   |
+|      |                                          | rate FF21 status stream        |
+|      |                                          | (~85 Hz, 1900+ unique payloads |
+|      |                                          | per minute). DM1 stays empty   |
+|      |                                          | (no active SPN/FMI codes) even |
+|      |                                          | while the dashboard is showing |
+|      |                                          | numeric error codes — see      |
+|      |                                          | "Dashboard error codes" below. |
+| 0x12 | Sender of FF21 proprietary B traffic     | Function unknown; constant     |
+|      |                                          | payload `01 00 00 00 00 00 00  |
+|      |                                          | 00`. Distinct from FF21 from   |
+|      |                                          | 0xCA despite sharing a PGN.    |
 | 0x41 | Address-claim type frame                 | Few frames; not analyzed.      |
 
 
@@ -143,16 +177,61 @@ F102F3 — "BMS cell min/max summary"
     all in recorded-data/charging.csv).
 
 F100F3 — "BMS pack status (incl. |I|)"
-    * Bytes 2..3: a 16-bit field that scales like a pack-voltage proxy.
-      Magnitude is plausible but the exact LSB is TENTATIVE.
-    * Byte 4: pack-current magnitude at 0.1 A/bit — this is the |I|
-      reading the script labels as "pack current". CONFIRMED for
-      magnitude (matches charger current during charging within
-      rounding); the *sign* (charge vs discharge) is **not** carried in
-      this byte. Direction must be inferred from context (vehicle state,
-      charger active, etc.) until we identify the sign bit.
-    * Other bytes likely include SOC/SOH/temperature summaries; not yet
-      decoded.
+    Across the 5 asc/*.asc captures (idle, charger-inserted, full-throttle
+    drive in neutral, full-throttle + hydraulics in neutral, accelerate/
+    decelerate in neutral) the byte structure is:
+
+      byte 1 (data[0]): 0x03                  — constant
+      byte 2 (data[1]): 0x3E..0x41            — varies INVERSELY with load;
+                                                 highest at idle (0x41),
+                                                 lowest under full throttle
+                                                 + hydraulics (0x3E).
+                                                 Voltage-proxy candidate.
+      byte 3 (data[2]): 0x7D..0x7E            — near-constant.
+      byte 4 (data[3]): 0x00..0xA8 (0..168)   — load-correlated. The |I|
+                                                 candidate.
+      byte 5 (data[4]): 0xFA                  — constant. = 250 raw.
+      byte 6 (data[5]): 0xFA                  — constant. = 250 raw.
+      byte 7 (data[6]): 0x14                  — constant. = 20, the
+                                                 SERIES CELL COUNT.
+                                                 Cross-check on topology.
+      byte 8 (data[7]): 0x00                  — constant.
+
+    Notes per byte:
+
+    * Bytes 2..3: byte 2 alone steps once per ~0.1 V of pack sag, byte 3
+      barely changes. Treat (byte 2 * 0x100 + byte 3) as a 16-bit BE
+      voltage proxy — but the response under load does not fit a simple
+      single-LSB linear scaling, so the encoding is more involved than
+      "raw / k = volts" and is still TENTATIVE.
+
+    * Byte 4: pack-current magnitude. The raw value tracks load
+      qualitatively (highest in accel/decel, lowest at idle). The LSB
+      is still ambiguous:
+        - 0.1 A/bit → 0..16.8 A across all captures. Consistent with
+          previous driving/dph captures (~1 kW peak). Plausible.
+        - 1.0 A/bit → 0..168 A. Implausible for this small EV tractor
+          when in neutral on a hard surface, but possible scaling for
+          actual loaded operation.
+      All asc/*.asc captures were in NEUTRAL, so they do NOT pull real
+      traction current and cannot distinguish 0.1 from 1.0 A/bit.
+      Status: TENTATIVE pending an in-gear capture under load.
+
+    * Bytes 5..6 (both 0xFA = 250): constant across every capture
+      regardless of state. Hypothesis: BMS-published charge / discharge
+      current limits in the same units as byte 4. If byte 4 is 0.1 A/bit
+      then bytes 5 and 6 represent 25.0 A limits — consistent with a BMS
+      that is intentionally clamping current on this bus while reserving
+      the higher 300 A drivetrain limit for the (un-tapped) drive bus.
+      TENTATIVE.
+
+    * Byte 7 = 0x14 (20): matches the series cell count exactly. Either
+      the BMS broadcasts cell count as a sanity field here, or it
+      coincidentally tracks. Across these 5 captures it never changes.
+
+    * Sign: byte 4 carries magnitude only. No bit obviously flips between
+      idle/charger-inserted/driving captures that would code charge-vs-
+      discharge. Still UNKNOWN.
 
 F104F3 — "BMS temp min/max summary"
     Pack-wide hottest/coldest module-temperature summary, analogous to
@@ -160,15 +239,54 @@ F104F3 — "BMS temp min/max summary"
 
 F106F3 — "BMS state (charger-dependent)"
     Periodic frame whose contents differ between idle, driving, and
-    charging captures. Likely BMS state machine + flags. Not decoded.
+    charging captures. Likely BMS state machine + flags. Across the
+    asc/*.asc captures (all 100% SOC, all neutral):
+      * driving captures (full-throttle, ft+hyd, accel/decel):
+          b0=0x45  b1=0xE0  b2=0xFC  b3..b7=0xFF
+      * ignition-with-charger-inserted:
+          b0=0x80  b1=0xC4  b2=0xFC  b3..b7=0xFF
+      * normal-ignition (during wake-up): b0 transitions through
+          0x00, 0x80, 0x45 over the boot sequence.
+    Strong "BMS-side running mode" candidate — pairs with the F100D0
+    byte-0 mode field on the VC side. Vocabulary so far:
+      * 0x00 → init/boot
+      * 0x80 → standby / charger-detected
+      * 0x45 → ready / driving
+    More states (Calibrating, Charging, Discharging, Fault, Sleep)
+    expected per the vendor GUI. TENTATIVE.
 
 F107F3 — "BMS current/voltage limits"
-    Looks like the standard J1939 BMS "limits" frame (charge current
-    limit, discharge current limit, voltage limits). Bytes are stable
-    when SOC is stable, change near limits. Not decoded.
+    Standard J1939 BMS "limits" frame layout (charge current limit,
+    discharge current limit, voltage limits). Now with byte-level
+    state evidence from asc/*.asc:
+      * driving:          38 A4 27 10 01 76 00 00
+      * charger-inserted: 27 10 27 10 00 00 00 00
+    Observations:
+      * bytes 2..3 = 0x2710 = 10000 in EVERY capture — almost certainly
+        a J1939 "not-available" sentinel (10000 in 0.1 A/bit units is
+        suspicious; 0xFFFF would be the more conventional sentinel).
+      * bytes 0..1 are 0x2710 (= 0 effective limit) when charger is
+        inserted but vehicle isn't moving, and 0x38A4 (= 14500) when
+        driving. A current-limit field that goes from "no current
+        allowed" to "1450 A allowed" would make sense for a high-power
+        traction LSB; 0.1 A/bit gives 0 → 1450 A which matches the
+        300 A pack rating with margin. TENTATIVE.
+      * bytes 4..5 are 0x0176 = 374 driving, 0x0000 charger-inserted.
+        374 × 0.2 V/bit = 74.8 V, very close to the rated nominal
+        72 V — plausibly a voltage limit / HV cutoff. TENTATIVE.
+    Confirming this requires a charge capture from low SOC where the
+    BMS will publish meaningful charge-current limits.
 
 F108F3 — "BMS aux status"
-    Auxiliary/contactor/heater status flags. Not decoded.
+    Auxiliary/contactor/heater status flags. Across asc/*.asc:
+      * driving / normal-ignition (steady): 10 00 04 00 00 00 00 01
+      * ignition-with-charger-inserted:     10 00 04 00 00 00 00 B9
+    Byte 7 changes from 0x01 (no charger) to 0xB9 (charger inserted).
+    Strong "charger-detected / contactor-state" flag candidate. The
+    bit pattern 0xB9 = 1011_1001 likely encodes multiple flags
+    simultaneously (charger present, charger inhibit, BMS at-100%-SOC,
+    etc.) — they all changed together because conditions changed
+    together. TENTATIVE.
 
 
 PGN decode notes (charger, SA = 0xE5)
@@ -182,6 +300,108 @@ FF50E5 — "Charger telemetry (V, A)"
       * bytes 3..4 (LE u16) = output current at 0.1 A/bit
     CONFIRMED for V and A magnitudes during charging; status byte
     semantics (beyond "0 = idle") are TENTATIVE.
+
+    Refinement from ignition-with-charger-inserted.asc: with the
+    charger plug physically inserted in the tractor's port BUT no AC
+    mains supplied to the charger, FF50E5 still beacons at ~10 Hz
+    (27 frames over 27 s) with status = 0x00, v_raw = 2 (~0.7 V),
+    i_raw = 2048 (constant). Separately, in normal-ignition.asc
+    (no charger connected at all) the charger module ALSO beacons
+    during wake-up, with status briefly cycling 0x00 → 0x01 → 0x02
+    and v_raw / i_raw sweeping nonsensical values (84 V, 700 A) for
+    a few frames. These are charger-module self-test artifacts, NOT
+    real bus readings — they will inflate the parser summary's V/I
+    range unless filtered by ignition completion. So:
+      * status = 0x00 means "not actively charging" — does NOT
+        distinguish "charger absent" from "charger present but not
+        powered" from "charger present, AC live, but BMS-inhibited
+        at 100% SOC". Charger-presence detection therefore lives
+        elsewhere (current best candidate: F108F3 byte 7).
+      * The ~constant i_raw = 2048 with no AC power is sensor offset /
+        zero baseline, not a real current. Don't trust low-magnitude
+        FF50 current readings unless status is nonzero.
+
+
+Dashboard error codes (102, 109, 140) — NOT in the broadcast traffic
+--------------------------------------------------------------------
+
+Operator reports that the tractor's display showed numeric BMS error
+codes 102, 109, and 140 during most of the asc/*.asc recording session
+(all of which were taken at 100% SOC). A targeted byte-level search
+across the 5 captures finds the literal values 0x66, 0x6D, 0x8C in
+exactly three places, none of which is an error-code stream:
+
+* F100F3 byte 4 (the |I| magnitude): byte ranges 0..168 across the
+  captures, so 102/109/140 appear as ordinary mid-range current
+  readings. Coincidental.
+
+* FF50E5 byte 1 in normal-ignition.asc: a single-frame hit on 0x8C
+  during the charger-module self-test sweep at wake-up. Coincidental.
+
+* FF21CA byte 2: this looked promising at first because the user-
+  reported codes all show up here — but FF21CA carries **1914 unique
+  payloads in 48 s** (~85 Hz, byte 2 sweeping continuously over
+  ~0x37..0xD0), so 102/109/140 are not distinguished from any other
+  value byte 2 takes. FF21CA is some high-rate status / measurement
+  broadcast, not a discrete error stream.
+
+What 0xCA *is* broadcasting on the standard diagnostic channel:
+
+* DM1 (PGN FECA from SA 0xCA) is being transmitted continuously, but
+  with payload `00 00 00 00 00 00 FF FF` — the SAE J1939-encoded
+  representation of "no active diagnostic trouble codes". That is,
+  while the dashboard is displaying error codes, the BMS is *also*
+  advertising via the standard channel that it has no active codes.
+  These two facts are not consistent under any straightforward model
+  where the BMS is the source of truth for the codes.
+
+Most likely explanations, in rough order of plausibility:
+
+1. **The codes are dashboard-synthesized, not BMS-broadcast.** The
+   dashboard sees the same FF21CA / F1xx telemetry we do and
+   independently computes "code 102 / 109 / 140" based on local
+   thresholds (e.g., a 100%-SOC + voltage-band combination). The BMS
+   itself doesn't know there's a "code"; that's why DM1 is empty.
+   This would mean the codes will never appear on the bus regardless
+   of what we capture passively.
+
+2. **The codes live on the un-tapped drivetrain bus.** The dashboard
+   is almost certainly a gateway between this bus and a second CAN
+   segment we haven't tapped yet. The codes might be broadcast there
+   (by the motor controller, traction inverter, or another ECU).
+
+3. **The codes are stored in the BMS but only reported by request.**
+   Standard J1939 has DM2 (previously-active DTCs, broadcast) and
+   DM4/DM7 (request/response for specific DTCs). None of those are
+   present in the asc captures because no client is querying them.
+   The dashboard might issue these requests internally on a tap point
+   we don't see, or via a vendor UDS/KWP2000 service we'd have to
+   trigger explicitly.
+
+4. **The codes are encoded in a multi-byte field of an existing
+   broadcast PGN that we haven't decoded.** Possible candidates:
+   F104F3 (constant payload `3A 38 06 01 02 FF FF FF` — the leading
+   `3A 38` ≈ 58 / 56 doesn't match the reported codes, but the field
+   semantics are unknown), or F108F3 byte 7 (`0x01` normal,
+   `0xB9` with charger inserted — 0xB9 = 185, not a reported code,
+   but this byte clearly carries flag bits we haven't decoded). None
+   of these PGNs *literally contain* 102/109/140, but a bit-mask
+   interpretation could in principle decode to those ordinal IDs.
+
+To pin this down, the next capture should ideally:
+
+* Be triggered specifically while one of the codes is on the display
+  (not just "during a session where they appeared at some point").
+* Cover an explicit clear/cycle of the code on the dashboard (key off
+  or whatever the operator menu offers) so we can see what frame
+  changes contemporaneously.
+* Optionally, send DM2 / DM7 request frames from the logger
+  (1806CAxx with the right payload) and capture any responses. This
+  is active, not passive, so it's a different kind of test.
+
+Until then: status of the codes' on-bus encoding is **UNKNOWN**, and
+the dashboard's display of them does NOT prove the BMS broadcasts
+them.
 
 
 PGN decode notes (vehicle controller, SA = 0xD0)
@@ -269,8 +489,14 @@ Decoder errata exposed by the screenshot:
   CONFIRMED to TENTATIVE pending that check.
 
 
-Source-CSV timestamp column is unusable
----------------------------------------
+Source-CSV timestamp column is unusable (recorded-data/*.csv only)
+-----------------------------------------------------------------
+
+This section applies only to the original SavvyCAN-style CSVs in
+`recorded-data/`. The newer `asc/*.asc` captures (Vector ASC format)
+do carry real per-frame microsecond timestamps and are not affected.
+
+
 
 The "Time Stamp" column in recorded-data/*.csv is essentially a single
 constant value across an entire capture (e.g. `62336000` is shared by
@@ -311,6 +537,16 @@ Confirmed quantitative findings
   draw on the order of ~1.8 kW. The mean of dph.csv is *lower* than
   driving.csv only because dph.csv includes more idle/parked time —
   per-event peaks are higher in dph.
+* 100% SOC reference (asc/*.asc): all 5 captures show cell means
+  in the 4153–4165 mV band (8–12 mV cell-to-cell within a single
+  capture; 6–8 mV F102 spread). Pack-V estimate (20 × cell mean):
+    - idle / no charger:       83.29 V
+    - charger inserted, no AC: 83.31 V
+    - full throttle (neutral): 83.22 V
+    - accel/decel (neutral):   83.18 V
+    - full thr + hyd (neutral):83.06 V
+  The 0.25 V sag from idle to highest load is the cleanest pack-V
+  load response we have on this dataset.
 * Charging (charging.csv): charger output on the order of ~1.5 kW into
   the pack at this SOC. Pack |I| reported by F100 byte 4 matches
   charger current from FF50E5 within rounding, which is what cross-
@@ -328,13 +564,31 @@ Open questions / future work
 
 * F100 bytes 2..3 voltage scaling — the LSB is TENTATIVE. Capturing a
   full charge from low SOC to 100% should let us pin it down by fitting
-  to the known charger voltage from FF50.
+  to the known charger voltage from FF50. The asc/*.asc captures show
+  this field tracking pack sag inversely with load, but a single LSB
+  doesn't fit the response — encoding may be multi-component.
 * Pack-current sign — F100 byte 4 is magnitude only. Look for a sign
   bit elsewhere in F100 (possibly in the status/flags byte) or for
-  sign in F107/F108.
-* F106 / F107 / F108 byte-level decoding — not yet attempted. Compare
-  values across charging-vs-idle-vs-driving captures to isolate which
-  byte is which.
+  sign in F107/F108. The asc/*.asc captures didn't surface an obvious
+  sign bit.
+* F106 / F107 / F108 byte-level decoding — partial progress from the
+  asc/*.asc captures. F106 byte 0 is the running-mode candidate
+  (0x00/0x80/0x45 vocabulary observed). F107 fits the standard J1939
+  "limits" frame layout (current/voltage limits, with 0x2710 as a
+  sentinel). F108 byte 7 is the charger-detected flag candidate
+  (0x01 normal, 0xB9 with charger inserted). All TENTATIVE and need
+  charge-from-low-SOC and in-gear-under-load captures to confirm.
+* Dashboard error codes (102, 109, 140 ...) — chase down where these
+  are coming from. Suggested experiments:
+    - Capture again with a single code freshly triggered on the
+      display, then key-cycle to clear it; look for any frame whose
+      bytes change in lockstep. (Passive; cheap.)
+    - Issue J1939 DM2 (previously-active DTCs) and DM7 (request a
+      specific DTC) requests from a CAN tool and capture responses.
+      DM7 in particular lets you ask the BMS specifically about
+      codes 102/109/140. (Active; requires a transmit-capable tool.)
+    - If neither shows results, the codes are almost certainly
+      either dashboard-synthesized or on the drivetrain bus.
 * Drivetrain bus — find the second CAN connector. The dashboard
   receives RPM/motor telemetry that is *not* on this bus, so there is
   another CAN segment somewhere on the vehicle. Plausible options:
@@ -343,23 +597,30 @@ Open questions / future work
     - a backshell tap on the dash harness
   Once tapped, expect to see SAE-standard PGNs like 61444 (EEC1, RPM),
   65262 (Engine Temperature), and similar.
-* Full-SOC capture — operator agreed to capture a continuous file at
-  100% SOC. That data should refine the cell-voltage range and
-  validate the pack-voltage scaling.
+* Full-SOC capture — DONE. Five asc/*.asc captures at 100% SOC are
+  now in `asc/`. Established cell-voltage band (~4.16 V/cell) and
+  pack-V band (~83.2 V) at full SOC; provided the first byte-level
+  state evidence on F106 / F107 / F108. All in-neutral, so do NOT
+  validate F100 byte-4 current LSB under high traction load — that
+  open question survives.
 * Confirm whether dashboard is the bus gateway, or whether a dedicated
   gateway ECU sits between the two segments. Either is plausible.
 * Identify the BMS vendor via the Escorts trail. The GUI's
   "ESCORTS-INTERNAL" classification narrows the candidate OEM list
   considerably; locating a protocol PDF would close out most TENTATIVE
   items at once.
-* Re-record with real per-frame timestamps. The current source CSVs'
-  "Time Stamp" column is effectively constant, blocking all
-  time-derivative analysis (see "Source-CSV timestamp column is
-  unusable" section). Find the toggle in whichever logger produced
-  these files, or switch loggers, before the next capture session.
+* Real per-frame timestamps — DONE for the asc/*.asc batch. Vector
+  ASC format carries microsecond-resolution monotonic timestamps,
+  so all time-domain analyses (rate, dV/dt, integrated Ah, frame
+  pacing) are now possible on those captures. Original recorded-
+  data/*.csv files remain unusable for time-derivative analysis.
 * Re-validate F100 byte 4 current scaling against a capture that
   actually pulls high traction current. The 0.1 A/bit assumption is
   inconsistent with the 300 A rated discharge limit if byte 4 is uint8.
+  asc/*.asc captures were all in NEUTRAL so they do not help here —
+  byte 4 stayed in the 0..168 range that's consistent with either
+  scaling. Need an in-gear capture pulling actual load (towing,
+  tilling, climbing a grade, etc.) to disambiguate.
 * Hunt SOC / SOH / alarms in F104 / F106 / F107 / F108. The vendor
   GUI snapshot gave us a vocabulary (LowSoc lvl 2, Calibrating,
   KL15, etc.) but not enough states to disambiguate byte positions
@@ -381,25 +642,51 @@ CONFIRMED:
     F102 byte6 = min-cell number, 1-based
     pack-V estimate formula (20 × mean cell mV) cross-validates against
         the GUI's displayed pack voltage
+    100% SOC reference: ~4.16 V/cell, pack ~83.2 V, F102 spread 6–8 mV
+    FF50 status = 0x00 means "not actively delivering charge" — does
+        NOT distinguish "charger absent" from "charger inserted but
+        unpowered" (charger module beacons either way at low values)
+    Vector ASC files carry real per-frame timestamps; recorded-data
+        SavvyCAN CSVs do not.
 
 TENTATIVE / GUESSED:
     F102 byte 8 (flags) semantics
-    F100 voltage scaling (bytes 2..3)
-    F100 byte 4 current scaling — matched charger current during
-        charging.csv at 0.1 A/bit, but inconsistent with the 300 A
-        rated discharge limit if byte 4 is uint8. Re-check with a
-        capture that draws real traction load; likely either a
-        larger LSB or a 16-bit field instead.
+    F100 voltage scaling (bytes 1..2 BE) — single-LSB linear fit fails
+    F100 byte 4 current scaling — 0.1 A/bit fits all in-neutral data
+        within plausible power numbers, but cannot be promoted past
+        TENTATIVE without a capture under real traction load.
+    F100 bytes 5..6 = 0xFA constants — likely BMS-published current
+        limits (25.0 A discharge / 25.0 A charge if byte-4 LSB is
+        0.1 A/bit), but unconfirmed.
+    F100 byte 7 = 0x14 constant: probably the series cell count.
     FF50 status-byte semantics beyond 0/nonzero
-    All of F104 / F106 / F107 / F108
+    F106 byte 0 running-mode vocabulary: 0x00 init, 0x80 standby/
+        charger-detected, 0x45 ready/driving — partial.
+    F107 limits-frame layout: bytes 0..1 = current limit (sentinel
+        0x2710 when zero, 0x38A4 = 14500 when driving), bytes 4..5
+        = voltage limit (0x0176 = 374 → ~74.8 V). LSBs unconfirmed.
+    F108 byte 7 = charger-detected / contactor-state flag candidate
+        (0x01 normal, 0xB9 with charger inserted unpowered).
 
 UNKNOWN:
-    pack-current sign
+    pack-current sign (none of the 5 new captures showed an obvious
+        sign-bit candidate either)
     SOC / SOH host PGN
     alarm word location (screenshot showed "LowSoc lvl 2")
+    dashboard numeric error codes (102, 109, 140 etc.) — operator
+        observed them on the display during the asc/*.asc session,
+        but they do NOT appear as a distinct error-code field in
+        any broadcast frame; DM1 is empty throughout. Most likely
+        dashboard-synthesized or on the drivetrain bus. See
+        "Dashboard error codes" section.
     KL15 / wake-up status bit location
-    full enumeration of running-mode codes (at least Calibrating, plus
-        init/ready already known on F100D0)
-    SA 0x12 / 0xCA roles beyond the surface descriptions above
+    F104 byte-level decoding (temp min/max summary)
+    FF21CA byte-level decoding — high-rate (~85 Hz) status stream
+        with byte 2 sweeping ~0x37..0xD0 during driving and pinned
+        at 0x80 at idle; signal type unidentified.
+    full enumeration of running-mode codes (Calibrating, Charging,
+        Discharging, Fault, Sleep all still missing)
+    SA 0x12 role beyond emitting a constant FF21 payload
     everything on the (un-tapped) drivetrain bus
-    why the source CSV "Time Stamp" column is effectively constant
+    why the recorded-data/*.csv "Time Stamp" column is effectively
+        constant (orthogonal to ASC having real timestamps)
