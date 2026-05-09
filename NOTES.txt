@@ -105,8 +105,9 @@ Source-address (SA) map observed in these captures
 | 0xCA | Motor controller / drive ECU             | Sends DM1 (FECA) AND high-rate |
 |      |                                          | FF21 motor telemetry (~85 Hz). |
 |      |                                          | RPM, throttle, ctrl temp, and  |
-|      |                                          | drive-enabled flag all live in |
-|      |                                          | FF21CA — see decode section.   |
+|      |                                          | directional pedal selector all |
+|      |                                          | live in FF21CA — see decode    |
+|      |                                          | section.                       |
 |      |                                          | FF21CA frame is *suppressed*   |
 |      |                                          | entirely while charging        |
 |      |                                          | (contactors open for traction).|
@@ -375,10 +376,15 @@ FF21CA — "Motor telemetry (RPM, throttle, drive state, ctrl temp)"
                                                  54 → 14 °C). Near
                                                  ambient throughout.
       byte 7 (data[6]): 0x00                  — constant.
-      byte 8 (data[7]): 0x14 driving / 0x00   — drive-enabled flag.
-                                                 0x14 (= 20) once the
-                                                 drive-side is up; 0x00
-                                                 during early boot.
+      byte 8 (data[7]): directional pedal selector.
+                                                 0x10 (16) = idle / neither
+                                                              pedal pressed.
+                                                 0x14 (20) = forward pedal
+                                                              pressed.
+                                                 0x18 (24) = reverse pedal
+                                                              pressed.
+                                                 CONFIRMED — see "Direction
+                                                 encoding" below.
 
     RPM — CONFIRMED:
 
@@ -401,10 +407,49 @@ FF21CA — "Motor telemetry (RPM, throttle, drive state, ctrl temp)"
             at every multiple-of-256 RPM boundary, exactly as a 16-bit
             value should.
 
-      The 0x0C80 bias is the controller's "zero RPM" sentinel —
-      could be an offset-binary convention to allow signed values
-      (e.g. for reverse rotation) without using a signed type, or
-      simply a configuration constant.
+      The 0x0C80 bias is the controller's "zero RPM" sentinel.
+      In practice the field appears to be **magnitude only** — see
+      "Direction encoding" below — so values below 0x0C80 (which would
+      represent negative / reverse rotation under an offset-binary
+      reading) are not actually emitted, even when the operator
+      drives in reverse. Reverse direction is signaled instead by
+      data[7]; the 0x0C80 offset is best understood as a fixed
+      configuration constant rather than a true signed-value zero.
+
+    Direction encoding — CONFIRMED:
+
+      data[7] selects the directional pedal that the operator is
+      pressing. The Solectrac e25 has a dual-pedal "shuttle" layout —
+      one pedal for forward, one for reverse — and FF21CA byte 8
+      reports which (if any) is currently depressed:
+
+          0x10 (16)  idle / neither pedal pressed
+          0x14 (20)  forward pedal pressed
+          0x18 (24)  reverse pedal pressed
+
+      Verified against driving.asc, where the operator reported
+      backing out of a parking spot before pulling forward. The
+      capture has exactly three transitions:
+
+          t=  1.08 s   data[7] = 0x10 (idle)        boot complete
+          t= 15.93 s   0x10 → 0x18 (REVERSE pedal)  back-out begins
+          t= 55.29 s   0x18 → 0x10 (idle)           reverse pedal released
+          t= 55.79 s   0x10 → 0x14 (FORWARD pedal)  forward driving
+
+      Phase statistics across the full capture match the maneuver:
+        idle (b7=0x10): RPM ≈ 0,   throttle ≈ 0..3 except at the
+                       brief pedal-swap moment around t=55.3 s.
+        reverse (0x18): RPM 0..1369, throttle up to 72; lower top
+                       speed consistent with creeping out of the
+                       parking spot.
+        forward (0x14): RPM 0..2529, throttle up to 82; full
+                       sustained driving.
+
+      data[2..3] LE - 0x0C80 stays non-negative throughout — the
+      motor controller reports rotational *magnitude*, with sign
+      determined separately by data[7]. Treat the decoded RPM as
+      "speed" and form a signed value as `direction × |rpm|` if
+      direction-aware analysis is needed.
 
     Frame suppression: FF21CA does not appear at all in
     ignition-with-charger-inserted.asc. Motor controller goes silent
@@ -798,8 +843,12 @@ CONFIRMED:
         ~0x34. Sweeps with operator pedal input and leads the RPM ramp.
     FF21CA byte 6 (data[5]) = motor controller temperature, J1939
         +40 °C offset (53 → 13 °C). Near ambient in all captures.
-    FF21CA byte 8 (data[7]) = drive-enabled flag (0x14 driving,
-        0x00 during early boot before drive comes up).
+    FF21CA byte 8 (data[7]) = directional pedal selector:
+        0x10 = idle / neither pedal, 0x14 = forward pedal, 0x18 =
+        reverse pedal. Verified against driving.asc transitions
+        matching the operator's reverse-then-forward maneuver.
+    FF21CA RPM is a magnitude (always ≥ 0); reverse is signaled by
+        data[7] = 0x18, not by a sub-bias value in data[2..3].
     FF21CA frame is suppressed entirely while charging — motor
         controller goes silent when contactors are open for traction.
 
@@ -829,11 +878,6 @@ TENTATIVE / GUESSED:
         (0x01 normal, 0xB9 with charger inserted unpowered).
     FF21CA byte 5 (data[4], three-state field 0x28 / 0x3B / 0x3C) —
         not yet attributed to a specific signal.
-    FF21CA RPM bias of 0x0C80 — likely an offset-binary convention
-        to allow signed values (e.g. for reverse rotation), but
-        we have not captured a reverse-direction case to confirm
-        whether values below the bias represent reverse RPM or are
-        simply unused.
 
 UNKNOWN:
     F100 byte 4's actual signal source (clearly NOT pack current; what
@@ -860,8 +904,8 @@ UNKNOWN:
         See "Dashboard error codes" section.
     KL15 / wake-up status bit location
     F104 byte-level decoding (temp min/max summary)
-    FF21CA bytes 1, 4, 6 — counter / sub-state fields not yet
-        attributed to specific signals.
+    FF21CA bytes 2, 5, 7 (data[1], data[4], data[6]) — counter /
+        sub-state fields not yet attributed to specific signals.
     full enumeration of running-mode codes (Calibrating, Charging,
         Discharging, Fault, Sleep all still missing)
     SA 0x12 role beyond emitting a constant FF21 payload

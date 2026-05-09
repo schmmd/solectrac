@@ -136,9 +136,10 @@ class State:
     # vehicle controller
     vc_state_raw: Channel = field(default_factory=Channel)
     # motor controller (FF21CA)
-    motor_rpm: Channel = field(default_factory=Channel)
+    motor_rpm: Channel = field(default_factory=Channel)        # signed (dir * |rpm|)
+    motor_rpm_mag: Channel = field(default_factory=Channel)    # |rpm| magnitude
     motor_throttle: Channel = field(default_factory=Channel)
-    motor_drive_enabled: Channel = field(default_factory=Channel)
+    motor_direction: Channel = field(default_factory=Channel)  # -1 rev / 0 idle / +1 fwd
     motor_temp_c: Channel = field(default_factory=Channel)
     # F102 cell summary
     max_cell_mv: Channel = field(default_factory=Channel)
@@ -231,11 +232,20 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
         state.decoded += 1
 
     elif src == SRC_MOTOR and pgn == PGN_FF21:
-        # bytes 2-3 little-endian, biased by 0x0C80, give RPM.
-        rpm = ((data[3] << 8) | data[2]) - RPM_BIAS
-        state.motor_rpm.update(rpm, now)
+        # bytes 2-3 little-endian, biased by 0x0C80, give RPM magnitude.
+        rpm_mag = ((data[3] << 8) | data[2]) - RPM_BIAS
+        # byte 7 selects pedal: 0x14 = forward, 0x18 = reverse, 0x10 = idle.
+        pedal = data[7]
+        if pedal == 0x14:
+            direction = 1
+        elif pedal == 0x18:
+            direction = -1
+        else:
+            direction = 0
+        state.motor_rpm_mag.update(rpm_mag, now)
+        state.motor_rpm.update(direction * rpm_mag, now)
+        state.motor_direction.update(direction, now)
         state.motor_throttle.update(data[0], now)
-        state.motor_drive_enabled.update(1 if data[7] == 0x14 else 0, now)
         if data[5]:
             state.motor_temp_c.update(data[5] - TEMP_OFFSET_C, now)
         state.decoded += 1
@@ -490,12 +500,14 @@ def render_motor(state: State, now: float) -> Panel:
     if rpm is None:
         rpm_text = Text("---", style="dim")
     else:
-        style = ("bold red" if rpm > 2600
-                else "green" if rpm > 100
+        mag = abs(int(rpm))
+        style = ("bold red" if mag > 2600
+                else "green" if mag > 100
                 else None)
-        rpm_text = Text(f"{int(rpm):>5d}", style=style)
+        sign = "-" if rpm < 0 else " "
+        rpm_text = Text(f"{sign}{mag:>5d}", style=style)
         if state.motor_rpm.is_stale(now):
-            rpm_text = Text(f"{int(rpm):>5d}  (stale)", style="yellow dim")
+            rpm_text = Text(f"{sign}{mag:>5d}  (stale)", style="yellow dim")
     t.add_row("RPM", rpm_text)
 
     thr = state.motor_throttle.value
@@ -510,14 +522,16 @@ def render_motor(state: State, now: float) -> Panel:
         t.add_row("throttle",
                   Text.assemble(bar, Text(f"  {pct:>3d}%  (raw {int(thr)})")))
 
-    de = state.motor_drive_enabled.value
-    if de is None:
-        de_text = Text("---", style="dim")
-    elif de:
-        de_text = Text("enabled", style="green")
+    di = state.motor_direction.value
+    if di is None:
+        di_text = Text("---", style="dim")
+    elif di == 1:
+        di_text = Text("FORWARD", style="bold green")
+    elif di == -1:
+        di_text = Text("REVERSE", style="bold yellow")
     else:
-        de_text = Text("disabled", style="dim")
-    t.add_row("drive", de_text)
+        di_text = Text("idle", style="dim")
+    t.add_row("direction", di_text)
 
     mt = state.motor_temp_c.value
     if mt is None:

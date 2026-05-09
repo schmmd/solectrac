@@ -308,15 +308,23 @@ def decode_file(path: Path, scenario: str, sinks: dict, counts: dict,
                 sc["vc"] += 1
 
             elif src == SRC_MOTOR and pgn == PGN_FF21:
-                # bytes 2-3 little-endian, biased by 0x0C80, give RPM.
-                rpm = ((data[3] << 8) | data[2]) - RPM_BIAS
+                # bytes 2-3 little-endian, biased by 0x0C80, give RPM magnitude.
+                rpm_mag = ((data[3] << 8) | data[2]) - RPM_BIAS
                 throttle_raw = data[0]
-                drive_enabled = 1 if data[7] == 0x14 else 0
+                # byte 7 selects which directional pedal is pressed.
+                pedal = data[7]
+                if pedal == 0x14:
+                    direction = 1            # forward pedal
+                elif pedal == 0x18:
+                    direction = -1           # reverse pedal
+                else:
+                    direction = 0            # idle / neither
+                rpm_signed = direction * rpm_mag
                 # byte 5 is +40 C-offset; 0 means "not present" in this frame.
                 ctrl_temp_c = (data[5] - TEMP_OFFSET_C) if data[5] else None
                 ctrl_temp_f = c_to_f(ctrl_temp_c)
                 sinks["motor"].append((
-                    scenario, ts, rpm, throttle_raw, drive_enabled,
+                    scenario, ts, rpm_signed, rpm_mag, direction, throttle_raw,
                     "" if ctrl_temp_c is None else ctrl_temp_c,
                     "" if ctrl_temp_f is None else ctrl_temp_f,
                 ))
@@ -358,8 +366,8 @@ OUTPUT_SCHEMAS = {
                      "v_raw", "voltage_v_estimate",
                      "i_raw", "current_a"],
     "vc_status":    ["file", "timestamp", "state_raw", "state_name"],
-    "motor":        ["file", "timestamp", "rpm",
-                     "throttle_raw", "drive_enabled",
+    "motor":        ["file", "timestamp", "rpm_signed", "rpm_magnitude",
+                     "direction", "throttle_raw",
                      "controller_temp_c", "controller_temp_f"],
 }
 
@@ -459,12 +467,17 @@ def summarize(counts: dict, sinks: dict):
                   f"({c_to_f(min(ts_c))}..{c_to_f(max(ts_c))} F)")
         mt = [r for r in sinks["motor"] if r[0] == scenario]
         if mt:
-            rpms = [r[2] for r in mt]
-            thr = [r[3] for r in mt]
-            drv = [r[4] for r in mt]
-            print(f"    motor RPM : {min(rpms)}..{max(rpms)}")
+            rpms_signed = [r[2] for r in mt]
+            rpms_mag = [r[3] for r in mt]
+            dirs = [r[4] for r in mt]
+            thr = [r[5] for r in mt]
+            n_fwd = sum(1 for d in dirs if d == 1)
+            n_rev = sum(1 for d in dirs if d == -1)
+            n_idle = sum(1 for d in dirs if d == 0)
+            print(f"    motor RPM : {min(rpms_signed)}..{max(rpms_signed)} (signed)")
+            print(f"    |RPM|     : {min(rpms_mag)}..{max(rpms_mag)}")
             print(f"    throttle  : {min(thr)}..{max(thr)} (raw)")
-            print(f"    drive on  : {sum(drv)}/{len(drv)} frames")
+            print(f"    pedal     : fwd={n_fwd}  rev={n_rev}  idle={n_idle}")
 
 
 # --- main --------------------------------------------------------------------
