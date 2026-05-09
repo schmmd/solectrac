@@ -3,7 +3,7 @@
 solectrac-stream.py — Live (or replayed) BMS / charger TUI for the
 Solectrac CAN bus.
 
-Decodes the same J1939-style frames as parse_solectrac_can.py, but
+Decodes the same J1939-style frames as solectrac-analyze.py, but
 streams from a live CAN interface (or a python-can log file) and
 displays a real-time dashboard:
 
@@ -58,7 +58,7 @@ except ImportError:
     sys.exit(1)
 
 
-# --- protocol constants (mirrored from parse_solectrac_can.py) --------------
+# --- protocol constants (mirrored from solectrac-analyze.py) --------------
 
 SRC_BMS = 0xF3
 SRC_CHARGER = 0xE5

@@ -3,7 +3,7 @@
 Decode J1939-style CAN logs from a small electric tractor BMS / charger.
 
 Usage:
-    python3 parse_solectrac_can.py file1.asc [file2.blf ...]
+    python3 solectrac-analyze.py file1.asc [file2.blf ...]
 
 Inputs are read via python-can's LogReader, so any format python-can
 understands works: .asc (Vector ASCII), .blf, .log (canutils), .trc, and
@@ -160,7 +160,7 @@ def describe_pgn(pgn: int) -> str:
     return ""
 
 
-def describe_id(can_id: int, is_extended: bool) -> dict:
+def decode_can_id(can_id: int, is_extended: bool) -> dict:
     """Decode a CAN ID (11- or 29-bit) into J1939 fields."""
     if not is_extended:
         return {
@@ -410,7 +410,7 @@ def write_ids(id_counts: dict, out_dir: Path):
     path = out_dir / "ids.csv"
     decoded = []
     for (can_id, is_ext), n in id_counts.items():
-        d = describe_id(can_id, is_ext)
+        d = decode_can_id(can_id, is_ext)
         decoded.append((d, n))
     # Sort: 29-bit before 11-bit, then by numeric ID value.
     decoded.sort(key=lambda dn: (not dn[0]["ext"], int(dn[0]["id"], 16)))
