@@ -63,17 +63,20 @@ except ImportError:
 SRC_BMS = 0xF3
 SRC_CHARGER = 0xE5
 SRC_VEHICLE = 0xD0
+SRC_MOTOR = 0xCA
 
 PGN_CELL_FIRST, PGN_CELL_LAST = 0xF113, 0xF13C
 PGN_TEMP_FIRST, PGN_TEMP_LAST = 0xF155, 0xF15E
 PGN_F100 = 0xF100
 PGN_F102 = 0xF102
 PGN_FF50 = 0xFF50
+PGN_FF21 = 0xFF21
 
 TEMP_OFFSET_C = 40
 PACK_CURRENT_LSB_A = 0.1
 CHARGER_V_LSB_V = 1.0 / 3.0
 CHARGER_I_LSB_A = 0.1
+RPM_BIAS = 0x0C80
 
 VC_STATE_NAMES = {0x00: "init", 0x0C: "ready"}
 
@@ -128,6 +131,11 @@ class State:
     chgr_status: Channel = field(default_factory=Channel)
     # vehicle controller
     vc_state_raw: Channel = field(default_factory=Channel)
+    # motor controller (FF21CA)
+    motor_rpm: Channel = field(default_factory=Channel)
+    motor_throttle: Channel = field(default_factory=Channel)
+    motor_drive_enabled: Channel = field(default_factory=Channel)
+    motor_temp_c: Channel = field(default_factory=Channel)
     # F102 cell summary
     max_cell_mv: Channel = field(default_factory=Channel)
     min_cell_mv: Channel = field(default_factory=Channel)
@@ -216,6 +224,16 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
 
     elif src == SRC_VEHICLE and pgn == PGN_F100:
         state.vc_state_raw.update(data[0], now)
+        state.decoded += 1
+
+    elif src == SRC_MOTOR and pgn == PGN_FF21:
+        # bytes 2-3 little-endian, biased by 0x0C80, give RPM.
+        rpm = ((data[3] << 8) | data[2]) - RPM_BIAS
+        state.motor_rpm.update(rpm, now)
+        state.motor_throttle.update(data[0], now)
+        state.motor_drive_enabled.update(1 if data[7] == 0x14 else 0, now)
+        if data[5]:
+            state.motor_temp_c.update(data[5] - TEMP_OFFSET_C, now)
         state.decoded += 1
 
     elif src == SRC_CHARGER and pgn == PGN_FF50:
@@ -449,6 +467,50 @@ def render_temps(state: State, now: float) -> Panel:
     return Panel(Group(t, sub), title="Temperatures", border_style="blue")
 
 
+def render_motor(state: State, now: float) -> Panel:
+    t = Table.grid(padding=(0, 2))
+    t.add_column(justify="left")
+    t.add_column(justify="left")
+
+    rpm = state.motor_rpm.value
+    if rpm is None:
+        rpm_text = Text("---", style="dim")
+    else:
+        style = ("bold red" if rpm > 2600
+                else "green" if rpm > 100
+                else None)
+        rpm_text = Text(f"{int(rpm):>5d}", style=style)
+        if state.motor_rpm.is_stale(now):
+            rpm_text = Text(f"{int(rpm):>5d}  (stale)", style="yellow dim")
+    t.add_row("RPM", rpm_text)
+
+    thr = state.motor_throttle.value
+    if thr is None:
+        t.add_row("throttle", Text("---", style="dim"))
+    else:
+        # Approximate full-scale 0x34 = 52 raw seen in captures.
+        pct = min(100, int(round(thr * 100 / 52)))
+        bar_w = 20
+        filled = int(round(pct * bar_w / 100))
+        bar = Text("█" * filled + "░" * (bar_w - filled))
+        t.add_row("throttle",
+                  Text.assemble(bar, Text(f"  {pct:>3d}%  (raw {int(thr)})")))
+
+    de = state.motor_drive_enabled.value
+    if de is None:
+        de_text = Text("---", style="dim")
+    elif de:
+        de_text = Text("enabled", style="green")
+    else:
+        de_text = Text("disabled", style="dim")
+    t.add_row("drive", de_text)
+
+    t.add_row("ctrl temp",
+              fmt(state.motor_temp_c, "{:.0f}", "°C", now))
+
+    return Panel(t, title="Motor controller", border_style="magenta")
+
+
 def render_vc(state: State, now: float) -> Panel:
     t = Table.grid(padding=(0, 2))
     t.add_column(justify="left")
@@ -487,7 +549,7 @@ def build_layout(state: State, args, now: float) -> Layout:
         Layout(name="row1", size=8),
         Layout(name="cells", size=NUM_CELLS + 4),
         Layout(name="row3", size=5),
-        Layout(name="row4", size=5),
+        Layout(name="row4", size=8),
         Layout(name="alerts", size=8),
     )
     layout["header"].update(render_header(state, now))
@@ -497,7 +559,10 @@ def build_layout(state: State, args, now: float) -> Layout:
     )
     layout["cells"].update(render_cells(state, now))
     layout["row3"].update(render_temps(state, now))
-    layout["row4"].update(render_vc(state, now))
+    layout["row4"].split_row(
+        Layout(render_motor(state, now)),
+        Layout(render_vc(state, now)),
+    )
     alerts = evaluate_alerts(state, args.mains_v, args.breaker_a,
                              args.efficiency, now)
     layout["alerts"].update(render_alerts(alerts))

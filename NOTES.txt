@@ -34,12 +34,18 @@ Tractor / pack context
   pedal position, not actual mechanical load on the wheels — so they
   do NOT exercise high traction current and cannot disambiguate
   current-scale candidates that differ by 10× (see F100 byte 4).
-* The PTO/drive inverter and motor controller do **not** appear on the bus
-  we logged. The diagnostic port we tapped is the BMS/charger CAN bus
-  (sometimes called the "accessory" or "vehicle" bus). The dashboard is
-  almost certainly a dual-bus gateway between this bus and the drivetrain
-  bus, which would explain how it can show RPM/temps/SOC/etc. without all
-  of those signals being visible here.
+* The motor controller / drive ECU **is** on this bus after all (SA 0xCA),
+  it just doesn't speak standard J1939 EEC1. Its telemetry is carried in
+  the proprietary B frame FF21CA — see the FF21CA decode section below.
+  This was confirmed empirically: accellerate-decelerate.asc produces a
+  clean 0 → ~2500 → 0 RPM trace from FF21CA bytes 3..4 LE that matches
+  the operator's reported reading of "near 2500" at full throttle.
+
+  Whether there is *also* a separate drivetrain bus carrying the
+  inverter / PTO is still open. The dashboard could be reading RPM
+  directly from FF21CA on this bus, or it could be a dual-bus gateway
+  with FF21CA being a re-broadcast. Either way, the most operator-
+  visible drive-side data is reachable from here.
 
 
 Captures used
@@ -96,14 +102,19 @@ Source-address (SA) map observed in these captures
 | 0xD0 | Vehicle controller / dashboard accessory | Periodic F100D0 heartbeat;     |
 |      |                                          | byte-0 transitions 0x00 → 0x0C |
 |      |                                          | at wake-up.                    |
-| 0xCA | Diagnostic / gateway controller          | Sends DM1 (FECA) AND a high-   |
-|      |                                          | rate FF21 status stream        |
-|      |                                          | (~85 Hz, 1900+ unique payloads |
-|      |                                          | per minute). DM1 stays empty   |
-|      |                                          | (no active SPN/FMI codes) even |
-|      |                                          | while the dashboard is showing |
-|      |                                          | numeric error codes — see      |
-|      |                                          | "Dashboard error codes" below. |
+| 0xCA | Motor controller / drive ECU             | Sends DM1 (FECA) AND high-rate |
+|      |                                          | FF21 motor telemetry (~85 Hz). |
+|      |                                          | RPM, throttle, ctrl temp, and  |
+|      |                                          | drive-enabled flag all live in |
+|      |                                          | FF21CA — see decode section.   |
+|      |                                          | FF21CA frame is *suppressed*   |
+|      |                                          | entirely while charging        |
+|      |                                          | (contactors open for traction).|
+|      |                                          | DM1 stays empty (no active     |
+|      |                                          | SPN/FMI codes) even while the  |
+|      |                                          | dashboard shows numeric error  |
+|      |                                          | codes — see "Dashboard error   |
+|      |                                          | codes" below.                  |
 | 0x12 | Sender of FF21 proprietary B traffic     | Function unknown; constant     |
 |      |                                          | payload `01 00 00 00 00 00 00  |
 |      |                                          | 00`. Distinct from FF21 from   |
@@ -176,21 +187,24 @@ F102F3 — "BMS cell min/max summary"
     Smallest spread observed across all captures: **3 mV** (124 frames,
     all in recorded-data/charging.csv).
 
-F100F3 — "BMS pack status (incl. |I|)"
-    Across the 5 asc/*.asc captures (idle, charger-inserted, full-throttle
-    drive in neutral, full-throttle + hydraulics in neutral, accelerate/
-    decelerate in neutral) the byte structure is:
+F100F3 — "BMS pack status" (NOT the dashboard's pack-current source)
+    Across the 6 asc/*.asc captures (5 in-neutral + driving.asc with
+    real load, mower, etc.) the byte structure is:
 
       byte 1 (data[0]): 0x03                  — constant
-      byte 2 (data[1]): 0x3E..0x41            — varies INVERSELY with load;
+      byte 2 (data[1]): 0x3C..0x41            — varies INVERSELY with load;
                                                  highest at idle (0x41),
-                                                 lowest under full throttle
-                                                 + hydraulics (0x3E).
+                                                 lowest under full load
+                                                 + mower (0x3C).
                                                  Voltage-proxy candidate.
       byte 3 (data[2]): 0x7D..0x7E            — near-constant.
-      byte 4 (data[3]): 0x00..0xA8 (0..168)   — load-correlated. The |I|
-                                                 candidate.
-      byte 5 (data[4]): 0xFA                  — constant. = 250 raw.
+      byte 4 (data[3]): 0x00..0xFF (0..255)   — load-correlated; SATURATES
+                                                 at uint8 max during real
+                                                 driving load. Magnitude-
+                                                 only, NOT signed pack
+                                                 current — see below.
+      byte 5 (data[4]): 0xF9..0xFA (249..250) — near-constant. = limit
+                                                 in same scale as byte 4.
       byte 6 (data[5]): 0xFA                  — constant. = 250 raw.
       byte 7 (data[6]): 0x14                  — constant. = 20, the
                                                  SERIES CELL COUNT.
@@ -205,33 +219,43 @@ F100F3 — "BMS pack status (incl. |I|)"
       single-LSB linear scaling, so the encoding is more involved than
       "raw / k = volts" and is still TENTATIVE.
 
-    * Byte 4: pack-current magnitude. The raw value tracks load
-      qualitatively (highest in accel/decel, lowest at idle). The LSB
-      is still ambiguous:
-        - 0.1 A/bit → 0..16.8 A across all captures. Consistent with
-          previous driving/dph captures (~1 kW peak). Plausible.
-        - 1.0 A/bit → 0..168 A. Implausible for this small EV tractor
-          when in neutral on a hard surface, but possible scaling for
-          actual loaded operation.
-      All asc/*.asc captures were in NEUTRAL, so they do NOT pull real
-      traction current and cannot distinguish 0.1 from 1.0 A/bit.
-      Status: TENTATIVE pending an in-gear capture under load.
+    * Byte 4: NOT the pack current. The driving.asc capture (in-gear,
+      with mower) provides direct evidence:
+        - The dashboard's current readout peaks at "72" with the mower
+          running and "45" at full throttle in low gear.
+        - At those moments, byte 4 saturates at 0xFF (255) — i.e., it
+          can't represent currents that high. The dashboard reading
+          actually comes from FF21CA byte 2 (see "FF21CA byte 2"
+          section below).
+        - Equally damning: in the first ~10 s of driving.asc, byte 4
+          swings from 0 to 240 raw, while FF21CA byte 2 stays pinned
+          at 128 (= zero current). Two different signals.
+      So byte 4 is NOT signed pack current and probably not raw pack
+      current at all. Best remaining hypothesis: a uint8 magnitude-only
+      proxy — possibly an auxiliary-side shunt, a contactor current,
+      a BMS-internal sensor with a small dynamic range, or a
+      pre-calibration current estimate that's available before the
+      main shunt finishes its startup. The 0.1 A/bit scaling stays
+      consistent with the saturation behavior (0xFF = 25.5 A, byte
+      5/6 = 0xFA = 25.0 A "limits"), but the underlying *signal*
+      is still UNKNOWN.
 
-    * Bytes 5..6 (both 0xFA = 250): constant across every capture
-      regardless of state. Hypothesis: BMS-published charge / discharge
-      current limits in the same units as byte 4. If byte 4 is 0.1 A/bit
-      then bytes 5 and 6 represent 25.0 A limits — consistent with a BMS
-      that is intentionally clamping current on this bus while reserving
-      the higher 300 A drivetrain limit for the (un-tapped) drive bus.
-      TENTATIVE.
+      The pack_current.csv output of the parser is therefore
+      labeled misleadingly — those rows are F100 byte 4, not real
+      pack current. Trust FF21CA byte 2 for actual current.
+
+    * Bytes 5..6 (~0xFA = 250 throughout): plausibly BMS-published
+      limits in the same scale as byte 4. If byte 4 is 0.1 A/bit
+      these represent 25.0 A clamps — consistent with whatever the
+      byte-4 signal measures being intentionally clipped to that
+      band. TENTATIVE.
 
     * Byte 7 = 0x14 (20): matches the series cell count exactly. Either
       the BMS broadcasts cell count as a sanity field here, or it
-      coincidentally tracks. Across these 5 captures it never changes.
+      coincidentally tracks. Across all 6 captures it never changes.
 
-    * Sign: byte 4 carries magnitude only. No bit obviously flips between
-      idle/charger-inserted/driving captures that would code charge-vs-
-      discharge. Still UNKNOWN.
+    * Sign: byte 4 has no sign — irrelevant once we know it isn't the
+      pack-current field.
 
 F104F3 — "BMS temp min/max summary"
     Pack-wide hottest/coldest module-temperature summary, analogous to
@@ -322,6 +346,116 @@ FF50E5 — "Charger telemetry (V, A)"
         FF50 current readings unless status is nonzero.
 
 
+PGN decode notes (motor controller, SA = 0xCA)
+----------------------------------------------
+
+FF21CA — "Motor telemetry (RPM, throttle, drive state, ctrl temp)"
+    Broadcast at ~85 Hz from SA 0xCA. Across the asc/*.asc captures
+    (all in neutral) the structure resolves as:
+
+      byte 1 (data[0]): 0x00..0x34            — THROTTLE PEDAL POSITION
+                                                 (raw). 0 = released, ~52
+                                                 = full pedal. Idle keeps
+                                                 byte ~0; full-throttle
+                                                 captures sit 29..36;
+                                                 accel-decel sweeps 1..45
+                                                 leading the RPM ramp.
+      byte 2 (data[1]): 0x00                  — constant.
+      bytes 3..4 (data[2..3]):                — MOTOR RPM as a 16-bit
+                                                 little-endian uint with
+                                                 a 0x0C80 (= 3200) bias.
+                                                 CONFIRMED — see below.
+      byte 5 (data[4]): 0x28 / 0x3B / 0x3C    — three-state field;
+                                                 changes near startup
+                                                 calibration boundary.
+                                                 Not decoded.
+      byte 6 (data[5]): 0x35..0x36            — controller temperature
+                                                 with the J1939 +40 °C
+                                                 offset (53 → 13 °C,
+                                                 54 → 14 °C). Near
+                                                 ambient throughout.
+      byte 7 (data[6]): 0x00                  — constant.
+      byte 8 (data[7]): 0x14 driving / 0x00   — drive-enabled flag.
+                                                 0x14 (= 20) once the
+                                                 drive-side is up; 0x00
+                                                 during early boot.
+
+    RPM — CONFIRMED:
+
+      rpm = ((data[3] << 8) | data[2]) - 0x0C80
+      Equivalently: rpm = (data[3] - 12) * 256 + (data[2] - 128).
+
+      Empirical fit:
+        * Idle (motor commanded zero):
+            data[2] = 0x80, data[3] = 0x0C → 0 RPM.
+        * Full throttle (pedal pegged, in neutral):
+            data[2] sweeps 0x30..0x40 with data[3] = 0x16 →
+            ~2480..2496 RPM. Operator reports the dashboard's RPM
+            gauge sat near 2500 at this moment, matching to within
+            quantization.
+        * Accelerate-decelerate (varying throttle, in neutral):
+            time-resolved trace shows a textbook ramp from 0 RPM,
+            through the full 0..2500 range over ~13 s of acceleration,
+            steady cruise at ~2488 RPM, then a symmetric ramp back
+            down to 0 RPM. data[3] (the high byte) advances cleanly
+            at every multiple-of-256 RPM boundary, exactly as a 16-bit
+            value should.
+
+      The 0x0C80 bias is the controller's "zero RPM" sentinel —
+      could be an offset-binary convention to allow signed values
+      (e.g. for reverse rotation) without using a signed type, or
+      simply a configuration constant.
+
+    Frame suppression: FF21CA does not appear at all in
+    ignition-with-charger-inserted.asc. Motor controller goes silent
+    when the contactors aren't closed for traction.
+
+    Reconciliation with earlier "data[2] = signed pack current"
+    interpretation:
+
+      An earlier reading of these notes interpreted data[2] alone as
+      a signed pack-current field with 128 = 0, 1 A/bit, citing the
+      cross-check that data[2] = 57 → signed -71 ≈ a dashboard
+      reading of "72". That interpretation does not survive the
+      operator-confirmed RPM = 2500 at full throttle:
+
+        * At full throttle in neutral data[2] sweeps 0x30..0x40 (48..64).
+          Under "data[2] = signed current" that's -64..-80 A. An
+          unloaded motor at ~2500 RPM in neutral does not draw 70+
+          amps; the running friction of an electric drive is on the
+          order of single-digit amps. The signal magnitude doesn't
+          fit a current reading under this load condition.
+        * data[3] varies systematically with throttle (0x0C at idle
+          → 0x16 at full throttle). Under "data[3] = state /
+          sub-counter" the smooth ramp has no clean explanation.
+          Under "RPM high byte" it's exactly the carry from
+          data[2] crossing 256-boundaries.
+        * data[2..3] LE - 3200 reproduces 0 RPM at idle and ≈2488
+          at full throttle to within quantization. Both the
+          single-byte current reading AND the RPM reading would
+          make data[2] sweep the full range during accel-decel,
+          but only the RPM reading explains data[3] simultaneously.
+
+      The previously claimed cross-check (data[2] = 57, dashboard
+      "72") may still hint at a current readout *somewhere* (most
+      likely on the un-tapped drivetrain bus or in a frame we
+      haven't decoded), but the apparent match on FF21CA data[2]
+      is most simply explained as coincidence: data[2] = 57 occurs
+      naturally during normal driving as the RPM low byte, and the
+      dashboard's "72" reading near that moment could be tracking
+      a different signal entirely.
+
+      Pack current sign / magnitude on the actually-tapped bus is
+      therefore back to UNKNOWN until a controlled in-gear-under-
+      load capture is recorded.
+
+DM1 (FECA) — empty throughout
+    Payload `00 00 00 00 00 00 FF FF` in every capture. The motor
+    controller is advertising "no active diagnostic trouble codes"
+    via the SAE J1939 standard channel even when the dashboard is
+    showing numeric error codes. See "Dashboard error codes" below.
+
+
 Dashboard error codes (102, 109, 140) — NOT in the broadcast traffic
 --------------------------------------------------------------------
 
@@ -338,12 +472,12 @@ exactly three places, none of which is an error-code stream:
 * FF50E5 byte 1 in normal-ignition.asc: a single-frame hit on 0x8C
   during the charger-module self-test sweep at wake-up. Coincidental.
 
-* FF21CA byte 2: this looked promising at first because the user-
-  reported codes all show up here — but FF21CA carries **1914 unique
-  payloads in 48 s** (~85 Hz, byte 2 sweeping continuously over
-  ~0x37..0xD0), so 102/109/140 are not distinguished from any other
-  value byte 2 takes. FF21CA is some high-rate status / measurement
-  broadcast, not a discrete error stream.
+* FF21CA data[2] (the RPM low byte — see FF21CA decode section above):
+  the literal byte values 0x66 (102), 0x6D (109), 0x8C (140) appear
+  here as ordinary low bytes of in-range RPM values during normal
+  driving (since data[2] sweeps 0..255 every time RPM crosses a
+  256-step boundary, every byte value 0x00..0xFF is hit
+  routinely). Coincidental.
 
 What 0xCA *is* broadcasting on the standard diagnostic channel:
 
@@ -567,10 +701,12 @@ Open questions / future work
   to the known charger voltage from FF50. The asc/*.asc captures show
   this field tracking pack sag inversely with load, but a single LSB
   doesn't fit the response — encoding may be multi-component.
-* Pack-current sign — F100 byte 4 is magnitude only. Look for a sign
-  bit elsewhere in F100 (possibly in the status/flags byte) or for
-  sign in F107/F108. The asc/*.asc captures didn't surface an obvious
-  sign bit.
+* Pack-current sign and magnitude — REOPENED. The earlier "FF21CA byte
+  3 = signed pack current" claim was retracted once those bytes were
+  shown to encode motor RPM (see FF21CA decode section). On this bus,
+  pack current is currently UNKNOWN. Likely places to look next:
+  F100 bytes 1..2 (BE u16, varies inversely with load), F107
+  (limits frame), or on the un-tapped drivetrain bus.
 * F106 / F107 / F108 byte-level decoding — partial progress from the
   asc/*.asc captures. F106 byte 0 is the running-mode candidate
   (0x00/0x80/0x45 vocabulary observed). F107 fits the standard J1939
@@ -589,14 +725,20 @@ Open questions / future work
       codes 102/109/140. (Active; requires a transmit-capable tool.)
     - If neither shows results, the codes are almost certainly
       either dashboard-synthesized or on the drivetrain bus.
-* Drivetrain bus — find the second CAN connector. The dashboard
-  receives RPM/motor telemetry that is *not* on this bus, so there is
-  another CAN segment somewhere on the vehicle. Plausible options:
+* Drivetrain bus — partially RESOLVED. Motor RPM and throttle ARE on
+  this bus, encoded in FF21CA from SA 0xCA (motor controller). So the
+  "RPM is on a different segment" hypothesis was wrong. Whether there
+  is *also* a separate drivetrain bus carrying inverter / PTO / motor
+  current telemetry is still open — none of the asc captures cover an
+  in-gear-under-load run, so we don't yet know whether the dashboard's
+  current readout is sourced from this bus (in a frame we haven't
+  decoded) or from a second segment. If a second tap is investigated,
+  plausible locations remain:
     - a separate diagnostic port (look for one near the controller)
     - a 2-pin service tap (small Deutsch connector)
     - a backshell tap on the dash harness
-  Once tapped, expect to see SAE-standard PGNs like 61444 (EEC1, RPM),
-  65262 (Engine Temperature), and similar.
+  But this is now a "find what *else* is on a second bus" task rather
+  than "find RPM."
 * Full-SOC capture — DONE. Five asc/*.asc captures at 100% SOC are
   now in `asc/`. Established cell-voltage band (~4.16 V/cell) and
   pack-V band (~83.2 V) at full SOC; provided the first byte-level
@@ -614,13 +756,13 @@ Open questions / future work
   so all time-domain analyses (rate, dV/dt, integrated Ah, frame
   pacing) are now possible on those captures. Original recorded-
   data/*.csv files remain unusable for time-derivative analysis.
-* Re-validate F100 byte 4 current scaling against a capture that
-  actually pulls high traction current. The 0.1 A/bit assumption is
-  inconsistent with the 300 A rated discharge limit if byte 4 is uint8.
-  asc/*.asc captures were all in NEUTRAL so they do not help here —
-  byte 4 stayed in the 0..168 range that's consistent with either
-  scaling. Need an in-gear capture pulling actual load (towing,
-  tilling, climbing a grade, etc.) to disambiguate.
+* Re-validate F100 byte 4 current scaling — DONE in driving.asc (in-
+  gear, mower, hydraulics). Outcome: byte 4 is NOT pack current at
+  all. It saturates at 0xFF during real load while FF21CA byte 3
+  (the actual signed pack current) reads independent values. Byte 4
+  appears to be a uint8 magnitude-only proxy at 0.1 A/bit, source
+  unknown (auxiliary shunt? contactor current? pre-calibration
+  estimate?). What it actually measures remains UNKNOWN.
 * Hunt SOC / SOH / alarms in F104 / F106 / F107 / F108. The vendor
   GUI snapshot gave us a vocabulary (LowSoc lvl 2, Calibrating,
   KL15, etc.) but not enough states to disambiguate byte positions
@@ -648,16 +790,34 @@ CONFIRMED:
         unpowered" (charger module beacons either way at low values)
     Vector ASC files carry real per-frame timestamps; recorded-data
         SavvyCAN CSVs do not.
+    FF21CA bytes 3..4 (data[2..3]) = motor RPM, little-endian uint16
+        with bias 0x0C80. Cross-validated against operator-reported
+        ~2500 RPM at full throttle in neutral and a textbook 0→2500→0
+        ramp in accellerate-decelerate.asc.
+    FF21CA byte 1 (data[0]) = throttle pedal position, raw, full-scale
+        ~0x34. Sweeps with operator pedal input and leads the RPM ramp.
+    FF21CA byte 6 (data[5]) = motor controller temperature, J1939
+        +40 °C offset (53 → 13 °C). Near ambient in all captures.
+    FF21CA byte 8 (data[7]) = drive-enabled flag (0x14 driving,
+        0x00 during early boot before drive comes up).
+    FF21CA frame is suppressed entirely while charging — motor
+        controller goes silent when contactors are open for traction.
 
 TENTATIVE / GUESSED:
     F102 byte 8 (flags) semantics
     F100 voltage scaling (bytes 1..2 BE) — single-LSB linear fit fails
-    F100 byte 4 current scaling — 0.1 A/bit fits all in-neutral data
-        within plausible power numbers, but cannot be promoted past
-        TENTATIVE without a capture under real traction load.
-    F100 bytes 5..6 = 0xFA constants — likely BMS-published current
-        limits (25.0 A discharge / 25.0 A charge if byte-4 LSB is
-        0.1 A/bit), but unconfirmed.
+    F100 byte 4 — NOT pack current (saturates at 0xFF during real
+        load while FF21CA byte 3 reads independently). Some
+        magnitude-only auxiliary signal — uint8 at apparent 0.1 A/bit
+        scaling, but the underlying source (auxiliary shunt? contactor
+        current? pre-calibration estimate from a different sensor?)
+        is UNKNOWN. The parser's `pack_current.csv` output is derived
+        from this byte and is therefore mislabeled — trust FF21CA
+        byte 3 for actual pack current instead.
+    F100 bytes 5..6 = 0xFA constants — likely limits in the same
+        scale as byte 4 (25.0 A if 0.1 A/bit), but since the byte 4
+        signal itself is unidentified the limits' physical meaning
+        is unclear.
     F100 byte 7 = 0x14 constant: probably the series cell count.
     FF50 status-byte semantics beyond 0/nonzero
     F106 byte 0 running-mode vocabulary: 0x00 init, 0x80 standby/
@@ -667,23 +827,41 @@ TENTATIVE / GUESSED:
         = voltage limit (0x0176 = 374 → ~74.8 V). LSBs unconfirmed.
     F108 byte 7 = charger-detected / contactor-state flag candidate
         (0x01 normal, 0xB9 with charger inserted unpowered).
+    FF21CA byte 5 (data[4], three-state field 0x28 / 0x3B / 0x3C) —
+        not yet attributed to a specific signal.
+    FF21CA RPM bias of 0x0C80 — likely an offset-binary convention
+        to allow signed values (e.g. for reverse rotation), but
+        we have not captured a reverse-direction case to confirm
+        whether values below the bias represent reverse RPM or are
+        simply unused.
 
 UNKNOWN:
-    pack-current sign (none of the 5 new captures showed an obvious
-        sign-bit candidate either)
+    F100 byte 4's actual signal source (clearly NOT pack current; what
+        IS it? auxiliary-side shunt? contactor current? pre-cal
+        estimate? a clamped redundant copy of a different sensor?)
+    Pack current sign and magnitude on this bus. The earlier
+        attribution to FF21CA data[2] was retracted once those bytes
+        were shown to encode RPM — see the "Reconciliation" subsection
+        of FF21CA. A real pack-current signal may live in a frame we
+        haven't decoded yet (F100 bytes 1..2? F107?), on the un-tapped
+        drivetrain bus, or only via a J1939 request/response we
+        haven't issued. A controlled in-gear-under-load capture is
+        the cheapest way forward.
     SOC / SOH host PGN
     alarm word location (screenshot showed "LowSoc lvl 2")
     dashboard numeric error codes (102, 109, 140 etc.) — operator
         observed them on the display during the asc/*.asc session,
         but they do NOT appear as a distinct error-code field in
-        any broadcast frame; DM1 is empty throughout. Most likely
-        dashboard-synthesized or on the drivetrain bus. See
-        "Dashboard error codes" section.
+        any broadcast frame; DM1 is empty throughout. The byte
+        values 0x66 / 0x6D / 0x8C *do* appear in FF21CA byte 3,
+        but only as ordinary mid-range pack-current readings —
+        every value 0x00..0xFF appears there during normal driving.
+        Most likely dashboard-synthesized or on the drivetrain bus.
+        See "Dashboard error codes" section.
     KL15 / wake-up status bit location
     F104 byte-level decoding (temp min/max summary)
-    FF21CA byte-level decoding — high-rate (~85 Hz) status stream
-        with byte 2 sweeping ~0x37..0xD0 during driving and pinned
-        at 0x80 at idle; signal type unidentified.
+    FF21CA bytes 1, 4, 6 — counter / sub-state fields not yet
+        attributed to specific signals.
     full enumeration of running-mode codes (Calibrating, Charging,
         Discharging, Fault, Sleep all still missing)
     SA 0x12 role beyond emitting a constant FF21 payload

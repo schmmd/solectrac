@@ -20,6 +20,7 @@ Outputs (written next to the inputs):
     cell_summary.csv   max/min cell mV from PGN F102 (and inferred pack voltage)
     pack_current.csv   pack current magnitude inferred from F100 byte 4
     charger.csv        external charger telemetry (PGN FF50, source 0xE5)
+    motor.csv          motor controller telemetry (PGN FF21, source 0xCA)
     stdout             per-scenario summary
 
 Decoder assumptions (verify against the BMS spec before trusting numerically):
@@ -38,6 +39,14 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
                           bytes 4-5 LE = charger output current in 0.1 A/bit.
     Voltage scale is uncertain pending a full-SOC capture; stored as raw and
     a tentative 1/3 V/bit estimate.
+  * PGN 0xFF21 from 0xCA: motor controller / drive ECU telemetry.
+        byte 0     = throttle pedal position (raw, ~0..0x34)
+        bytes 2-3  = motor RPM, little-endian uint16, biased by 0x0C80
+                     (rpm = ((b3<<8)|b2) - 0x0C80; verified against a
+                     0->2500 RPM acceleration trace).
+        byte 5     = controller temperature with the J1939 +40 C offset.
+        byte 7     = 0x14 when drive enabled, 0x00 otherwise.
+    Frame is suppressed entirely while charging (contactors open for traction).
 """
 
 import csv
@@ -54,6 +63,7 @@ except ImportError:
 SRC_BMS = 0xF3
 SRC_CHARGER = 0xE5
 SRC_VEHICLE = 0xD0   # vehicle controller; broadcasts a minimal F100 heartbeat
+SRC_MOTOR = 0xCA     # motor controller / drive ECU; FF21 telemetry, DM1 source
 
 # Decoded names for the byte-1 state field of 18F100D0.
 VC_STATE_NAMES = {
@@ -73,10 +83,14 @@ PGN_F102 = 0xF102   # cell min/max summary
 # Charger broadcast.
 PGN_FF50 = 0xFF50   # charger telemetry (V, A)
 
+# Motor controller broadcast.
+PGN_FF21 = 0xFF21   # motor telemetry (RPM, throttle, drive-state, ctrl temp)
+
 TEMP_OFFSET_C = 40
 PACK_CURRENT_LSB_A = 0.1                  # tentative scaling for F100 byte 4
 CHARGER_V_LSB_V = 1.0 / 3.0               # tentative; revisit with full-SOC data
 CHARGER_I_LSB_A = 0.1
+RPM_BIAS = 0x0C80                         # FF21CA bytes 2-3 LE zero-RPM offset
 
 
 # --- helpers -----------------------------------------------------------------
@@ -107,6 +121,7 @@ PGN_NAMES = {
     0x00F107: "BMS current/voltage limits",
     0x00F108: "BMS aux status",
     0x00FF50: "Charger telemetry (V, A)",
+    0x00FF21: "Motor telemetry (RPM, throttle, state)",
 }
 
 
@@ -190,7 +205,8 @@ def decode_file(path: Path, scenario: str, sinks: dict, counts: dict,
     """Stream one log via python-can; append decoded rows to sinks in-place."""
     sc = counts.setdefault(scenario, {
         "total": 0, "cells": 0, "temps": 0, "f100": 0, "f102": 0,
-        "charger": 0, "vc": 0, "skipped_zero": 0, "extended_false": 0,
+        "charger": 0, "vc": 0, "motor": 0,
+        "skipped_zero": 0, "extended_false": 0,
     })
 
     reader = can.LogReader(str(path))
@@ -279,6 +295,19 @@ def decode_file(path: Path, scenario: str, sinks: dict, counts: dict,
                 ))
                 sc["vc"] += 1
 
+            elif src == SRC_MOTOR and pgn == PGN_FF21:
+                # bytes 2-3 little-endian, biased by 0x0C80, give RPM.
+                rpm = ((data[3] << 8) | data[2]) - RPM_BIAS
+                throttle_raw = data[0]
+                drive_enabled = 1 if data[7] == 0x14 else 0
+                # byte 5 is +40 C-offset; 0 means "not present" in this frame.
+                ctrl_temp_c = (data[5] - TEMP_OFFSET_C) if data[5] else None
+                sinks["motor"].append((
+                    scenario, ts, rpm, throttle_raw, drive_enabled,
+                    "" if ctrl_temp_c is None else ctrl_temp_c,
+                ))
+                sc["motor"] += 1
+
             elif src == SRC_CHARGER and pgn == PGN_FF50:
                 if all(b == 0 for b in data):
                     sc["skipped_zero"] += 1
@@ -315,6 +344,8 @@ OUTPUT_SCHEMAS = {
                      "v_raw", "voltage_v_estimate",
                      "i_raw", "current_a"],
     "vc_status":    ["file", "timestamp", "state_raw", "state_name"],
+    "motor":        ["file", "timestamp", "rpm",
+                     "throttle_raw", "drive_enabled", "controller_temp_c"],
 }
 
 # ids.csv has its own writer because the column set is naturally different.
@@ -328,6 +359,7 @@ OUTPUT_FILES = {
     "pack_current": "pack_current.csv",
     "charger":      "charger.csv",
     "vc_status":    "vc_status.csv",
+    "motor":        "motor.csv",
 }
 
 
@@ -373,11 +405,11 @@ def write_ids(id_counts: dict, out_dir: Path):
 def summarize(counts: dict, sinks: dict):
     print()
     print(f"{'file':<28} {'frames':>7} {'cells':>6} {'temps':>6} "
-          f"{'F100':>5} {'F102':>5} {'chgr':>5} {'vc':>5}")
+          f"{'F100':>5} {'F102':>5} {'chgr':>5} {'vc':>5} {'motor':>6}")
     for scenario, sc in counts.items():
         print(f"{scenario:<28} {sc['total']:>7} {sc['cells']:>6} "
               f"{sc['temps']:>6} {sc['f100']:>5} {sc['f102']:>5} "
-              f"{sc['charger']:>5} {sc['vc']:>5}")
+              f"{sc['charger']:>5} {sc['vc']:>5} {sc['motor']:>6}")
 
     print("\nsummary:")
     for scenario in counts:
@@ -409,6 +441,14 @@ def summarize(counts: dict, sinks: dict):
         if ts:
             ts_c = [r[3] for r in ts]
             print(f"    temps     : {min(ts_c)}..{max(ts_c)} C")
+        mt = [r for r in sinks["motor"] if r[0] == scenario]
+        if mt:
+            rpms = [r[2] for r in mt]
+            thr = [r[3] for r in mt]
+            drv = [r[4] for r in mt]
+            print(f"    motor RPM : {min(rpms)}..{max(rpms)}")
+            print(f"    throttle  : {min(thr)}..{max(thr)} (raw)")
+            print(f"    drive on  : {sum(drv)}/{len(drv)} frames")
 
 
 # --- main --------------------------------------------------------------------
