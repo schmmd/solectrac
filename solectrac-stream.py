@@ -238,11 +238,12 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
     elif src == SRC_MOTOR and pgn == PGN_FF21:
         # bytes 2-3 little-endian, biased by 0x0C80, give RPM magnitude.
         rpm_mag = ((data[3] << 8) | data[2]) - RPM_BIAS
-        # byte 7 selects pedal: 0x14 = forward, 0x18 = reverse, 0x10 = idle.
-        pedal = data[7]
-        if pedal == 0x14:
+        # byte 7 bits 2-3 encode direction: 0b00 idle, 0b01 fwd, 0b10 rev.
+        # Other bits in this byte vary across captures and aren't decoded.
+        pedal_bits = data[7] & 0x0C
+        if pedal_bits == 0x04:
             direction = 1
-        elif pedal == 0x18:
+        elif pedal_bits == 0x08:
             direction = -1
         else:
             direction = 0
@@ -504,17 +505,18 @@ def render_motor(state: State, now: float) -> Panel:
     t.add_column(justify="left")
     t.add_column(justify="left")
 
-    rpm = state.motor_rpm.value
-    if rpm is None:
+    rpm_mag = state.motor_rpm_mag.value
+    if rpm_mag is None:
         rpm_text = Text("---", style="dim")
     else:
-        mag = abs(int(rpm))
-        style = ("bold red" if mag > 2600
+        mag = abs(int(rpm_mag))
+        style = ("bold red" if mag > 2800
                 else "green" if mag > 100
                 else None)
-        sign = "-" if rpm < 0 else " "
+        di = state.motor_direction.value
+        sign = "-" if di == -1 else " "
         rpm_text = Text(f"{sign}{mag:>5d}", style=style)
-        if state.motor_rpm.is_stale(now):
+        if state.motor_rpm_mag.is_stale(now):
             rpm_text = Text(f"{sign}{mag:>5d}  (stale)", style="yellow dim")
     t.add_row("RPM", rpm_text)
 

@@ -18,7 +18,7 @@ Outputs (written next to the inputs):
     cells.csv          per-cell voltage samples
     temps.csv          per-channel module temperatures (degC and degF, +40 offset removed)
     cell_summary.csv   max/min cell mV from PGN F102 (and inferred pack voltage)
-    pack_current.csv   pack current magnitude inferred from F100 byte 4
+    pack_current.csv   signed pack current decoded from F100 bytes 3-4 (BE)
     charger.csv        external charger telemetry (PGN FF50, source 0xE5)
     motor.csv          motor controller telemetry (PGN FF21, source 0xCA)
     stdout             per-scenario summary
@@ -33,7 +33,14 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
         temp_index = (PGN - 0xF155) * 8 + slot
   * PGN 0xF102: bytes 1-2 BE = max cell mV, bytes 3-4 BE = min cell mV,
                 bytes 5-6 = max/min cell index, byte 8 = spread/flags.
-  * PGN 0xF100 byte 4 ~ |pack current| in 0.1 A/bit (sign unknown; tentative).
+  * PGN 0xF100 bytes 3-4 BE = signed pack current at 0.1 A/bit, biased so that
+        raw 0x7D00 = 0 A (positive = drawing from pack, negative = charging).
+        Idle data[2]=0x7D explains why the earlier byte-4-only decode happened
+        to match the dashboard at rest but rolled when current crossed ~25.6 A.
+        Cross-validated by the amp-*.asc dashboard-anchored set (1, 18, 35, 42,
+        58 A): mean decoded current matches the displayed dashboard reading
+        within ~1 A across the full range, including across the 0x7D→0x7E and
+        0x7F→0x80 high-byte rollovers.
   * PGN 0xFF50 from 0xE5: byte 1 = status (0x02 = active),
                           bytes 2-3 LE = charger output voltage (raw),
                           bytes 4-5 LE = charger output current in 0.1 A/bit.
@@ -82,7 +89,7 @@ PGN_CELL_FIRST, PGN_CELL_LAST = 0xF113, 0xF13C
 PGN_TEMP_FIRST, PGN_TEMP_LAST = 0xF155, 0xF15E
 
 # Aggregate / status PGNs from BMS.
-PGN_F100 = 0xF100   # pack status (byte 4 ~ |current|)
+PGN_F100 = 0xF100   # pack status (bytes 3-4 BE = signed pack current)
 PGN_F102 = 0xF102   # cell min/max summary
 # PGN 0xF104, 0xF106, 0xF107 are also broadcast but not yet decoded numerically.
 
@@ -126,7 +133,7 @@ PGN_NAMES = {
     0x00FECA: "DM1 (Active Diagnostic Trouble Codes)",
     0x00FECB: "DM2 (Previously Active DTCs)",
     # Solectrac BMS broadcasts (vendor-defined within the J1939 envelope):
-    0x00F100: "BMS pack status (incl. |I|)",
+    0x00F100: "BMS pack status (incl. signed pack current)",
     0x00F102: "BMS cell min/max summary",
     0x00F104: "BMS temp min/max summary",
     0x00F106: "BMS state (charger-dependent)",
