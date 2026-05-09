@@ -8,11 +8,25 @@ streams from a live CAN interface (or a python-can log file) and
 displays a real-time dashboard:
 
     * Pack voltage estimate, current magnitude, DC and estimated AC power.
+    * State-of-charge (SOC) estimate from min cell voltage (NMC OCV curve;
+      load-sensitive — see SOC notes below).
     * Charger output V / A / power, status flag.
     * Per-cell voltages with min/max/spread (1-based BMS numbering).
     * Per-channel module temperatures (with the +40 C offset removed).
     * Vehicle-controller heartbeat state.
     * Live alerts (low/high cell, spread, temp, AC budget, stale BMS).
+
+SOC estimate notes:
+    * Voltage-only SOC is approximate. The OCV->SOC table assumes NMC
+      chemistry (consistent with the ~4.1 V/cell range observed on this
+      pack); LFP cells would need a different table.
+    * Estimate is taken from the **lowest** cell voltage so it tracks the
+      limiting cell (the one that will trip the BMS first), not the pack
+      average.
+    * Terminal voltage drops below OCV under load and rises above OCV
+      while charging. The dashboard tags the estimate as "(loaded)" when
+      |I| exceeds a small threshold so a depressed reading isn't taken
+      as ground truth.
 
 Data sources:
     --interface socketcan --channel can0    live SocketCAN bus
@@ -91,6 +105,48 @@ NUM_TEMPS = 7
 
 STALE_S = 2.0  # mark a channel stale if no update for this long
 
+# OCV (open-circuit voltage) -> SOC table for typical NMC Li-ion at room
+# temperature, in (mV-per-cell, percent). Composite curve; vendor-specific
+# cells can drift from this by ~5-10% SOC. The lower knee is steeper than
+# the upper, which is why the table is denser near the bottom.
+NMC_OCV_TABLE: List[Tuple[int, float]] = [
+    (3000,   0.0),
+    (3300,   5.0),
+    (3450,  10.0),
+    (3530,  15.0),
+    (3620,  20.0),
+    (3690,  30.0),
+    (3740,  40.0),
+    (3800,  50.0),
+    (3870,  60.0),
+    (3930,  70.0),
+    (4000,  80.0),
+    (4080,  90.0),
+    (4150,  95.0),
+    (4200, 100.0),
+]
+
+# Treat the SOC reading as "loaded" (terminal voltage != OCV) when |I|
+# exceeds this. At rest the estimate is the most trustworthy.
+SOC_REST_CURRENT_A = 2.0
+
+
+def soc_from_cell_mv(mv: float) -> float:
+    """Linear-interpolated SOC % from a per-cell OCV using NMC_OCV_TABLE.
+
+    Clamps below the table's first point to 0 % and above the last to
+    100 %. This is voltage-only; load and temperature are not corrected.
+    """
+    table = NMC_OCV_TABLE
+    if mv <= table[0][0]:
+        return 0.0
+    if mv >= table[-1][0]:
+        return 100.0
+    for (v0, s0), (v1, s1) in zip(table, table[1:]):
+        if v0 <= mv <= v1:
+            return s0 + (s1 - s0) * (mv - v0) / (v1 - v0)
+    return 0.0
+
 
 def parse_id(can_id: int) -> Tuple[int, int]:
     """Return (pgn, source) from a 29-bit J1939 ID."""
@@ -148,6 +204,8 @@ class State:
     spread_mv: Channel = field(default_factory=Channel)
     max_cell_n: Channel = field(default_factory=Channel)  # 1-based per BMS
     min_cell_n: Channel = field(default_factory=Channel)  # 1-based per BMS
+    # Voltage-derived SOC (from min cell mV via NMC OCV table).
+    soc_pct: Channel = field(default_factory=Channel)
     # per-cell / per-temp arrays (indexed 0-based; display is 1-based)
     cells: List[Channel] = field(
         default_factory=lambda: [Channel() for _ in range(NUM_CELLS)]
@@ -229,6 +287,8 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             state.pack_v_est.update(
                 NUM_CELLS * (max_mv + min_mv) / 2.0 / 1000.0, now
             )
+            # SOC tracks the limiting (lowest) cell; conservative.
+            state.soc_pct.update(soc_from_cell_mv(min_mv), now)
             state.decoded += 1
 
     elif src == SRC_VEHICLE and pgn == PGN_F100:
@@ -394,6 +454,33 @@ def render_pack(state: State, mains_v: float, efficiency: float,
             t.add_row("AC est",
                       Text(f"~{ac_w:.0f} W  ({ac_a:.1f} A @ {mains_v:.0f} V, "
                            f"{efficiency * 100:.0f}% eff)"))
+
+    soc = state.soc_pct.value
+    if soc is not None:
+        bar_w = 20
+        filled = int(round(soc * bar_w / 100))
+        bar = Text("█" * filled + "░" * (bar_w - filled))
+        if soc < 15:
+            soc_style = "bold red"
+        elif soc < 30:
+            soc_style = "yellow"
+        else:
+            soc_style = "green"
+        # Tag the reading when the pack is under significant load: terminal
+        # voltage is depressed (discharging) or elevated (charging) and the
+        # voltage-only SOC won't match the true coulomb-counted state.
+        if pi is not None and abs(pi) > SOC_REST_CURRENT_A:
+            tag = " (loaded)" if pi > 0 else " (charging)"
+        else:
+            tag = ""
+        if state.soc_pct.is_stale(now):
+            tag += " stale"
+        soc_text = Text.assemble(
+            bar,
+            Text(f"  {soc:>3.0f}%", style=soc_style),
+            Text(tag, style="dim"),
+        )
+        t.add_row("SOC", soc_text)
 
     return Panel(t, title="Pack", border_style="green")
 
@@ -592,7 +679,7 @@ def build_layout(state: State, args, now: float) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="row1", size=8),
+        Layout(name="row1", size=9),
         Layout(name="cells", size=NUM_CELLS + 4),
         Layout(name="row3", size=5),
         Layout(name="row4", size=8),
