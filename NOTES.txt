@@ -1,0 +1,233 @@
+NOTES — Solectrac CAN-bus reverse-engineering findings
+======================================================
+
+These notes record what we learned about *this specific tractor* and *these
+specific captures*. The README covers the parser itself in generic terms;
+this file is where the experimental, observational, and tentative material
+lives. Numbers below come from the captures in this directory and are
+subject to revision when better data or vendor documentation arrives.
+
+
+Tractor / pack context
+----------------------
+
+* Tractor: Solectrac electric tractor (~70 V class).
+* Pack chemistry inferred from cell voltages: NMC (not LFP).
+    - Resting cells in the ~3.65 V range at ~40% reported SOC matches a
+      partial-discharge NMC OCV curve, not LFP's flat plateau.
+* Pack topology: 20 series cells (s = 20). Module-temperature frames carry
+  enough channels for several thermistors per module; 8 channels per frame
+  across F155..F15E means the BMS reserves space for up to 80 channels even
+  though far fewer are actually populated on this pack.
+* SOC at time of capture: ~40% (operator-reported).
+* Ambient: ~55 °F (~13 °C); tractor was outdoors.
+* The PTO/drive inverter and motor controller do **not** appear on the bus
+  we logged. The diagnostic port we tapped is the BMS/charger CAN bus
+  (sometimes called the "accessory" or "vehicle" bus). The dashboard is
+  almost certainly a dual-bus gateway between this bus and the drivetrain
+  bus, which would explain how it can show RPM/temps/SOC/etc. without all
+  of those signals being visible here.
+
+
+Captures used
+-------------
+
+* `continuous.csv`  — long resting baseline at ~40% SOC. Useful for noise
+                      floor, standby draw, and temperature stability.
+* `startingup.csv`  — wake-up transition. Vehicle-controller heartbeat
+                      transitions from 0x00 (init) to 0x0C (ready).
+* `driving.csv`     — ~30 s of normal driving with no implements.
+* `dph.csv`         — driving *plus hydraulics*. Same drive activity as
+                      `driving.csv` with the hydraulic circuit active in
+                      addition. Despite the name "driving plus hydraulics"
+                      this capture also contains substantial idle/parked
+                      time that drags its mean current down — compare
+                      *peak* / high-percentile values, not means, when
+                      contrasting it with `driving.csv`.
+* `charging.csv`    — charging from ~40% SOC.
+* `data.csv`        — *excluded*. Contains additional injected/unrelated
+                      OBD-II "Tester Present" traffic the operator was
+                      generating at the same time. Not part of the BMS/
+                      charger conversation we're trying to characterize.
+
+
+Source-address (SA) map observed in these captures
+--------------------------------------------------
+
+| SA   | Role inferred                           | Notes                          |
+|------|------------------------------------------|--------------------------------|
+| 0xF3 | BMS                                      | Owns the F100/F102/F104/F106/  |
+|      |                                          | F107/F108/F113../F155.. set.   |
+| 0xE5 | On-board charger                         | Talks FF50 telemetry.          |
+| 0xF4 | Vehicle controller (drive-side)          | Sends 1806E5F4 (request to     |
+|      |                                          | charger SA 0xE5).              |
+| 0xD0 | Vehicle controller / dashboard accessory | Periodic F100D0 heartbeat;     |
+|      |                                          | byte-0 transitions 0x00 → 0x0C |
+|      |                                          | at wake-up.                    |
+| 0xCA | Sender of DM1 (FECA) frames              | DM1 payloads observed but no   |
+|      |                                          | active SPN/FMI codes set.      |
+| 0x12 | Sender of FF21 proprietary B traffic     | Function unknown.              |
+| 0x41 | Address-claim type frame                 | Few frames; not analyzed.      |
+
+
+PGN decode notes (BMS, SA = 0xF3)
+---------------------------------
+
+All scalings below were derived empirically. Where a scaling is consistent
+with sane physical units across multiple captures it's marked CONFIRMED;
+otherwise it's TENTATIVE.
+
+F113..F13C — "BMS cell voltages N..N+3"
+    8 bytes = 4 × big-endian uint16 in millivolts.
+    F113 = cells 0..3, F114 = cells 4..7, ... F13C = cells 164..167.
+    Only the first 20 cells of F113..F117 have nonzero / sensible
+    values for this pack; the rest are 0xFFFF (sentinel) or 0.
+    CONFIRMED: BE u16 mV. Cells read ~3.6–3.7 V at ~40% SOC.
+
+F155..F15E — "BMS module temps 8N..8N+7"
+    8 bytes = 8 × uint8 with J1939 +40 °C offset (i.e. raw 53 = 13 °C).
+    F155 = channels 0..7, F156 = 8..15, ... F15E = 72..79.
+    Most channels are 0xFF (not present); a small number reflect ambient
+    and were what let us pin down the +40 °C convention.
+    CONFIRMED: u8, offset 40 °C.
+
+F102F3 — "BMS cell min/max summary"
+    Carries pack-wide cell statistics. We use:
+      * a max-cell mV (BE u16)
+      * a min-cell mV (BE u16)
+      * spread = max - min (mV)
+      * a byte that appears to encode the index of the lowest cell
+      * status/flag bits in another byte
+      * a coarse pack-voltage estimate (sum of 20 × cell average), kept
+        as a sanity check
+    CONFIRMED for max/min/spread; index/flag byte assignments are
+    TENTATIVE — they are stable but their *labels* are guessed.
+
+F100F3 — "BMS pack status (incl. |I|)"
+    * Bytes 2..3: a 16-bit field that scales like a pack-voltage proxy.
+      Magnitude is plausible but the exact LSB is TENTATIVE.
+    * Byte 4: pack-current magnitude at 0.1 A/bit — this is the |I|
+      reading the script labels as "pack current". CONFIRMED for
+      magnitude (matches charger current during charging within
+      rounding); the *sign* (charge vs discharge) is **not** carried in
+      this byte. Direction must be inferred from context (vehicle state,
+      charger active, etc.) until we identify the sign bit.
+    * Other bytes likely include SOC/SOH/temperature summaries; not yet
+      decoded.
+
+F104F3 — "BMS temp min/max summary"
+    Pack-wide hottest/coldest module-temperature summary, analogous to
+    F102 for cells. Not currently parsed into its own CSV.
+
+F106F3 — "BMS state (charger-dependent)"
+    Periodic frame whose contents differ between idle, driving, and
+    charging captures. Likely BMS state machine + flags. Not decoded.
+
+F107F3 — "BMS current/voltage limits"
+    Looks like the standard J1939 BMS "limits" frame (charge current
+    limit, discharge current limit, voltage limits). Bytes are stable
+    when SOC is stable, change near limits. Not decoded.
+
+F108F3 — "BMS aux status"
+    Auxiliary/contactor/heater status flags. Not decoded.
+
+
+PGN decode notes (charger, SA = 0xE5)
+-------------------------------------
+
+FF50E5 — "Charger telemetry (V, A)"
+    Proprietary B frame from the on-board charger.
+      * byte 0 = status / mode (0 when idle, nonzero when charging)
+      * bytes 1..2 (LE u16) = output voltage at ~1/3 V/bit
+        (raw 0x00DC ≈ 73.3 V matches the pack at the time)
+      * bytes 3..4 (LE u16) = output current at 0.1 A/bit
+    CONFIRMED for V and A magnitudes during charging; status byte
+    semantics (beyond "0 = idle") are TENTATIVE.
+
+
+PGN decode notes (vehicle controller, SA = 0xD0)
+------------------------------------------------
+
+F100D0 — "VC heartbeat"
+    Note: same PGN (F100) as the BMS pack-status frame, but a different
+    *source*. The PGN namespace is global; it's the SA that disambiguates.
+    Observed byte-0 values:
+      * 0x00 — "init" (early in startingup.csv, before key/wake completes)
+      * 0x0C — "ready" (steady state once tractor is awake)
+    The transition is sharp and aligns with the operator-described
+    wake-up event, which is what gives us confidence in the labels.
+    Other bytes change but haven't been decoded.
+
+
+Confirmed quantitative findings
+-------------------------------
+
+* Resting / standby pack draw (continuous.csv): on the order of
+  100–200 W. Consistent with BMS + dash + accessory loads, no traction.
+* Driving (driving.csv): peak draw on the order of ~1 kW; typical
+  driving current well under nameplate.
+* Driving + hydraulics (dph.csv): hydraulic actuation adds clearly
+  visible current spikes on top of the drive baseline; peak combined
+  draw on the order of ~1.8 kW. The mean of dph.csv is *lower* than
+  driving.csv only because dph.csv includes more idle/parked time —
+  per-event peaks are higher in dph.
+* Charging (charging.csv): charger output on the order of ~1.5 kW into
+  the pack at this SOC. Pack |I| reported by F100 byte 4 matches
+  charger current from FF50E5 within rounding, which is what cross-
+  validates the 0.1 A/bit scaling.
+* Cell spread at rest: tens of mV. No outlier cells observed.
+* No active DM1 trouble codes during any capture (FECA frames are
+  emitted but their SPN/FMI fields are inactive).
+* Temperatures: all populated channels read 12–15 °C, consistent with
+  the ~13 °C ambient. No self-heating signature in any capture (none
+  of these runs are long or hard enough to warm the pack).
+
+
+Open questions / future work
+----------------------------
+
+* F100 bytes 2..3 voltage scaling — the LSB is TENTATIVE. Capturing a
+  full charge from low SOC to 100% should let us pin it down by fitting
+  to the known charger voltage from FF50.
+* Pack-current sign — F100 byte 4 is magnitude only. Look for a sign
+  bit elsewhere in F100 (possibly in the status/flags byte) or for
+  sign in F107/F108.
+* F106 / F107 / F108 byte-level decoding — not yet attempted. Compare
+  values across charging-vs-idle-vs-driving captures to isolate which
+  byte is which.
+* Drivetrain bus — find the second CAN connector. The dashboard
+  receives RPM/motor telemetry that is *not* on this bus, so there is
+  another CAN segment somewhere on the vehicle. Plausible options:
+    - a separate diagnostic port (look for one near the controller)
+    - a 2-pin service tap (small Deutsch connector)
+    - a backshell tap on the dash harness
+  Once tapped, expect to see SAE-standard PGNs like 61444 (EEC1, RPM),
+  65262 (Engine Temperature), and similar.
+* Full-SOC capture — operator agreed to capture a continuous file at
+  100% SOC. That data should refine the cell-voltage range and
+  validate the pack-voltage scaling.
+* Confirm whether dashboard is the bus gateway, or whether a dedicated
+  gateway ECU sits between the two segments. Either is plausible.
+
+
+Confidence summary
+------------------
+
+CONFIRMED:
+    cell-voltage scaling (BE u16 mV)
+    module-temp scaling (u8 + 40 °C)
+    pack-current magnitude (F100 byte 4 @ 0.1 A/bit)
+    charger output V (FF50 LE u16 @ 1/3 V/bit)
+    charger output A (FF50 LE u16 @ 0.1 A/bit)
+    vehicle-controller heartbeat init/ready states (F100D0 byte 0)
+
+TENTATIVE / GUESSED:
+    F102 spread-related index/flag byte assignments
+    F100 voltage scaling (bytes 2..3)
+    FF50 status-byte semantics beyond 0/nonzero
+    All of F106 / F107 / F108
+
+UNKNOWN:
+    pack-current sign
+    SA 0x12 / 0xCA roles beyond the surface descriptions above
+    everything on the (un-tapped) drivetrain bus
