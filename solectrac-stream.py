@@ -84,6 +84,9 @@ PGN_CELL_FIRST, PGN_CELL_LAST = 0xF113, 0xF13C
 PGN_TEMP_FIRST, PGN_TEMP_LAST = 0xF155, 0xF15E
 PGN_F100 = 0xF100
 PGN_F102 = 0xF102
+PGN_F104 = 0xF104
+PGN_F106 = 0xF106
+PGN_F107 = 0xF107
 PGN_F108 = 0xF108
 PGN_FF50 = 0xFF50
 PGN_FF21 = 0xFF21
@@ -222,6 +225,7 @@ CHARGER_V_LSB_V = PACK_VOLTAGE_LSB_V       # charger uses identical encoding
 CHARGER_V_OFFSET_V = PACK_VOLTAGE_OFFSET_V
 CHARGER_I_LSB_A = 0.1
 RPM_BIAS = 0x0C80
+LIMIT_CURRENT_LSB_A = 0.01     # F107 bytes 0-1 / 2-3 BE, 0.01 A/bit
 
 VC_STATE_NAMES = {0x00: "init", 0x0C: "ready"}
 
@@ -359,6 +363,23 @@ class State:
     spread_mv: Channel = field(default_factory=Channel)
     max_cell_n: Channel = field(default_factory=Channel)  # 1-based per BMS
     min_cell_n: Channel = field(default_factory=Channel)  # 1-based per BMS
+    # F104 temp summary (symmetric with F102)
+    temp_max_c: Channel = field(default_factory=Channel)
+    temp_min_c: Channel = field(default_factory=Channel)
+    temp_spread_c: Channel = field(default_factory=Channel)
+    temp_max_n: Channel = field(default_factory=Channel)  # 1-based per BMS
+    temp_min_n: Channel = field(default_factory=Channel)  # 1-based per BMS
+    # F106 BMS state bitmap
+    bms_state_byte0: Channel = field(default_factory=Channel)
+    bms_state_byte1: Channel = field(default_factory=Channel)
+    bms_charging: Channel = field(default_factory=Channel)         # b1 bit 3
+    bms_charger_present: Channel = field(default_factory=Channel)  # b1 bit 2
+    bms_drive_mode: Channel = field(default_factory=Channel)       # b1 bit 5
+    bms_contactors: Channel = field(default_factory=Channel)       # b1 bit 6
+    # F107 BMS current limits
+    limit_discharge_a: Channel = field(default_factory=Channel)
+    limit_charge_a: Channel = field(default_factory=Channel)
+    limit_mode: Channel = field(default_factory=Channel)           # 0 chg / 1 drv
     # Voltage-derived SOC (from min cell mV via NMC OCV table).
     soc_pct: Channel = field(default_factory=Channel)
     # BMS-published SOC (F100F3 byte 4). More authoritative than the
@@ -503,6 +524,48 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             )
             # SOC tracks the limiting (lowest) cell; conservative.
             state.soc_pct.update(soc_from_cell_mv(min_mv), now)
+            state.decoded += 1
+
+        elif pgn == PGN_F104:
+            # Symmetric with F102 but for module temperatures. Layout
+            # cross-validated against per-channel temp.NN.c values from
+            # F155..F15E in every capture (see analyze.py for detail).
+            if all(b == 0 for b in data) or data[0] == 0xFF:
+                return
+            state.temp_max_c.update(data[0] - TEMP_OFFSET_C, now)
+            state.temp_min_c.update(data[1] - TEMP_OFFSET_C, now)
+            state.temp_max_n.update(data[2], now)
+            state.temp_min_n.update(data[3], now)
+            state.temp_spread_c.update(data[4], now)
+            state.decoded += 1
+
+        elif pgn == PGN_F106:
+            # BMS state. byte 1 carries the bitmap with the clearest
+            # semantics (charging / charger present / drive mode /
+            # contactors); byte 0 is a top-level state byte whose bit
+            # semantics aren't fully nailed down.
+            if all(b == 0 for b in data):
+                return
+            state.bms_state_byte0.update(data[0], now)
+            state.bms_state_byte1.update(data[1], now)
+            b1 = data[1]
+            state.bms_charging.update(1 if b1 & 0x08 else 0, now)
+            state.bms_charger_present.update(1 if b1 & 0x04 else 0, now)
+            state.bms_drive_mode.update(1 if b1 & 0x20 else 0, now)
+            state.bms_contactors.update(1 if b1 & 0x40 else 0, now)
+            state.decoded += 1
+
+        elif pgn == PGN_F107:
+            # BMS current limits, two BE u16 fields at 0.01 A/bit.
+            # Drive captures: 145.0 A discharge / 100.0 A charge.
+            # Charging captures: 100.0 A / 100.0 A.
+            if all(b == 0 for b in data):
+                return
+            i_dis = be16(data[0], data[1]) * LIMIT_CURRENT_LSB_A
+            i_chg = be16(data[2], data[3]) * LIMIT_CURRENT_LSB_A
+            state.limit_discharge_a.update(i_dis, now)
+            state.limit_charge_a.update(i_chg, now)
+            state.limit_mode.update(data[4], now)
             state.decoded += 1
 
     elif src == SRC_VEHICLE and pgn == PGN_F100:
@@ -825,6 +888,7 @@ def render_charger(state: State, now: float) -> Panel:
     # on the slope of recent BMS SOC samples; CV taper near full will
     # make the linear extrapolation read low in the last ~10%.
     if cs == CHGR_STATUS_ACTIVE and not stale:
+        t.add_row("", "")
         soc_now = state.bms_soc_pct.value
         if soc_now is not None and soc_now >= 99.5:
             t.add_row("ETA to 100%", Text("complete", style="green"))

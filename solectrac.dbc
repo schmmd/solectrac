@@ -49,6 +49,27 @@ BO_ 2565931763 BMS_CellSummary: 8 BMS
  SG_ Cell_Min_Index : 47|8@0+ (1,0) [0|255] "" VehicleController
  SG_ Cell_Flags : 63|8@0+ (1,0) [0|255] "" VehicleController
 
+BO_ 2565932275 BMS_TempSummary: 8 BMS
+ SG_ Temp_Max_C : 7|8@0+ (1,-40) [-40|215] "degC" VehicleController
+ SG_ Temp_Min_C : 15|8@0+ (1,-40) [-40|215] "degC" VehicleController
+ SG_ Temp_Max_Index : 23|8@0+ (1,0) [0|255] "" VehicleController
+ SG_ Temp_Min_Index : 31|8@0+ (1,0) [0|255] "" VehicleController
+ SG_ Temp_Spread_C : 39|8@0+ (1,0) [0|255] "degC" VehicleController
+
+BO_ 2565932787 BMS_State: 8 BMS
+ SG_ State_Byte0_Raw : 0|8@1+ (1,0) [0|255] "" VehicleController
+ SG_ State_BMS_Alive : 15|1@1+ (1,0) [0|1] "" VehicleController
+ SG_ State_Contactors_Closed : 14|1@1+ (1,0) [0|1] "" VehicleController
+ SG_ State_Drive_Mode : 13|1@1+ (1,0) [0|1] "" VehicleController
+ SG_ State_Charging_Active : 11|1@1+ (1,0) [0|1] "" VehicleController
+ SG_ State_Charger_Present : 10|1@1+ (1,0) [0|1] "" VehicleController
+
+BO_ 2565933043 BMS_CurrentLimits: 8 BMS
+ SG_ Discharge_Current_Limit : 7|16@0+ (0.01,0) [0|655.35] "A" VehicleController,Charger,MotorECU
+ SG_ Charge_Current_Limit : 23|16@0+ (0.01,0) [0|655.35] "A" VehicleController,Charger,MotorECU
+ SG_ Limit_Mode : 39|8@0+ (1,0) [0|255] "" VehicleController
+ SG_ Limit_Byte5_Raw : 47|8@0+ (1,0) [0|255] "" VehicleController
+
 BO_ 2565933299 BMS_FaultFlags: 8 BMS
  SG_ Fault_140_SystemFaultLevel : 56|1@1+ (1,0) [0|1] "" VehicleController
  SG_ Fault_124_PreChargingFault : 57|1@1+ (1,0) [0|1] "" VehicleController
@@ -181,6 +202,27 @@ CM_ SG_ 2565931763 Cell_Max_Index "1-based cell number (BMS GUI numbering) of th
 CM_ SG_ 2565931763 Cell_Min_Index "1-based cell number (BMS GUI numbering) of the cell reporting Cell_Min_mV. Subtract 1 to map to the 0-based BMS_CellVoltages_* signal index. CONFIRMED via the same recorded-data/charging.csv cross-check that anchored Cell_Max_Index.";
 CM_ SG_ 2565931763 Cell_Flags "Byte 7. Spread/flags field, semantics not yet decoded. TENTATIVE.";
 
+CM_ BO_ 2565932275 "PGN F104 from BMS. Pack temperature min/max summary, mirroring the per-channel data in F155..F15E. Cross-validated byte-for-byte against the decoded per-channel temperatures across multiple captures: byte 0 = max temp, byte 1 = min temp, byte 4 = max-min spread. CONFIRMED.";
+CM_ SG_ 2565932275 Temp_Max_C "Highest module temperature in the pack, J1939 +40 C raw offset already removed by the scaling.";
+CM_ SG_ 2565932275 Temp_Min_C "Lowest module temperature in the pack, J1939 +40 C raw offset already removed by the scaling.";
+CM_ SG_ 2565932275 Temp_Max_Index "1-based channel number of the sensor reporting Temp_Max_C. Subtract 1 to map to the 0-based BMS_ModuleTemps_* signal index.";
+CM_ SG_ 2565932275 Temp_Min_Index "1-based channel number of the sensor reporting Temp_Min_C. Subtract 1 to map to the 0-based BMS_ModuleTemps_* signal index.";
+CM_ SG_ 2565932275 Temp_Spread_C "Max-Min temperature spread, degC. Equals Temp_Max_C - Temp_Min_C across all observed captures (not a J1939-offset value).";
+
+CM_ BO_ 2565932787 "PGN F106 from BMS. BMS state bitmap; behaviour is charger-dependent. Two state bytes observed: byte 0 carries vehicle/contactor-related flags whose bit semantics are not yet fully decoded (surfaced as raw); byte 1 has been decoded with high confidence by correlating bit transitions across drive captures, charging captures, and charger-plugged-but-idle captures. Observed (byte0, byte1) combinations include (0x45, 0xE0)=drive ready, (0x45, 0xCC)=active charging, (0x80, 0xC4)=charger plugged but idle.";
+CM_ SG_ 2565932787 State_Byte0_Raw "Byte 0 of F106 raw. Carries vehicle-state flags whose bit-to-meaning mapping is not yet established. 0x45 in drive captures and during active charging; 0x80 when charger plugged but idle. Byte 1 is omitted as a raw signal because it is fully bit-decoded into the State_* signals below (cantools rejects overlapping signal layouts).";
+CM_ SG_ 2565932787 State_BMS_Alive "Byte 1 bit 7. Set in every observed frame with non-zero state bytes; appears to be a BMS-alive / heartbeat indicator.";
+CM_ SG_ 2565932787 State_Contactors_Closed "Byte 1 bit 6. Set when the main contactors are closed (drive mode and active charging); cleared when charger is merely present but idle.";
+CM_ SG_ 2565932787 State_Drive_Mode "Byte 1 bit 5. Set in drive captures, clear during charging.";
+CM_ SG_ 2565932787 State_Charging_Active "Byte 1 bit 3. Set during active charging; cleared otherwise.";
+CM_ SG_ 2565932787 State_Charger_Present "Byte 1 bit 2. Set whenever the charger is plugged in (idle or active); cleared in drive captures.";
+
+CM_ BO_ 2565933043 "PGN F107 from BMS. Active current limits the BMS is authorising on the bus. Bytes 0-1 BE = max discharge current at 0.01 A/bit (145.0 A in drive captures, 100.0 A while charging); bytes 2-3 BE = max charge current at 0.01 A/bit (always 100.0 A in observed captures). These match the manufacturer spec of 200 A peak / 100 A continuous discharge for this 20-cell NMC pack. Byte 4 toggles 0 (charging) / 1 (drive). Byte 5 is a slowly-varying counter whose semantics aren't established.";
+CM_ SG_ 2565933043 Discharge_Current_Limit "Maximum allowed discharge current, big-endian uint16 at 0.01 A/bit. Observed values: 145.0 A in drive captures, 100.0 A while charging.";
+CM_ SG_ 2565933043 Charge_Current_Limit "Maximum allowed charge current, big-endian uint16 at 0.01 A/bit. Observed value: 100.0 A across all captures.";
+CM_ SG_ 2565933043 Limit_Mode "Byte 4. 0 = charge mode (charger present and/or charging), 1 = drive mode. Tracks State_Drive_Mode but is encoded as a u8 here rather than a bit.";
+CM_ SG_ 2565933043 Limit_Byte5_Raw "Byte 5. Slowly-varying counter or status byte whose semantics aren't yet established. Observed range 0x71..0x77 in drive captures, 0x00 in charge-mode captures. TENTATIVE.";
+
 CM_ BO_ 2565933299 "PGN F108 from BMS. Active fault bitmap; the BMS surfaces operator-visible warning codes here. All bytes are 0x00 in healthy idle (verified against asc/bms-error-codes/idle-no-bms.asc). Byte 7 is a bitmap of dashboard-displayed BMS warning codes. Cross-validated against two operator-confirmed captures in asc/bms-error-codes/: bms-124-140-142-143-144-146.asc (codes 124,140,142,143,144,146; byte 7 = 0xBB = bits 0,1,3,4,5,7) and bms-fullcharge-102-109-140.asc (codes 102,109,140; byte 7 = 0x01 = bit 0). The only code shared by both captures is 140, and the only byte-7 bit shared by both is bit 0 -> bit 0 = 140 (which forces 124 to bit 1, reversing the previous assumption). Bits 3,4,5,7 cover capture-A's remaining codes (142,143,144,146) in numeric order. Bits 2 and 6 weren't lit in either capture, so codes 141 and 145 are SPECULATIVE assignments from the operator manual. Bytes 0..6 carry additional fault info (bytes 0 and 2 seen nonzero in capture B with codes 102/109/140 cycling) but the bit-to-code mapping for those bytes isn't established yet. The vendor BMS error-code table is from the operator manual (codes 100-113, 116-127, 140, 142-146).";
 CM_ SG_ 2565933299 Fault_140_SystemFaultLevel "BMS code 140: System fault: kvst. Bit 0 of byte 7. CONFIRMED: this is the single bit shared between the two F108 calibration captures (capture A bits 0,1,3,4,5,7 vs capture B bit 0).";
 CM_ SG_ 2565933299 Fault_124_PreChargingFault "BMS code 124: Pre-charging fault. Bit 1 of byte 7. CONFIRMED by elimination once Fault_140 was anchored to bit 0; previous mapping (bit 0 = 124) was wrong.";
@@ -234,3 +276,9 @@ VAL_ 2565933299 Fault_143_Battery_NeedsMaintenance 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_144_BatterySys_NeedsMaintenance 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_145_FullCycleNeeded 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_146_MaintenanceMode 0 "inactive" 1 "active" ;
+VAL_ 2565932787 State_BMS_Alive 0 "no" 1 "yes" ;
+VAL_ 2565932787 State_Contactors_Closed 0 "open" 1 "closed" ;
+VAL_ 2565932787 State_Drive_Mode 0 "inactive" 1 "active" ;
+VAL_ 2565932787 State_Charging_Active 0 "inactive" 1 "active" ;
+VAL_ 2565932787 State_Charger_Present 0 "absent" 1 "present" ;
+VAL_ 2565933043 Limit_Mode 0 "charge" 1 "drive" ;

@@ -44,6 +44,20 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     pack.voltage_v             F100 byte 1: pack voltage, b * 0.1 + 76.8 V
     pack.current_raw           F100 bytes 2-3 (raw biased u16)
     pack.current_a             F100 signed pack current, A
+    pack.temp_max_c            F104 byte 0: pack max module temp, b - 40
+    pack.temp_min_c            F104 byte 1: pack min module temp, b - 40
+    pack.temp_max_n            F104 byte 2: max-temp channel # (1-based)
+    pack.temp_min_n            F104 byte 3: min-temp channel # (1-based)
+    pack.temp_spread_c         F104 byte 4: max - min temp (°C)
+    bms.state.byte0/1          F106 raw state bytes
+    bms.state.charging         F106 byte 1 bit 3 (charger active)
+    bms.state.charger_present  F106 byte 1 bit 2 (charger plugged in)
+    bms.state.drive_mode       F106 byte 1 bit 5 (motor enabled)
+    bms.state.contactors       F106 byte 1 bit 6 (vehicle awake)
+    bms.limit.discharge_a      F107 bytes 0-1 BE * 0.01: max discharge current
+    bms.limit.charge_a         F107 bytes 2-3 BE * 0.01: max charge current
+    bms.limit.mode             F107 byte 4: 0=charging, 1=driving
+    bms.limit.byte5            F107 byte 5: slowly varying counter (raw)
     bms.fault.byteN            F108 bytes 0..7 raw (only emitted when frame is non-zero;
                                corresponds to DBC FaultByteN_Raw signals)
     bms.fault.code_NNN         F108 byte 7: 1 when bit set; NNN per vendor table
@@ -216,6 +230,7 @@ CHARGER_V_LSB_V = PACK_VOLTAGE_LSB_V      # charger reports the same encoding
 CHARGER_V_OFFSET_V = PACK_VOLTAGE_OFFSET_V
 CHARGER_I_LSB_A = 0.1
 RPM_BIAS = 0x0C80                         # FF21CA bytes 2-3 LE zero-RPM offset
+LIMIT_CURRENT_LSB_A = 0.01                # F107F3 bytes 0-1 / 2-3 BE, 0.01 A/bit
 
 
 def c_to_f(c):
@@ -450,6 +465,101 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     emissions.append(("pack.v_estimate", pack_v, "v"))
                     sc["f102"] += 1
 
+                elif pgn == PGN_F104:
+                    # Symmetric with F102 (cell min/max summary) but for
+                    # module temperatures. Layout verified by cross-
+                    # referencing every capture's F104 payload against
+                    # the per-channel temp.NN.c values decoded from
+                    # F155..F15E in the same capture: byte 0 = max temp
+                    # in °C with the J1939 +40 offset, byte 1 = min
+                    # temp same encoding, byte 2 = max-temp channel
+                    # number (1-based), byte 3 = min-temp channel
+                    # number (1-based), byte 4 = b0 - b1 (spread, °C);
+                    # bytes 5-7 are 0xFF (J1939 unused).
+                    if all(b == 0 for b in data):
+                        sc["skipped_zero"] += 1
+                        continue
+                    if data[0] == 0xFF or data[1] == 0xFF:
+                        continue
+                    emissions.append(
+                        ("pack.temp_max_c", data[0] - TEMP_OFFSET_C, "c"))
+                    emissions.append(
+                        ("pack.temp_min_c", data[1] - TEMP_OFFSET_C, "c"))
+                    emissions.append(("pack.temp_max_n", data[2], ""))
+                    emissions.append(("pack.temp_min_n", data[3], ""))
+                    emissions.append(("pack.temp_spread_c", data[4], "c"))
+                    sc.setdefault("f104", 0)
+                    sc["f104"] += 1
+
+                elif pgn == PGN_F106:
+                    # BMS state byte pair. Across all 20 captures we see
+                    # only a small set of (byte 0, byte 1) combinations:
+                    #   (0x45, 0xE0) = drive ready (every capture with
+                    #                  motor activity)
+                    #   (0x45, 0xCC) = active charging (dominant in
+                    #                  charging-120V-90ish-to-100.asc)
+                    #   (0x80, 0xC4) = charger plugged in, idle
+                    #   (0x45, 0xC4) / (0x84, 0xC4) / (0x85, 0xC4) /
+                    #   (0x00, 0x80) = transient handshake states
+                    # byte 1 has the clearest bit semantics:
+                    #   bit 7 (0x80) = BMS alive (always set when data
+                    #                  is published)
+                    #   bit 6 (0x40) = vehicle/contactors awake
+                    #   bit 5 (0x20) = drive mode (set only with motor)
+                    #   bit 3 (0x08) = charging active (set only with
+                    #                  charger status 0x03)
+                    #   bit 2 (0x04) = charger present
+                    # bits in byte 0 are less clear; emit raw for now.
+                    # byte 2 is constant 0xFC; bytes 3-7 are 0xFF
+                    # (J1939 unused).
+                    if all(b == 0 for b in data):
+                        sc["skipped_zero"] += 1
+                        continue
+                    emissions.append(("bms.state.byte0", data[0], ""))
+                    emissions.append(("bms.state.byte1", data[1], ""))
+                    b1 = data[1]
+                    emissions.append(
+                        ("bms.state.charging", 1 if b1 & 0x08 else 0, ""))
+                    emissions.append(
+                        ("bms.state.charger_present",
+                         1 if b1 & 0x04 else 0, ""))
+                    emissions.append(
+                        ("bms.state.drive_mode",
+                         1 if b1 & 0x20 else 0, ""))
+                    emissions.append(
+                        ("bms.state.contactors",
+                         1 if b1 & 0x40 else 0, ""))
+                    sc.setdefault("f106", 0)
+                    sc["f106"] += 1
+
+                elif pgn == PGN_F107:
+                    # BMS current limits, two BE u16 fields at 0.01 A/bit:
+                    #   bytes 0-1 = max discharge current
+                    #   bytes 2-3 = max charge current
+                    # In every drive capture bytes 0-1 = 0x38A4 = 145.0 A
+                    # and bytes 2-3 = 0x2710 = 100.0 A; in every charging
+                    # capture both fall to 0x2710 = 100.0 A. The pack
+                    # spec lists 200 A peak / 100 A continuous, so the
+                    # 145 A figure is the BMS-published derated peak and
+                    # 100 A is the continuous limit.
+                    # byte 4 = mode flag (0x00 charging, 0x01 driving),
+                    # byte 5 = slowly varying counter / status (~0x71..
+                    # 0x77 in driving captures, 0x00 in charging); not
+                    # yet fully decoded.
+                    if all(b == 0 for b in data):
+                        sc["skipped_zero"] += 1
+                        continue
+                    i_dis_max = be16(data[0], data[1]) * LIMIT_CURRENT_LSB_A
+                    i_chg_max = be16(data[2], data[3]) * LIMIT_CURRENT_LSB_A
+                    emissions.append(
+                        ("bms.limit.discharge_a", round(i_dis_max, 2), "a"))
+                    emissions.append(
+                        ("bms.limit.charge_a", round(i_chg_max, 2), "a"))
+                    emissions.append(("bms.limit.mode", data[4], ""))
+                    emissions.append(("bms.limit.byte5", data[5], ""))
+                    sc.setdefault("f107", 0)
+                    sc["f107"] += 1
+
                 elif pgn == PGN_F108:
                     # All zeros = healthy idle baseline. Byte 7 is the
                     # dashboard-displayed BMS warning code bitmap (decoded
@@ -595,6 +705,22 @@ DECODERS = [
      "", "tentative", "status/flag bits per NOTES; bit-level decode unknown"),
     ("pack.v_estimate", "F102", "F3", "0-3", "20 * (max+min)/2 / 1000",
      "v", "verified", "assumes 20-cell pack"),
+    ("pack.temp_max_c", "F104", "F3", "0", "u8 - 40",
+     "c", "verified",
+     "max module temp; cross-validated against per-channel temp.NN.c "
+     "decoded from F155..F15E in every capture"),
+    ("pack.temp_min_c", "F104", "F3", "1", "u8 - 40",
+     "c", "verified", "min module temp; same cross-validation as temp_max_c"),
+    ("pack.temp_max_n", "F104", "F3", "2", "u8 (raw)",
+     "", "verified",
+     "max-temp channel number, 1-based BMS GUI numbering; "
+     "subtract 1 for 0-based temp_index"),
+    ("pack.temp_min_n", "F104", "F3", "3", "u8 (raw)",
+     "", "verified",
+     "min-temp channel number, 1-based BMS GUI numbering; "
+     "subtract 1 for 0-based temp_index"),
+    ("pack.temp_spread_c", "F104", "F3", "4", "u8",
+     "c", "verified", "= byte 0 - byte 1 in every observed capture"),
     ("pack.voltage_v", "F100", "F3", "1", "u8 * 0.1 + 76.8",
      "v", "verified",
      "anchored by 24-capture regression vs 20*mean(cell mV); confirmed by FF50"),
@@ -610,6 +736,42 @@ DECODERS = [
      "%", "tentative",
      "linear fit through (224, 90%) and (250, 100%) from "
      "charging-120V-90ish-to-100.asc; slope loose pending deeper-discharge data"),
+    ("bms.state.byte0", "F106", "F3", "0", "u8 (raw)",
+     "", "tentative",
+     "BMS top-level state byte; observed values 0x00, 0x44, 0x45, 0x80, "
+     "0x84, 0x85 across 20 captures; bit semantics not fully established"),
+    ("bms.state.byte1", "F106", "F3", "1", "u8 (raw)",
+     "", "verified",
+     "BMS state bitmap; bits decoded into bms.state.charging / "
+     "charger_present / drive_mode / contactors below"),
+    ("bms.state.charging", "F106", "F3", "1 (bit 3)", "(b1 >> 3) & 1",
+     "", "verified",
+     "set only in charging-120V-90ish-to-100.asc while charger status=0x03"),
+    ("bms.state.charger_present", "F106", "F3", "1 (bit 2)", "(b1 >> 2) & 1",
+     "", "verified",
+     "set whenever charger is plugged in (charging or idle); "
+     "matches charger.status presence"),
+    ("bms.state.drive_mode", "F106", "F3", "1 (bit 5)", "(b1 >> 5) & 1",
+     "", "verified",
+     "set only in captures with motor (FF21CA) traffic; clear during charging"),
+    ("bms.state.contactors", "F106", "F3", "1 (bit 6)", "(b1 >> 6) & 1",
+     "", "tentative",
+     "set whenever the vehicle is awake (drive or charge); "
+     "likely tracks contactor / pre-charge complete"),
+    ("bms.limit.discharge_a", "F107", "F3", "0-1", "BE u16 * 0.01",
+     "a", "verified",
+     "max discharge current; 145.0 A in every drive capture, "
+     "100.0 A during charging; matches 200 A peak / 100 A continuous spec"),
+    ("bms.limit.charge_a", "F107", "F3", "2-3", "BE u16 * 0.01",
+     "a", "verified",
+     "max charge current; 100.0 A in every observed capture"),
+    ("bms.limit.mode", "F107", "F3", "4", "u8 (raw)",
+     "", "verified",
+     "0x00 in charging captures, 0x01 in drive captures"),
+    ("bms.limit.byte5", "F107", "F3", "5", "u8 (raw)",
+     "", "tentative",
+     "slowly varying counter / status (0x71..0x77 in drive captures, "
+     "0x00 in charging); semantics unknown"),
     ("bms.fault.byteN", "F108", "F3", "0..7", "u8 (raw, when nonzero)",
      "", "verified",
      "byte 7 = dashboard warning code bitmap; bytes 0..6 carry additional "
