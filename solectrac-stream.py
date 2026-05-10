@@ -92,8 +92,14 @@ PGN_FF21 = 0xFF21
 # manual). Each entry is (bit, code, description). Decoded from
 # asc/bms-error-codes/bms-124-140-142-143-144-146.asc vs idle-no-bms.asc:
 # byte 7 = 0xBB in the fault capture (= bits 0,1,3,4,5,7) maps exactly to
-# the operator-confirmed codes {124, 140, 142, 143, 144, 146}. Bit 2 maps
-# to code 141, which is reserved (not in the manual) and is omitted here.
+# the operator-confirmed codes {124, 140, 142, 143, 144, 145, 146}. Bit
+# 2 maps to code 141, which is reserved (not in the manual) and is
+# omitted here.
+#
+# These map onto the DBC's Fault_<code>_<ShortName> bit-level signals
+# (e.g. Fault_124_ClockFault). The script emits them as
+# bms.fault.code_<NNN>; the encodings and bit positions are identical,
+# only the naming convention differs.
 BMS_FAULT_CODES_BYTE7: List[Tuple[int, int, str]] = [
     (0, 124, "Clock fault"),
     (1, 140, "System fault level"),
@@ -206,6 +212,10 @@ class Channel:
         self.value = value
         self.ts = now
 
+    def clear(self) -> None:
+        self.value = None
+        self.ts = None
+
     def is_stale(self, now: float) -> bool:
         return self.ts is None or (now - self.ts) > STALE_S
 
@@ -243,12 +253,13 @@ class State:
     soc_pct: Channel = field(default_factory=Channel)
     # F108 fault bitmap bytes. Byte 7 is decoded (BMS warning code
     # bitmap from the operator manual). Bytes 0 and 2 are known to
-    # carry fault info too (seen nonzero in
-    # asc/bms-error-codes/bms-fullcharge-102-109-140.asc) but the
-    # bit-to-code mapping isn't established yet, and codes 100-123
-    # aren't in the BMS manual table at all — so bytes 0/2 may host
-    # non-BMS dashboard codes (MC / charger / VC). All 8 bytes are
-    # tracked so undecoded fault info is at least visible.
+    # carry additional fault info (seen nonzero in
+    # asc/bms-error-codes/bms-fullcharge-102-109-140.asc, where the
+    # dashboard cycled BMS codes 102, 109, 140; codes 102 and 109
+    # are part of the same vendor BMS error-code table that already
+    # supplied byte 7's mapping). The bit-to-code mapping for
+    # bytes 0..6 is not yet established. All 8 bytes are tracked
+    # so undecoded fault info is at least visible.
     fault_bytes: List[Channel] = field(
         default_factory=lambda: [Channel() for _ in range(8)]
     )
@@ -339,8 +350,9 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
         elif pgn == PGN_F108:
             # All zeros in healthy idle. Byte 7 = dashboard-displayed
             # warning code bitmap (decoded). Other bytes carry fault
-            # info too (bytes 0 and 2 seen nonzero with non-BMS-table
-            # codes 102/109 displayed) but aren't decoded yet.
+            # info too (bytes 0 and 2 seen nonzero with BMS codes
+            # 102/109/140 cycling on the dashboard) but the bit-to-
+            # code mapping isn't established yet.
             for i in range(8):
                 state.fault_bytes[i].update(data[i], now)
             state.decoded += 1
@@ -392,11 +404,22 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
     elif src == SRC_CHARGER and pgn == PGN_FF50:
         if all(b == 0 for b in data):
             return
-        state.chgr_status.update(data[0], now)
-        v_raw = le16(data[1], data[2])
-        i_raw = le16(data[3], data[4])
-        state.chgr_v.update(v_raw * CHARGER_V_LSB_V + CHARGER_V_OFFSET_V, now)
-        state.chgr_i.update(i_raw * CHARGER_I_LSB_A, now)
+        status = data[0]
+        state.chgr_status.update(status, now)
+        # The voltage/current bytes only carry meaningful values while
+        # status == 0x03 (actively charging). In other states (idle,
+        # handshake, post-charge) the bytes hold leftover/handshake values
+        # that decode to nonsense -- e.g. byte 4 = 0x08 in idle decodes to
+        # 204.8 A. Only emit V/I while charging; clear them otherwise so
+        # the TUI shows '---' instead of garbage.
+        if status == CHGR_STATUS_ACTIVE:
+            v_raw = le16(data[1], data[2])
+            i_raw = le16(data[3], data[4])
+            state.chgr_v.update(v_raw * CHARGER_V_LSB_V + CHARGER_V_OFFSET_V, now)
+            state.chgr_i.update(i_raw * CHARGER_I_LSB_A, now)
+        else:
+            state.chgr_v.clear()
+            state.chgr_i.clear()
         state.decoded += 1
 
 

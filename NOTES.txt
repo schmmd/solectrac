@@ -557,27 +557,30 @@ PGN decode notes (charger, SA = 0xE5)
 -------------------------------------
 
 FF50E5 — "Charger telemetry (V, A)"
-    Proprietary B frame from the on-board charger.
-      * byte 0 = charger status / mode:
+    Proprietary B frame from the on-board charger. Byte numbering below
+    is 1-based with explicit data[N] (0-based) annotations, matching
+    the convention used in the F100F3, F102F3, F108F3, and FF21CA
+    sections above.
+      * byte 1 (data[0]) = charger status / mode:
           0x00 = idle (not delivering)
           0x01, 0x02 = transient handshake states (only seen briefly
                         during wake-up / ramp; treat as not-delivering)
           0x03 = ACTIVELY delivering charge (CONFIRMED)
-      * bytes 1..2 (LE u16) = output voltage. Same encoding as F100F3
-        byte 1: V = raw * 0.1 + 76.8. CONFIRMED.
-      * bytes 3..4 (LE u16) = output current at 0.1 A/bit (no offset).
-        CONFIRMED.
+      * bytes 2..3 (data[1..2]) LE u16 = output voltage. Same encoding
+        as F100F3 byte 2 (data[1]): V = raw * 0.1 + 76.8. CONFIRMED.
+      * bytes 4..5 (data[3..4]) LE u16 = output current at 0.1 A/bit
+        (no offset). CONFIRMED.
 
     Status decode CONFIRMED from charging-120V-90ish-to-100.asc — a
     real charging trace from ~90 % SOC with the charger on 120 V mains.
     Status sat at 0x03 for 2863/3007 frames (the active-delivery
-    portion); bytes 1..2 and 3..4 are only meaningful while
+    portion); data[1..2] and data[3..4] are only meaningful while
     status == 0x03. The voltage and current scales were anchored
     against contemporaneous F100F3 readings using time-aligned
     regression across those 2863 active-charging frames:
-      * byte1 vs Pack_V: slope 0.1024, intercept 77.04, R^2 = 0.9856
-        → factor 0.1, offset 76.8 V (identical to F100 byte 1).
-      * byte3 vs |Pack_I|: slope 0.0989, intercept -0.07, R^2 = 0.9985
+      * data[1..2] vs Pack_V: slope 0.1024, intercept 77.04, R^2 = 0.9856
+        → factor 0.1, offset 76.8 V (identical to F100F3 byte 2 / data[1]).
+      * data[3..4] vs |Pack_I|: slope 0.0989, intercept -0.07, R^2 = 0.9985
         → 0.1 A/bit, no offset.
     End-to-end the decoded current showed a textbook CC→CV taper
     (~18.5 A → ~9.9 A → ~2.9 A) at constant ~83 V over the capture.

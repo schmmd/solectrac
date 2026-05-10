@@ -51,13 +51,18 @@ BO_ 2565931763 BMS_CellSummary: 8 BMS
 BO_ 2565933299 BMS_FaultFlags: 8 BMS
  SG_ Fault_124_ClockFault : 56|1@1+ (1,0) [0|1] "" VehicleController
  SG_ Fault_140_SystemFaultLevel : 57|1@1+ (1,0) [0|1] "" VehicleController
- SG_ Fault_141_Reserved : 58|1@1+ (1,0) [0|1] "" VehicleController
  SG_ Fault_142_BMS_NeedsMaintenance : 59|1@1+ (1,0) [0|1] "" VehicleController
  SG_ Fault_143_Battery_NeedsMaintenance : 60|1@1+ (1,0) [0|1] "" VehicleController
  SG_ Fault_144_BatterySys_NeedsMaintenance : 61|1@1+ (1,0) [0|1] "" VehicleController
  SG_ Fault_145_FullCycleNeeded : 62|1@1+ (1,0) [0|1] "" VehicleController
  SG_ Fault_146_MaintenanceMode : 63|1@1+ (1,0) [0|1] "" VehicleController
+ SG_ FaultByte0_Raw : 0|8@1+ (1,0) [0|255] "" VehicleController
+ SG_ FaultByte1_Raw : 8|8@1+ (1,0) [0|255] "" VehicleController
+ SG_ FaultByte2_Raw : 16|8@1+ (1,0) [0|255] "" VehicleController
+ SG_ FaultByte3_Raw : 24|8@1+ (1,0) [0|255] "" VehicleController
+ SG_ FaultByte4_Raw : 32|8@1+ (1,0) [0|255] "" VehicleController
  SG_ FaultByte5_Raw : 40|8@1+ (1,0) [0|255] "" VehicleController
+ SG_ FaultByte6_Raw : 48|8@1+ (1,0) [0|255] "" VehicleController
 
 BO_ 2565936115 BMS_CellVoltages_0: 8 BMS
  SG_ Cell_00_V : 7|16@0+ (0.001,0) [0|65.535] "V" VehicleController
@@ -151,7 +156,7 @@ BO_ 2365530570 Motor_Telemetry: 8 MotorECU
  SG_ Pedal_Direction : 56|8@1+ (1,0) [0|255] "" VehicleController
 
 
-CM_ "Solectrac electric tractor CAN database (J1939). Reverse-engineered from observed CAN traffic; not vendor documentation. Do NOT use for safety-relevant decisions. Signals tagged TENTATIVE in their comments are not yet cross-validated against a vendor spec.";
+CM_ "Solectrac electric tractor CAN database (J1939). Reverse-engineered from observed CAN traffic; not vendor documentation. Do NOT use for safety-relevant decisions. Signals tagged TENTATIVE in their comments are not yet cross-validated against a vendor spec. The companion Python parsers (solectrac-analyze.py, solectrac-stream.py) emit the same content under a parallel namespaced naming scheme — e.g. DBC Pack_Voltage <-> script pack.voltage_v, DBC Cell_NN_V <-> script cell.NN.voltage_v, DBC Fault_<code>_<name> <-> script bms.fault.code_<code>, DBC FaultByteN_Raw <-> script bms.fault.byteN. The encodings are identical; only the naming convention differs.";
 
 CM_ BU_ BMS "Battery management system. J1939 source address 0xF3.";
 CM_ BU_ Charger "External charger. J1939 source address 0xE5. Suppresses many BMS frames while not active.";
@@ -168,20 +173,25 @@ CM_ SG_ 2565931251 Pack_Current "Signed pack current. On the wire it is a biased
 CM_ BO_ 2565931763 "PGN F102 from BMS. Cell min/max summary across the whole pack.";
 CM_ SG_ 2565931763 Cell_Max_mV "Highest single-cell voltage in the pack, mV.";
 CM_ SG_ 2565931763 Cell_Min_mV "Lowest single-cell voltage in the pack, mV.";
-CM_ SG_ 2565931763 Cell_Max_Index "Index of the cell reporting Cell_Max_mV. Numbering matches BMS_CellVoltages_*. TENTATIVE.";
-CM_ SG_ 2565931763 Cell_Min_Index "Index of the cell reporting Cell_Min_mV. TENTATIVE.";
+CM_ SG_ 2565931763 Cell_Max_Index "1-based cell number (BMS GUI numbering) of the cell reporting Cell_Max_mV. Subtract 1 to map to the 0-based BMS_CellVoltages_* signal index — e.g. value 16 here corresponds to Cell_15_V. CONFIRMED by row-order correlation between F102 frames and surrounding F113..F117 cell-voltage frames in recorded-data/charging.csv: smallest-spread frames report byte 4 = 16 with the contemporaneous max cell at decoder cell_index 15 (= Cell_15_V).";
+CM_ SG_ 2565931763 Cell_Min_Index "1-based cell number (BMS GUI numbering) of the cell reporting Cell_Min_mV. Subtract 1 to map to the 0-based BMS_CellVoltages_* signal index. CONFIRMED via the same recorded-data/charging.csv cross-check that anchored Cell_Max_Index.";
 CM_ SG_ 2565931763 Cell_Flags "Byte 7. Spread/flags field, semantics not yet decoded. TENTATIVE.";
 
 CM_ BO_ 2565933299 "PGN F108 from BMS. Active fault bitmap; the BMS surfaces operator-visible warning codes here. All bytes are 0x00 in healthy idle (verified against asc/bms-error-codes/idle-no-bms.asc). Byte 7 is a bitmap of dashboard-displayed BMS warning codes packed in numeric order, with reserved/unused code numbers (141) occupying their natural bit position. Cross-validated against asc/bms-error-codes/bms-124-140-142-143-144-146.asc, in which the dashboard cycled codes 124, 140, 142, 143, 144, 146; F108 = 00 00 00 00 00 01 00 BB throughout, where 0xBB = bits 0,1,3,4,5,7 maps exactly to those six codes under the SG_ definitions below. Byte 5 (= 0x01 in that capture, 0x00 otherwise) carries an additional flag whose semantics are not yet decoded — likely a master 'any fault active' summary flag, but could be a separate fault-category bitmap. Codes 100-127 from the vendor table have not yet been triggered individually so the bit-to-code mapping for bytes 0-6 is unknown. The vendor BMS error-code table is from the operator manual (codes 100-113, 116-127, 140, 142-146).";
 CM_ SG_ 2565933299 Fault_124_ClockFault "BMS code 124: Clock fault.";
 CM_ SG_ 2565933299 Fault_140_SystemFaultLevel "BMS code 140: System fault level.";
-CM_ SG_ 2565933299 Fault_141_Reserved "Reserved bit (no code 141 in the vendor table). Always 0 in observed data.";
 CM_ SG_ 2565933299 Fault_142_BMS_NeedsMaintenance "BMS code 142: BMS fault, needs maintenance.";
 CM_ SG_ 2565933299 Fault_143_Battery_NeedsMaintenance "BMS code 143: Battery fault, needs maintenance.";
 CM_ SG_ 2565933299 Fault_144_BatterySys_NeedsMaintenance "BMS code 144: Battery system fault, needs maintenance.";
 CM_ SG_ 2565933299 Fault_145_FullCycleNeeded "BMS code 145: The battery needs to maintenance (full charging and full discharging).";
 CM_ SG_ 2565933299 Fault_146_MaintenanceMode "BMS code 146: Maintenance mode status.";
+CM_ SG_ 2565933299 FaultByte0_Raw "Byte 0 of F108. 0x00 in healthy idle. Observed 0x10 in asc/bms-error-codes/bms-fullcharge-102-109-140.asc, in which the dashboard cycled BMS codes 102 (Total voltage too high), 109 (Battery over voltage), 140 (System fault level). Byte 7 in that capture only carried the always-on 124 baseline, so codes 102 and/or 109 are most likely encoded in this byte and/or FaultByte2_Raw — but the bit-to-code mapping for bytes 0..6 is not yet established. Surfaced as raw u8 for visibility.";
+CM_ SG_ 2565933299 FaultByte1_Raw "Byte 1 of F108. 0x00 in every observed capture. Surfaced as raw u8 for forward compatibility — bit-to-code mapping not established.";
+CM_ SG_ 2565933299 FaultByte2_Raw "Byte 2 of F108. 0x00 in healthy idle. Observed 0x04 in asc/bms-error-codes/bms-fullcharge-102-109-140.asc with BMS codes 102/109/140 cycling on the dashboard, so this byte carries fault info — bit-to-code mapping for bytes 0..6 not yet established. Surfaced as raw u8 for visibility.";
+CM_ SG_ 2565933299 FaultByte3_Raw "Byte 3 of F108. 0x00 in every observed capture. Surfaced as raw u8 for forward compatibility — bit-to-code mapping not established.";
+CM_ SG_ 2565933299 FaultByte4_Raw "Byte 4 of F108. 0x00 in every observed capture. Surfaced as raw u8 for forward compatibility — bit-to-code mapping not established.";
 CM_ SG_ 2565933299 FaultByte5_Raw "Byte 5 of F108. 0x00 in healthy idle, 0x01 observed in a capture with codes {124,140,142,143,144,146} active. TENTATIVE: most likely a master 'any fault present' summary flag; could alternatively be a separate fault-category bitmap.";
+CM_ SG_ 2565933299 FaultByte6_Raw "Byte 6 of F108. 0x00 in every observed capture. Surfaced as raw u8 for forward compatibility — bit-to-code mapping not established.";
 
 CM_ BO_ 2565936115 "PGN F113 from BMS. Cell voltages 0..3.";
 CM_ BO_ 2565936371 "PGN F114 from BMS. Cell voltages 4..7.";
@@ -196,9 +206,9 @@ CM_ BO_ 2565953779 "PGN F158 from BMS. Module temperatures 24..31. The actual nu
 CM_ BO_ 2565954035 "PGN F159 from BMS. Module temperatures 32..39. PGNs F15A..F15E are reserved for larger packs.";
 
 CM_ BO_ 2566869221 "PGN FF50 from external Charger (0xE5). Charger output telemetry.";
-CM_ SG_ 2566869221 Charger_Status "Charger status byte. 0x00 = off / not charging (charger idle or session ended); 0x01 / 0x02 = brief state-transition values seen during handshake; 0x03 = ACTIVE charging. Established by asc/charging-120V-90ish-to-100.asc, in which 2863 of 3007 charger frames were status=0x03 with byte1 / byte3 tracking pack voltage and current respectively, then status switched to 0x00 with both data bytes pinned low for the final 134 frames once charging finished. Earlier captures only contained handshake/idle frames and were misleading.";
+CM_ SG_ 2566869221 Charger_Status "Charger status byte. 0x00 = idle / not charging (charger module idle or session ended); 0x01 / 0x02 = brief state-transition values seen during handshake; 0x03 = ACTIVE charging. Established by asc/charging-120V-90ish-to-100.asc, in which 2863 of 3007 charger frames were status=0x03 with byte1 / byte3 tracking pack voltage and current respectively, then status switched to 0x00 with both data bytes pinned low for the final 134 frames once charging finished. Earlier captures only contained handshake/idle frames and were misleading.";
 CM_ SG_ 2566869221 Charger_Voltage "Charger output voltage at the pack terminals. Encoded identically to Pack_Voltage in BMS_PackStatus: 0.1 V/bit with a +76.8 V offset. Anchored against asc/charging-120V-90ish-to-100.asc by linear regression of byte1 vs Pack_Voltage across 2863 active-charging frames: slope 0.1024, intercept 77.04, R^2=0.9856. Tracks Pack_Voltage to within 0.6 V across the whole charge (charger reads slightly lower than the BMS, consistent with cable voltage drop). Byte 2 (high byte of the 16-bit LE field) was 0x00 throughout the 120V capture; the pack will never reach 102.3 V with this 20-cell NMC chemistry, so the high byte may always be 0 in practice. ONLY MEANINGFUL WHEN Charger_Status == 'active' (0x03); other statuses leave the bytes at handshake / idle values that should not be interpreted as voltage.";
-CM_ SG_ 2566869221 Charger_Current "Charger output current magnitude. 0.1 A/bit, no offset, little-endian uint16. Anchored against |Pack_Current| in F100F3 across 2863 active-charging frames: slope 0.0989, intercept -0.07, R^2=0.9985. Tracks |Pack_Current| to within 0.3 A across the whole charge, including the constant-current to constant-voltage taper near full SOC (18.5 A -> 9.9 A -> 2.9 A as the pack approached 100%). Byte 4 (high byte) was 0x00 throughout the 120V capture (max observed current was 18.5 A); a higher-power charger could push the high byte above 0. ONLY MEANINGFUL WHEN Charger_Status == 'active' (0x03); other statuses leave the bytes at handshake / idle values - in particular byte 4 is 0x08 when status is 'off', which would naively decode to 204.8 A.";
+CM_ SG_ 2566869221 Charger_Current "Charger output current magnitude. 0.1 A/bit, no offset, little-endian uint16. Anchored against |Pack_Current| in F100F3 across 2863 active-charging frames: slope 0.0989, intercept -0.07, R^2=0.9985. Tracks |Pack_Current| to within 0.3 A across the whole charge, including the constant-current to constant-voltage taper near full SOC (18.5 A -> 9.9 A -> 2.9 A as the pack approached 100%). Byte 4 (high byte) was 0x00 throughout the 120V capture (max observed current was 18.5 A); a higher-power charger could push the high byte above 0. ONLY MEANINGFUL WHEN Charger_Status == 'active' (0x03); other statuses leave the bytes at handshake / idle values - in particular byte 4 is 0x08 when status is 'idle' (0x00), which would naively decode to 204.8 A.";
 
 CM_ BO_ 2365530570 "PGN FF21 from MotorECU (0xCA). Motor / drive telemetry. Frame priority is 3 (not 6), so the on-the-wire 29-bit ID is 0x0CFF21CA. Suppressed entirely while charging (traction contactors open).";
 CM_ SG_ 2365530570 Throttle_Raw "Throttle pedal position, raw. Observed range roughly 0..0x34 (0..52). Mapping to a percentage is not yet confirmed.";
@@ -208,11 +218,10 @@ CM_ SG_ 2365530570 Pedal_Direction "Foot-pedal selector. 0x10 = idle / neither p
 
 
 VAL_ 2565931216 VC_State 0 "init" 12 "ready" ;
-VAL_ 2566869221 Charger_Status 0 "off" 1 "transient_01" 2 "transient_02" 3 "active" ;
+VAL_ 2566869221 Charger_Status 0 "idle" 1 "transient_01" 2 "transient_02" 3 "active" ;
 VAL_ 2365530570 Pedal_Direction 16 "idle" 20 "forward" 24 "reverse" ;
 VAL_ 2565933299 Fault_124_ClockFault 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_140_SystemFaultLevel 0 "inactive" 1 "active" ;
-VAL_ 2565933299 Fault_141_Reserved 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_142_BMS_NeedsMaintenance 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_143_Battery_NeedsMaintenance 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_144_BatterySys_NeedsMaintenance 0 "inactive" 1 "active" ;

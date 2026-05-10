@@ -44,14 +44,18 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     pack.voltage_v             F100 byte 1: pack voltage, b * 0.1 + 76.8 V
     pack.current_raw           F100 bytes 2-3 (raw biased u16)
     pack.current_a             F100 signed pack current, A
-    bms.fault.byteN            F108 bytes 0..7 raw (only emitted when frame is non-zero)
+    bms.fault.byteN            F108 bytes 0..7 raw (only emitted when frame is non-zero;
+                               corresponds to DBC FaultByteN_Raw signals)
     bms.fault.code_NNN         F108 byte 7: 1 when bit set; NNN per vendor table
-                               (124, 140, 142, 143, 144, 145, 146)
+                               (124, 140, 142, 143, 144, 145, 146; corresponds to
+                               DBC Fault_<NNN>_<ShortName> bit signals)
     charger.status             FF50 byte 0
-    charger.v_raw              FF50 bytes 1-2 LE (raw)
+    charger.v_raw              FF50 bytes 1-2 LE (raw, always emitted)
     charger.voltage_v          FF50 charger output voltage, raw * 0.1 + 76.8 V
-    charger.i_raw              FF50 bytes 3-4 LE (raw)
+                               (only emitted while status == 0x03)
+    charger.i_raw              FF50 bytes 3-4 LE (raw, always emitted)
     charger.current_a          FF50 current, A
+                               (only emitted while status == 0x03)
     vc.state                   F100D0 byte 0 (raw heartbeat state)
     motor.rpm_signed           FF21CA RPM with directional sign
     motor.rpm_magnitude        FF21CA RPM unsigned
@@ -466,18 +470,27 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                 if all(b == 0 for b in data):
                     sc["skipped_zero"] += 1
                     continue
+                status = data[0]
                 v_raw = le16(data[1], data[2])
                 i_raw = le16(data[3], data[4])
-                emissions.append(("charger.status", data[0], ""))
+                emissions.append(("charger.status", status, ""))
                 emissions.append(("charger.v_raw", v_raw, ""))
-                emissions.append(
-                    ("charger.voltage_v",
-                     round(v_raw * CHARGER_V_LSB_V + CHARGER_V_OFFSET_V, 2),
-                     "v"))
                 emissions.append(("charger.i_raw", i_raw, ""))
-                emissions.append(
-                    ("charger.current_a",
-                     round(i_raw * CHARGER_I_LSB_A, 1), "a"))
+                # The voltage/current bytes only carry meaningful values
+                # while status == 0x03 (actively charging). In other
+                # states the bytes hold handshake/leftover values that
+                # decode to nonsense (e.g. byte 4 = 0x08 in idle ->
+                # 204.8 A). Keep status/v_raw/i_raw unconditional so the
+                # raw bytes remain visible, but only emit the engineering
+                # values while charging.
+                if status == 0x03:
+                    emissions.append(
+                        ("charger.voltage_v",
+                         round(v_raw * CHARGER_V_LSB_V + CHARGER_V_OFFSET_V, 2),
+                         "v"))
+                    emissions.append(
+                        ("charger.current_a",
+                         round(i_raw * CHARGER_I_LSB_A, 1), "a"))
                 sc["charger"] += 1
 
             if emissions:
@@ -556,15 +569,19 @@ DECODERS = [
      "", "verified",
      "0x00=idle, 0x01/0x02=handshake (transient), 0x03=active"),
     ("charger.v_raw", "FF50", "E5", "1-2", "LE u16",
-     "", "verified", ""),
+     "", "verified",
+     "raw bytes always emitted (handshake/idle constants visible)"),
     ("charger.voltage_v", "FF50", "E5", "1-2", "LE u16 * 0.1 + 76.8",
      "v", "verified",
-     "same encoding as F100 byte 1; meaningful only while status==0x03 "
+     "same encoding as F100 byte 1; emitted only while status==0x03 "
      "(R^2=0.986 vs F100F3 across 2863 active-charging frames)"),
     ("charger.i_raw", "FF50", "E5", "3-4", "LE u16",
-     "", "verified", ""),
+     "", "verified",
+     "raw bytes always emitted; in idle byte 4=0x08 -> i_raw=2048"),
     ("charger.current_a", "FF50", "E5", "3-4", "LE u16 * 0.1",
-     "a", "verified", ""),
+     "a", "verified",
+     "emitted only while status==0x03 (in idle the raw bytes would "
+     "decode to a spurious 204.8 A)"),
     ("vc.state", "F100", "D0", "0", "u8 (raw)",
      "", "verified", "0x00=init, 0x0C=ready"),
     ("motor.rpm_signed", "FF21", "CA", "2-3, 7",
