@@ -630,6 +630,15 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             state.decoded += 1
 
         elif pgn == PGN_F102:
+            # F102 layout (corpus survey, 36,950 active frames):
+            #   bytes 0-1 BE = max cell mV
+            #   bytes 2-3 BE = min cell mV
+            #   byte 4       = max-cell channel (1-based, per BMS GUI)
+            #   byte 5       = min-cell channel (1-based, per BMS GUI)
+            #   byte 6       = 0x00 padding (constant across corpus)
+            #   byte 7       = cell spread mV (max - min, 1 mV/bit; matches
+            #                  the computed (max-min) in 36,950/36,950
+            #                  corpus frames -- previously called 'flags')
             if all(b == 0 for b in data):
                 return
             max_mv = be16(data[0], data[1])
@@ -801,21 +810,31 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
         state.decoded += 1
 
     elif src == SRC_CHARGER and pgn == PGN_FF50:
+        # FF50E5 (charger telemetry, 3,108 frames across 5 of 30 captures).
+        # Layout established by full-corpus survey:
+        #   byte 0   = status (0x00 idle, 0x01/0x02 handshake, 0x03 active)
+        #   bytes 1-2 LE = pack/output voltage (0.1 V/bit, +0 V offset)
+        #   byte 3   = output current (0.1 A/bit)
+        #   byte 4   = status-flags bitmap (NOT current high byte!):
+        #                bit 2 = output disabled
+        #                bit 3 = AC line OK
+        #                bit 4 = AC line not detected
+        #   bytes 5-7 = 0x00 padding (constant across all observed frames)
+        # Voltage/current are only physically meaningful while
+        # status == 0x03 AND flags == 0x00. Idle / handshake / faulted
+        # frames carry leftover values that decode to nonsense (e.g.
+        # byte 3 = 0x08 in idle would decode to 0.8 A even though no
+        # current flows). Only emit V/I in the clean active state; clear
+        # them otherwise so the TUI shows '---' instead of garbage.
         if all(b == 0 for b in data):
             return
         status = data[0]
+        flags = data[4]
         state.chgr_status.update(status, now)
-        # The voltage/current bytes only carry meaningful values while
-        # status == 0x03 (actively charging). In other states (idle,
-        # handshake, post-charge) the bytes hold leftover/handshake values
-        # that decode to nonsense -- e.g. byte 4 = 0x08 in idle decodes to
-        # 204.8 A. Only emit V/I while charging; clear them otherwise so
-        # the TUI shows '---' instead of garbage.
-        if status == CHGR_STATUS_ACTIVE:
+        if status == CHGR_STATUS_ACTIVE and flags == 0x00:
             v_raw = le16(data[1], data[2])
-            i_raw = le16(data[3], data[4])
             state.chgr_v.update(v_raw * CHARGER_V_LSB_V + CHARGER_V_OFFSET_V, now)
-            state.chgr_i.update(i_raw * CHARGER_I_LSB_A, now)
+            state.chgr_i.update(data[3] * CHARGER_I_LSB_A, now)
         else:
             state.chgr_v.clear()
             state.chgr_i.clear()
