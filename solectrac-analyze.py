@@ -61,7 +61,10 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     motor.rpm_magnitude        FF21CA RPM unsigned
     motor.direction            +1 forward / 0 idle / -1 reverse
     motor.throttle_raw         FF21CA byte 0
-    motor.controller_temp_c    FF21CA byte 5 (only emitted when nonzero)
+    motor.controller_temp_c    FF21CA byte 4 (only emitted when nonzero)
+    motor.motor_temp_c         FF21CA byte 5 (only emitted when nonzero)
+    pack.soc_raw               F100F3 byte 4 (raw)
+    pack.soc_pct               F100F3 byte 4 -> percent (b4 * 0.385 + 3.8)
 
 Decoder assumptions (verify against the BMS spec before trusting numerically):
   * Source 0xF3 is the BMS, 0xE5 is the external charger, 0xF4 is a vehicle
@@ -96,10 +99,12 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
         0x7F->0x80 high-byte rollovers.
   * PGN 0xF108 byte 7 = dashboard-displayed BMS warning code bitmap. Each
         bit maps to a code in the vendor BMS error-code table (operator
-        manual). bit 0=124, bit 1=140, bit 3=142, bit 4=143, bit 5=144,
-        bit 6=145, bit 7=146 (bit 2 = code 141 reserved). Bytes 0..6
-        carry additional fault info (bit-to-code mapping not yet
-        established) and are surfaced as raw bytes for visibility.
+        manual). bit 0=140, bit 1=124, bit 3=142, bit 4=143, bit 5=144,
+        bit 7=146 (bits 2 and 6 didn't appear in either calibration
+        capture; codes 141 and 145 from the manual are speculatively
+        assigned). Bytes 0..6 carry additional fault info (bit-to-code
+        mapping not yet established) and are surfaced as raw bytes for
+        visibility.
   * PGN 0xFF50 from 0xE5: byte 0 = status (0x00=idle, 0x01/0x02=handshake
                           [transient], 0x03=active charging),
                           bytes 1-2 LE = charger output voltage at the pack
@@ -118,7 +123,8 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
                      (rpm = ((b3<<8)|b2) - 0x0C80; verified against a
                      0->2500 RPM acceleration trace). Always positive; sign of
                      motion comes from byte 7.
-        byte 5     = controller temperature with the J1939 +40 C offset.
+        byte 4     = main controller temperature, J1939 +40 C offset.
+        byte 5     = motor temperature, J1939 +40 C offset.
         byte 7     = directional pedal state (foot-pedal selector):
                        0x10 = idle / neither pedal
                        0x14 = forward pedal pressed
@@ -175,17 +181,27 @@ NUM_CELLS = 20
 NUM_TEMPS = 7
 
 # F108 byte 7: dashboard-displayed BMS warning code bitmap. Bit -> (code,
-# description). Cross-validated against asc/bms-error-codes/
-# bms-124-140-142-143-144-146.asc (byte 7 = 0xBB = bits {0,1,3,4,5,7}
-# matches operator-confirmed codes {124,140,142,143,144,146}). Bit 2 maps
-# to code 141 which is reserved (not in the manual) and is omitted.
+# description). Cross-validated against two operator-confirmed captures
+# in asc/bms-error-codes/:
+#   * bms-124-140-142-143-144-146.asc (codes 124,140,142,143,144,146):
+#     byte 7 = 0xBB = bits {0,1,3,4,5,7}
+#   * bms-fullcharge-102-109-140.asc (codes 102,109,140):
+#     byte 7 = 0x01 = bit {0}
+# The only code shared by both captures is 140, and the only byte-7 bit
+# shared by both is bit 0 -> bit 0 = 140 (not 124 as previously assumed).
+# That fixes 140 to bit 0 and forces 124 to bit 1; the remaining four set
+# bits (3,4,5,7) cover the four remaining capture-A codes (142,143,144,
+# 146) in numeric order. Bits 2 and 6 weren't lit in either capture, so
+# the codes assigned to them are *speculative*; codes 141 and 145 from
+# the manual are the most plausible candidates.
 BMS_FAULT_CODES_BYTE7 = [
-    (0, 124, "Clock fault"),
-    (1, 140, "System fault level"),
-    (3, 142, "BMS fault need maintenance"),
+    (0, 140, "System fault: kvst"),
+    (1, 124, "Pre-charging fault"),
+    (2, 141, "BMS fault need maintenance"),       # speculative
+    (3, 142, "BMS fault (manual omits 142)"),     # tentative; manual lists 141
     (4, 143, "Battery fault need maintenance"),
     (5, 144, "Battery system fault needs maintenance"),
-    (6, 145, "Full charge/discharge cycle needed"),
+    (6, 145, "Full charge/discharge cycle needed"),  # speculative
     (7, 146, "Maintenance mode status"),
 ]
 
@@ -396,6 +412,20 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     emissions.append(("pack.voltage_v", round(volts, 2), "v"))
                     emissions.append(("pack.current_raw", raw, ""))
                     emissions.append(("pack.current_a", round(amps, 1), "a"))
+                    # byte 4: BMS-published State-of-Charge. Identified by
+                    # cross-capture comparison: byte 4 is constant within
+                    # short captures (e.g. 250 across 489 frames in
+                    # accellerate-decelerate.asc despite voltage moving
+                    # 100 mV); saturates at 250 in soc-100-idle.asc; spans
+                    # 224..250 in charging-120V-90ish-to-100.asc whose
+                    # filename indicates a 90%->100% charge. Linear fit
+                    # through (224, 90%) and (250, 100%) gives the slope
+                    # and offset below; dynamic range is small so the
+                    # slope is loose, and the field is marked tentative
+                    # until a deeper-discharge capture confirms it.
+                    soc_pct = round(data[4] * 0.385 + 3.8, 1)
+                    emissions.append(("pack.soc_raw", data[4], ""))
+                    emissions.append(("pack.soc_pct", soc_pct, "%"))
                     sc["f100"] += 1
 
                 elif pgn == PGN_F102:
@@ -459,10 +489,23 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                 emissions.append(("motor.rpm_magnitude", rpm_mag, "rpm"))
                 emissions.append(("motor.direction", direction, ""))
                 emissions.append(("motor.throttle_raw", throttle_raw, ""))
-                # byte 5 is +40 C-offset; 0 means "not present" in this frame.
-                if data[5]:
+                # bytes 4 and 5 are both J1939 +40 C-offset temperatures.
+                # The operator manual lists two separate gauges on the dash:
+                # "Main Controller Temperature" and "Motor Temperature".
+                # Across all captures byte 4 is consistently a few degrees
+                # hotter than byte 5 and ramps up from cold-start in
+                # ignition-without-charger-inserted.asc (40->59 raw =
+                # 0->19 C while byte 5 stays at 13 C); inverter electronics
+                # (controller) typically run hotter than the motor housing,
+                # so byte 4 = controller, byte 5 = motor. Raw 0 means
+                # "not present" and is suppressed.
+                if data[4]:
                     emissions.append(
                         ("motor.controller_temp_c",
+                         data[4] - TEMP_OFFSET_C, "c"))
+                if data[5]:
+                    emissions.append(
+                        ("motor.motor_temp_c",
                          data[5] - TEMP_OFFSET_C, "c"))
                 sc["motor"] += 1
 
@@ -557,14 +600,22 @@ DECODERS = [
     ("pack.current_a", "F100", "F3", "2-3", "(BE u16 - 0x7D00) * 0.1",
      "a", "verified",
      "+draw / -charge; cross-validated against amp-*.asc dashboard captures"),
+    ("pack.soc_raw", "F100", "F3", "4", "u8 (raw)",
+     "", "tentative",
+     "BMS-published SoC raw byte; saturates at 250 in soc-100-idle.asc"),
+    ("pack.soc_pct", "F100", "F3", "4", "u8 * 0.385 + 3.8",
+     "%", "tentative",
+     "linear fit through (224, 90%) and (250, 100%) from "
+     "charging-120V-90ish-to-100.asc; slope loose pending deeper-discharge data"),
     ("bms.fault.byteN", "F108", "F3", "0..7", "u8 (raw, when nonzero)",
      "", "verified",
      "byte 7 = dashboard warning code bitmap; bytes 0..6 carry additional "
      "fault info, bit-to-code mapping not yet established"),
     ("bms.fault.code_NNN", "F108", "F3", "7", "(byte7 >> bit) & 1",
      "", "verified",
-     "NNN per vendor BMS error-code table (124, 140, 142, 143, 144, 145, 146); "
-     "emitted as 1 only when bit set"),
+     "NNN per vendor BMS error-code table; bit 0=140, bit 1=124, bit 3=142, "
+     "bit 4=143, bit 5=144, bit 7=146 (bits 2 and 6 speculative as codes "
+     "141 and 145); emitted as 1 only when bit set"),
     ("charger.status", "FF50", "E5", "0", "u8 (raw)",
      "", "verified",
      "0x00=idle, 0x01/0x02=handshake (transient), 0x03=active"),
@@ -592,8 +643,13 @@ DECODERS = [
      "", "verified", "directional pedal selector"),
     ("motor.throttle_raw", "FF21", "CA", "0", "u8 (raw)",
      "", "verified", "~0..0x34"),
-    ("motor.controller_temp_c", "FF21", "CA", "5", "u8 - 40",
-     "c", "tentative", "0 = not present in this frame; suppressed"),
+    ("motor.controller_temp_c", "FF21", "CA", "4", "u8 - 40",
+     "c", "tentative",
+     "main controller temp; consistently warmer than byte 5 and ramps up "
+     "from cold-start; 0 = not present and suppressed"),
+    ("motor.motor_temp_c", "FF21", "CA", "5", "u8 - 40",
+     "c", "tentative",
+     "motor temp; cooler/steadier than byte 4; 0 = not present and suppressed"),
 ]
 
 # ids.csv has its own writer because it's per-ID metadata, not timeseries.

@@ -87,27 +87,125 @@ PGN_F108 = 0xF108
 PGN_FF50 = 0xFF50
 PGN_FF21 = 0xFF21
 
-# F108 byte 7 carries a bitmap of dashboard-displayed BMS warning codes,
-# packed in numeric order from the vendor BMS error-code table (operator
-# manual). Each entry is (bit, code, description). Decoded from
-# asc/bms-error-codes/bms-124-140-142-143-144-146.asc vs idle-no-bms.asc:
-# byte 7 = 0xBB in the fault capture (= bits 0,1,3,4,5,7) maps exactly to
-# the operator-confirmed codes {124, 140, 142, 143, 144, 145, 146}. Bit
-# 2 maps to code 141, which is reserved (not in the manual) and is
-# omitted here.
+# Vendor BMS error-code table from the CET / Farmtrac 25 G operator
+# manual, p.44 ("Error Codes for Controller and Battery"). Authoritative
+# source for the human-readable description of each numeric code shown on
+# the dashboard's BMS error display.
+BMS_FAULT_DESCRIPTIONS: dict = {
+    100: "SOC is too high",
+    101: "SOC is too low",
+    102: "Total voltage is too high",
+    103: "Total voltage is too low",
+    104: "Charge current fault",
+    105: "Discharge current fault",
+    106: "Battery temperature is too low",
+    107: "Battery temperature is too high",
+    108: "Battery under voltage",
+    109: "Battery over voltage",
+    110: "Battery temperature unbalance",
+    111: "Battery voltage unbalance",
+    112: "The battery does not match",
+    113: "Output pole temperature too high",
+    116: "Memory parameter fault",
+    117: "Data memory fault",
+    118: "Cell voltage detection fault",
+    119: "Temperature detection fault",
+    120: "Current detection fault",
+    121: "Internal total voltage detection fault",
+    122: "External total voltage detection fault",
+    123: "Insulation monitoring fault",
+    124: "Pre-charging fault",
+    125: "Internal CAN communication fault",
+    126: "Serious insulation fault",
+    127: "Slight insulation fault",
+    140: "System fault: kvst",
+    141: "BMS fault need maintenance",
+    142: "BMS fault (manual omits 142)",  # tentative; bit-3 capture observation
+    143: "Battery fault need maintenance",
+    144: "Battery system fault needs maintenance",
+    145: "Needs full charge/discharge maintenance",
+    146: "Maintenance mode status",
+}
+
+# Motor controller fault codes from the same operator-manual table. Some
+# numbers list two distinct conditions; both are kept because the manual
+# gives no way to disambiguate them from the code alone.
+MC_FAULT_DESCRIPTIONS: dict = {
+    12: ["Controller Over Current"],
+    13: ["Current Sensor Fault"],
+    15: ["Controller Severe Undertemp"],
+    16: ["Controller Severe Overtemp"],
+    17: ["Severe B+ Undervoltage"],
+    18: ["Severe B+ Overvoltage"],
+    22: ["Controller Over Temp Cutback"],
+    23: ["B+ Undervoltage Cutback"],
+    24: ["B+ Overvoltage Cutback"],
+    25: ["+5V Supply Failure"],
+    26: ["Motor Temp Hot Cutback"],
+    29: ["Motor Temp Sensor Fault"],
+    31: ["Coil1 Driver Open/Short", "Main Open/Short"],
+    32: ["Coil2 Driver Open/Short", "EM Brake Open/Short"],
+    36: ["Encoder Fault", "Sin/Cos Sensor Fault"],
+    37: ["Motor Open"],
+    38: ["Main Contactor Welded"],
+    39: ["Main Contactor Did Not Close"],
+    41: ["Throttle Wiper High"],
+    42: ["Throttle Wiper Low"],
+    43: ["Pot2 Wiper High"],
+    44: ["Pot2 Wiper Low"],
+    45: ["Pot Low Over Current"],
+    47: ["HPD/Sequencing Fault"],
+    49: ["Parameter Change Fault", "PDO Timeout"],
+    71: ["Stall Detected", "Vehicle lock without applying hand brake"],
+    83: ["Driver Supply"],
+    87: ["Motor Characterization Fault"],
+    89: ["Encoder Pulse Count Fault", "Motor Type Fault"],
+    92: ["EM Brake failed to set"],
+    99: ["Parameter Mismatch"],
+}
+
+
+def describe_bms_code(code: int) -> str:
+    """Return the operator-manual description for a BMS code, or 'unknown'."""
+    return BMS_FAULT_DESCRIPTIONS.get(int(code), f"unknown code {int(code)}")
+
+
+def describe_mc_code(code: int) -> str:
+    """Return a slash-joined description for a motor-controller code."""
+    entries = MC_FAULT_DESCRIPTIONS.get(int(code))
+    if not entries:
+        return f"unknown code {int(code)}"
+    return " / ".join(entries)
+
+
+# F108 byte 7 carries a bitmap of dashboard-displayed BMS warning codes.
+# Each entry is (bit, code). The description is looked up from
+# BMS_FAULT_DESCRIPTIONS at render time so the operator-manual text is
+# the single source of truth.
 #
-# These map onto the DBC's Fault_<code>_<ShortName> bit-level signals
-# (e.g. Fault_124_ClockFault). The script emits them as
-# bms.fault.code_<NNN>; the encodings and bit positions are identical,
-# only the naming convention differs.
-BMS_FAULT_CODES_BYTE7: List[Tuple[int, int, str]] = [
-    (0, 124, "Clock fault"),
-    (1, 140, "System fault level"),
-    (3, 142, "BMS fault need maintenance"),
-    (4, 143, "Battery fault need maintenance"),
-    (5, 144, "Battery system fault needs maintenance"),
-    (6, 145, "Full charge/discharge cycle needed"),
-    (7, 146, "Maintenance mode status"),
+# Cross-validated against two operator-confirmed captures in
+# asc/bms-error-codes/:
+#   * bms-124-140-142-143-144-146.asc (codes 124,140,142,143,144,146):
+#     byte 7 = 0xBB = bits {0,1,3,4,5,7}
+#   * bms-fullcharge-102-109-140.asc (codes 102,109,140):
+#     byte 7 = 0x01 = bit {0}
+# The only code shared by both captures is 140, and the only byte-7 bit
+# shared by both is bit 0 -> bit 0 = 140 (not 124 as previously assumed).
+# That fixes 140 to bit 0 and forces 124 to bit 1; the remaining four set
+# bits (3,4,5,7) cover capture-A's remaining codes (142,143,144,146) in
+# numeric order. Bits 2 and 6 weren't lit in either capture, so codes
+# 141 and 145 are speculative assignments from the manual.
+#
+# These map onto the DBC's Fault_<code>_<ShortName> bit-level signals.
+BMS_FAULT_CODES_BYTE7: List[Tuple[int, int]] = [
+    (0, 140),
+    (1, 124),
+    (2, 141),  # speculative: bit not seen lit in any capture
+    (3, 142),  # tentative: manual omits 142 (lists 141 here)
+    (4, 143),
+    (5, 144),
+    (6, 145),  # speculative: bit not seen lit in any capture
+    (7, 146),
 ]
 
 TEMP_OFFSET_C = 40
@@ -242,6 +340,10 @@ class State:
     motor_rpm_mag: Channel = field(default_factory=Channel)    # |rpm| magnitude
     motor_throttle: Channel = field(default_factory=Channel)
     motor_direction: Channel = field(default_factory=Channel)  # -1 rev / 0 idle / +1 fwd
+    # FF21CA bytes 4 and 5 are both J1939 +40 C-offset temps; byte 4 is
+    # the main controller (consistently warmer, ramps from cold-start) and
+    # byte 5 is the motor housing.
+    controller_temp_c: Channel = field(default_factory=Channel)
     motor_temp_c: Channel = field(default_factory=Channel)
     # F102 cell summary
     max_cell_mv: Channel = field(default_factory=Channel)
@@ -251,6 +353,9 @@ class State:
     min_cell_n: Channel = field(default_factory=Channel)  # 1-based per BMS
     # Voltage-derived SOC (from min cell mV via NMC OCV table).
     soc_pct: Channel = field(default_factory=Channel)
+    # BMS-published SOC (F100F3 byte 4). More authoritative than the
+    # voltage-only estimate when present; preferred in render_pack.
+    bms_soc_pct: Channel = field(default_factory=Channel)
     # F108 fault bitmap bytes. Byte 7 is decoded (BMS warning code
     # bitmap from the operator manual). Bytes 0 and 2 are known to
     # carry additional fault info (seen nonzero in
@@ -345,6 +450,11 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             state.pack_i_a.update(
                 (raw_i - PACK_CURRENT_BIAS_RAW) * PACK_CURRENT_LSB_A, now
             )
+            # byte 4 = BMS-published State-of-Charge. Linear fit through
+            # (224, 90%) and (250, 100%) from charging-120V-90ish-to-100.asc;
+            # saturates at 250 in soc-100-idle.asc. Slope is loose pending
+            # a deeper-discharge capture.
+            state.bms_soc_pct.update(data[4] * 0.385 + 3.8, now)
             state.decoded += 1
 
         elif pgn == PGN_F108:
@@ -397,6 +507,13 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
         state.motor_rpm.update(direction * rpm_mag, now)
         state.motor_direction.update(direction, now)
         state.motor_throttle.update(data[0], now)
+        # bytes 4 and 5 are both J1939 +40 C-offset temperatures; byte 4
+        # is the main controller and byte 5 is the motor (per the
+        # cold-start ramp observed in ignition-without-charger-inserted.asc:
+        # byte 4 climbs 0->19 C while byte 5 stays at 13 C). Raw 0 means
+        # "not present" and is suppressed.
+        if data[4]:
+            state.controller_temp_c.update(data[4] - TEMP_OFFSET_C, now)
         if data[5]:
             state.motor_temp_c.update(data[5] - TEMP_OFFSET_C, now)
         state.decoded += 1
@@ -429,16 +546,18 @@ def active_bms_faults(state: State) -> List[Tuple[int, str]]:
     """Return [(code_number, description), ...] for currently set bits in
     F108 byte 7 (the dashboard-visible BMS warning code bitmap).
 
-    Byte 5's semantics aren't decoded yet, so it isn't surfaced here as a
-    code; render_faults shows its raw value separately for visibility.
+    Descriptions come from the operator-manual BMS_FAULT_DESCRIPTIONS
+    table. Byte 5's semantics aren't decoded yet, so it isn't surfaced
+    here as a code; render_faults shows its raw value separately for
+    visibility.
     """
     b7 = state.fault_bytes[7].value
     if b7 is None:
         return []
     out: List[Tuple[int, str]] = []
-    for bit, code, desc in BMS_FAULT_CODES_BYTE7:
+    for bit, code in BMS_FAULT_CODES_BYTE7:
         if (int(b7) >> bit) & 1:
-            out.append((code, desc))
+            out.append((code, describe_bms_code(code)))
     return out
 
 
@@ -507,8 +626,8 @@ def evaluate_alerts(state: State, mains_v: float, breaker_a: float,
     # Active BMS warning codes (F108 byte 7).
     faults = active_bms_faults(state)
     if faults:
-        codes = ", ".join(str(c) for c, _ in faults)
-        alerts.append(("WARN", f"BMS reports active fault codes: {codes}"))
+        items = ", ".join(f"{c} ({d})" for c, d in faults)
+        alerts.append(("WARN", f"BMS reports active fault codes: {items}"))
 
     return alerts
 
@@ -579,8 +698,21 @@ def render_pack(state: State, mains_v: float, efficiency: float,
                       Text(f"~{ac_w:.0f} W  ({ac_a:.1f} A @ {mains_v:.0f} V, "
                            f"{efficiency * 100:.0f}% eff)"))
 
-    soc = state.soc_pct.value
-    if soc is not None:
+    # Tag the reading when the pack is under significant load: terminal
+    # voltage is depressed (discharging) or elevated (charging) and the
+    # voltage-only SOC won't match the true coulomb-counted state.
+    # Applied to both rows; the BMS row is also tagged but not for the
+    # same reason -- the BMS does its own coulomb counting -- it just
+    # gives the user a hint that the two readings may diverge under load.
+    if pi is not None and abs(pi) > SOC_REST_CURRENT_A:
+        load_tag = " (loaded)" if pi > 0 else " (charging)"
+    else:
+        load_tag = ""
+
+    def _soc_row(label: str, ch: Channel) -> Optional[Text]:
+        if ch.value is None:
+            return None
+        soc = ch.value
         bar_w = 20
         filled = int(round(soc * bar_w / 100))
         bar = Text("█" * filled + "░" * (bar_w - filled))
@@ -590,21 +722,19 @@ def render_pack(state: State, mains_v: float, efficiency: float,
             soc_style = "yellow"
         else:
             soc_style = "green"
-        # Tag the reading when the pack is under significant load: terminal
-        # voltage is depressed (discharging) or elevated (charging) and the
-        # voltage-only SOC won't match the true coulomb-counted state.
-        if pi is not None and abs(pi) > SOC_REST_CURRENT_A:
-            tag = " (loaded)" if pi > 0 else " (charging)"
-        else:
-            tag = ""
-        if state.soc_pct.is_stale(now):
-            tag += " stale"
-        soc_text = Text.assemble(
+        tag = load_tag + (" stale" if ch.is_stale(now) else "")
+        return Text.assemble(
             bar,
             Text(f"  {soc:>3.0f}%", style=soc_style),
             Text(tag, style="dim"),
         )
-        t.add_row("SOC", soc_text)
+
+    bms_row = _soc_row("BMS", state.bms_soc_pct)
+    if bms_row is not None:
+        t.add_row("SOC (BMS)", bms_row)
+    ocv_row = _soc_row("OCV", state.soc_pct)
+    if ocv_row is not None:
+        t.add_row("SOC (OCV)", ocv_row)
 
     return Panel(t, title="Pack", border_style="green")
 
@@ -758,16 +888,16 @@ def render_motor(state: State, now: float) -> Panel:
         di_text = Text("idle", style="dim")
     t.add_row("direction", di_text)
 
-    mt = state.motor_temp_c.value
-    if mt is None:
-        mt_text = Text("---", style="dim")
-    else:
-        text = f"{mt:.0f} °C ({c_to_f(mt):.0f} °F)"
-        if state.motor_temp_c.is_stale(now):
-            mt_text = Text(text, style="yellow dim")
-        else:
-            mt_text = Text(text)
-    t.add_row("ctrl temp", mt_text)
+    def _temp_text(ch: Channel) -> Text:
+        if ch.value is None:
+            return Text("---", style="dim")
+        text = f"{ch.value:.0f} °C ({c_to_f(ch.value):.0f} °F)"
+        if ch.is_stale(now):
+            return Text(text, style="yellow dim")
+        return Text(text)
+
+    t.add_row("ctrl temp", _temp_text(state.controller_temp_c))
+    t.add_row("motor temp", _temp_text(state.motor_temp_c))
 
     return Panel(t, title="Motor controller", border_style="magenta")
 
