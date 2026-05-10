@@ -106,6 +106,28 @@ byte rollover behavior across the 25.5 / 51.1 / 76.7 A boundaries, and
 are now the cleanest cross-validation set for the F100F3 decode (see
 the F100F3 section below).
 
+A charging trace (`asc/charging-120V-90ish-to-100.asc`, 2026-05-09)
+provides the first capture with the charger actively delivering power
+to the pack, taken from ~90 % SOC on a 120 V outlet:
+
+* `charging-120V-90ish-to-100.asc` — 2863/3007 active-charging frames
+                                       (FF50 status = 0x03). End-to-end
+                                       it shows a textbook CC→CV taper
+                                       (~18.5 A → ~9.9 A → ~2.9 A) at
+                                       constant ~83 V. This is what
+                                       finally anchored the FF50
+                                       voltage and current scales (see
+                                       the FF50E5 section).
+
+A 100%-SOC idle capture with the charger plug inserted but BMS-
+inhibited:
+
+* `soc-100-idle.asc`                — charger present, no actual
+                                       charging (FF50 status = 0x03
+                                       with V settled, I ≈ 0). Useful
+                                       for distinguishing "plugged in,
+                                       BMS done" from "delivering".
+
 Fault-bitmap captures (`asc/bms-error-codes/`, 2026-05-09) gave us a
 matched-mode pair that nailed down F108 as the BMS active-fault bitmap:
 
@@ -244,13 +266,29 @@ F100F3 — "BMS pack status" (CONFIRMED pack-current source)
     load with the motor controller silent) the byte structure is:
 
       byte 1 (data[0]): 0x03                  — constant
-      byte 2 (data[1]): 0x3B..0x41            — varies INVERSELY with load;
-                                                 highest at idle (0x41),
-                                                 lowest under sustained
-                                                 hydraulic / driving load
-                                                 (0x3B..0x3C).
-                                                 Voltage / SOC proxy
-                                                 candidate. TENTATIVE.
+      byte 2 (data[1]): pack terminal voltage — CONFIRMED.
+                                                 V = b * 0.1 + 76.8.
+                                                 Range observed across
+                                                 all captures: 0x35..0x42
+                                                 → 82.1..83.4 V. Drops
+                                                 INVERSELY with load
+                                                 (sag under driving /
+                                                 hydraulic / inverter
+                                                 contactor draw).
+                                                 Anchored by linear
+                                                 regression vs
+                                                 20*mean(cell mV)
+                                                 across 24 captures
+                                                 (residuals < 0.55 V)
+                                                 and cross-checked
+                                                 against the FF50
+                                                 charger frame which
+                                                 uses an identical
+                                                 encoding (R^2 = 0.986
+                                                 across 2863 active-
+                                                 charging frames in
+                                                 charging-120V-90ish-
+                                                 to-100.asc).
       bytes 3-4 (data[2..3]):                 — SIGNED PACK CURRENT,
                                                  16-bit big-endian, 0.1
                                                  A/bit, biased so that
@@ -466,32 +504,54 @@ PGN decode notes (charger, SA = 0xE5)
 
 FF50E5 — "Charger telemetry (V, A)"
     Proprietary B frame from the on-board charger.
-      * byte 0 = status / mode (0 when idle, nonzero when charging)
-      * bytes 1..2 (LE u16) = output voltage at ~1/3 V/bit
-        (raw 0x00DC ≈ 73.3 V matches the pack at the time)
-      * bytes 3..4 (LE u16) = output current at 0.1 A/bit
-    CONFIRMED for V and A magnitudes during charging; status byte
-    semantics (beyond "0 = idle") are TENTATIVE.
+      * byte 0 = charger status / mode:
+          0x00 = idle (not delivering)
+          0x01, 0x02 = transient handshake states (only seen briefly
+                        during wake-up / ramp; treat as not-delivering)
+          0x03 = ACTIVELY delivering charge (CONFIRMED)
+      * bytes 1..2 (LE u16) = output voltage. Same encoding as F100F3
+        byte 1: V = raw * 0.1 + 76.8. CONFIRMED.
+      * bytes 3..4 (LE u16) = output current at 0.1 A/bit (no offset).
+        CONFIRMED.
+
+    Status decode CONFIRMED from charging-120V-90ish-to-100.asc — a
+    real charging trace from ~90 % SOC with the charger on 120 V mains.
+    Status sat at 0x03 for 2863/3007 frames (the active-delivery
+    portion); bytes 1..2 and 3..4 are only meaningful while
+    status == 0x03. The voltage and current scales were anchored
+    against contemporaneous F100F3 readings using time-aligned
+    regression across those 2863 active-charging frames:
+      * byte1 vs Pack_V: slope 0.1024, intercept 77.04, R^2 = 0.9856
+        → factor 0.1, offset 76.8 V (identical to F100 byte 1).
+      * byte3 vs |Pack_I|: slope 0.0989, intercept -0.07, R^2 = 0.9985
+        → 0.1 A/bit, no offset.
+    End-to-end the decoded current showed a textbook CC→CV taper
+    (~18.5 A → ~9.9 A → ~2.9 A) at constant ~83 V over the capture.
+
+    The earlier "raw 0x00DC ≈ 73.3 V via 1/3 V/bit" hypothesis was
+    WRONG — that decoder predates the charging trace and the regression
+    against F100. With the corrected formula, raw values seen at idle /
+    handshake are not voltage readings at all (see refinement below).
 
     Refinement from ignition-with-charger-inserted.asc: with the
     charger plug physically inserted in the tractor's port BUT no AC
     mains supplied to the charger, FF50E5 still beacons at ~10 Hz
-    (27 frames over 27 s) with status = 0x00, v_raw = 2 (~0.7 V),
+    (27 frames over 27 s) with status = 0x00, v_raw = 2 and
     i_raw = 2048 (constant). Separately, in normal-ignition.asc
     (no charger connected at all) the charger module ALSO beacons
     during wake-up, with status briefly cycling 0x00 → 0x01 → 0x02
-    and v_raw / i_raw sweeping nonsensical values (84 V, 700 A) for
-    a few frames. These are charger-module self-test artifacts, NOT
-    real bus readings — they will inflate the parser summary's V/I
-    range unless filtered by ignition completion. So:
-      * status = 0x00 means "not actively charging" — does NOT
+    and v_raw / i_raw sweeping nonsensical values for a few frames.
+    These are charger-module self-test artifacts, NOT real bus
+    readings — they will inflate the parser summary's V/I range
+    unless filtered by status. So:
+      * status = 0x00 means "not actively delivering" — does NOT
         distinguish "charger absent" from "charger present but not
         powered" from "charger present, AC live, but BMS-inhibited
         at 100% SOC". Charger-presence detection therefore lives
         elsewhere (current best candidate: F108F3 byte 7).
-      * The ~constant i_raw = 2048 with no AC power is sensor offset /
-        zero baseline, not a real current. Don't trust low-magnitude
-        FF50 current readings unless status is nonzero.
+      * status 0x01/0x02 are transient handshake states. Treat as
+        not-delivering for power accounting.
+      * Don't trust V/I unless status == 0x03.
 
 
 PGN decode notes (motor controller, SA = 0xCA)
@@ -759,6 +819,96 @@ the dashboard's display of them does NOT prove the BMS broadcasts
 them.
 
 
+Motor-controller error codes — methodology to decode (open)
+-----------------------------------------------------------
+
+We do not yet have a fault-mode capture for the motor controller (SA 0xCA).
+DM1 (FECA) is empty in every existing capture — same situation we had
+for the BMS before F108 was decoded — so the standard J1939 trouble-code
+channel is not the source. Methodology by analogy with the BMS work:
+
+What's already on the bus from SA 0xCA:
+* FECA (DM1)  — empty (`00 00 00 00 00 00 FF FF`).
+* FF21CA      — motor telemetry (~85 Hz). Three bytes are still
+                undecoded and are the highest-value MC-fault candidates:
+                  * byte 2 (data[1]): 0x00 constant in all captures
+                  * byte 5 (data[4]): three-state 0x28 / 0x3B / 0x3C
+                                      (changes near startup calibration)
+                  * byte 7 (data[6]): 0x00 constant in all captures
+                A constant-zero byte that "lights up" only under fault
+                conditions is exactly the F108-byte-7 pattern. byte 7 is
+                the strongest single candidate; byte 2 next; byte 5 is
+                more likely a state-machine field than a fault bitmap
+                (it changes during normal startup, which a fault flag
+                shouldn't).
+* Possibly a separate proprietary PGN we haven't seen because it's
+  silent until a fault asserts. Worth enumerating *all* (PGN, SA=0xCA)
+  pairs across every existing asc/*.asc to confirm FECA + FF21CA is
+  really all 0xCA emits in the no-fault state.
+* A capture might also surface MC fault info via a non-0xCA proxy
+  (the dashboard or VC re-broadcasting); enumerate any *new* PGNs
+  that appear in a fault capture but not in any clean baseline.
+
+Capture procedure (mirrors the BMS pair that nailed down F108):
+
+1. Clean baseline in the same key state as the planned fault capture.
+   Key on, in DRIVE (not neutral — the MC has more state machinery
+   awake in DRIVE; FF21CA byte 5 shifts), no faults active. Call it
+   `mc-clean-drive.asc`.
+2. Fault capture with one (ideally just one) MC code on the dashboard.
+   Single-code is critical: with the BMS we got lucky (six set bits in
+   numeric order) and could deduce the layout from one popcount match.
+   With a single set bit, the encoding is unambiguous regardless of
+   layout. Operator menu / cycle behavior of the dashboard determines
+   how to isolate one code.
+3. Byte-level diff between the two captures, restricted to messages
+   from SA 0xCA (and any new PGN that appears only in the fault file).
+   The change set should be small.
+4. Hypothesis check against the operator manual's MC error-code table
+   (assuming Solectrac publishes one analogous to the BMS table).
+   Popcount of the set bits should equal the count of displayed codes;
+   the bit-to-code mapping should fall out of single-code captures.
+
+Things to watch for:
+
+* FF21CA goes silent during charging (contactors open for traction).
+  Captures must be in a traction-ready state — fault captures while
+  plugged in won't carry FF21CA at all.
+* MC error code numbering may not share a numeric range with the BMS
+  table. A code 124 on the dashboard could in principle be either
+  BMS:124 or MC:124 depending on which subsystem the dashboard is
+  annunciating. Confirm against context (which subsystem the manual
+  attributes the code to) before reading too much into the number.
+* If the diff comes back empty (no FF21CA bytes change, no new PGNs
+  from 0xCA appear, no proxy frames change), that's the answer —
+  MC error codes aren't on this segment. They're then either:
+    - dashboard-synthesized from telemetry (analogous to hypothesis
+      #1 in the legacy "Dashboard error codes" section), or
+    - on the un-tapped drivetrain bus.
+* Don't intentionally induce dangerous faults to get a capture.
+  Reasonable MC faults to wait for or trigger safely: motor
+  over-temperature from sustained hydraulic-blocked operation,
+  low-pack-V cutoff during depleted-pack driving, direction-switch
+  contention from rapidly toggling forward/reverse pedals. Avoid
+  anything involving disconnecting sensor harnesses or stalling
+  the motor against a hard mechanical stop.
+
+Triage order if a fault capture is obtained:
+
+1. Diff FF21CA byte 7 first. Constant-zero across all clean captures
+   → highest prior probability of being the fault bitmap.
+2. Diff FF21CA byte 2 next. Same reasoning, weaker prior because
+   nothing else suggests it carries semantics.
+3. Enumerate any new (PGN, SA=0xCA) pairs only present in the fault
+   capture.
+4. Enumerate any byte in any frame whose value range expanded versus
+   the clean baseline.
+5. Only after the above turn up nothing should the un-tapped-second-
+   bus or dashboard-synthesized hypotheses be advanced; both imply
+   passive MC-fault capture on this segment is impossible and the
+   work shifts to active probing or a second tap.
+
+
 PGN decode notes (vehicle controller, SA = 0xD0)
 ------------------------------------------------
 
@@ -1000,8 +1150,18 @@ CONFIRMED:
     module-temp scaling (u8 + 40 °C)
     pack topology: 20S, 7 temp probes (vendor GUI)
     pack chemistry: NMC (vendor GUI: "NiCoMn")
-    charger output V (FF50 LE u16 @ 1/3 V/bit)
-    charger output A (FF50 LE u16 @ 0.1 A/bit)
+    charger output V (FF50 LE u16, V = raw * 0.1 + 76.8; identical
+        encoding to F100F3 byte 1; meaningful only while
+        FF50 status == 0x03)
+    charger output A (FF50 LE u16 @ 0.1 A/bit, no offset; meaningful
+        only while FF50 status == 0x03)
+    FF50 status byte 0: 0x00 = idle, 0x01/0x02 = transient handshake,
+        0x03 = actively delivering charge. CONFIRMED from
+        charging-120V-90ish-to-100.asc (2863/3007 frames at 0x03).
+    pack voltage at BMS terminals (F100F3 byte 1): V = b * 0.1 + 76.8.
+        Anchored by 24-capture regression vs 20*mean(cell mV)
+        (residuals < 0.55 V) and confirmed by FF50 active-charging
+        regression.
     vehicle-controller heartbeat init/ready states (F100D0 byte 0)
     F102 byte5 = max-cell number, 1-based
     F102 byte6 = min-cell number, 1-based
@@ -1058,17 +1218,16 @@ CONFIRMED:
 
 TENTATIVE / GUESSED:
     F102 byte 8 (flags) semantics
-    F100 byte 2 (data[1]) — voltage / SOC proxy. 0x3B..0x41 across
-        captures, varies inversely with load. Dynamic range too small
-        for a clean single-LSB voltage decode; possibly a coarse SOC
-        estimate.
     F100 byte 5 (data[4]) — 0xF8..0xFA. Plausibly a current-limit /
         status flag. Rare drops to 0xF8 under sustained hydraulic
         load hint at a status bit but not yet decoded.
     F100 byte 6 (data[5]) = 0xFA constant — possibly a related
         limit / config value.
     F100 byte 7 = 0x14 constant: probably the series cell count.
-    FF50 status-byte semantics beyond 0/nonzero
+    FF50 status: handshake states 0x01/0x02 — observed only as a brief
+        transient during wake-up; their precise meaning (e.g. CP/CC
+        negotiation phases) is not pinned down beyond "transient,
+        not delivering"
     F106 byte 0 running-mode vocabulary: 0x00 init, 0x80 standby/
         charger-detected, 0x45 ready/driving — partial.
     F107 limits-frame layout: bytes 0..1 = current limit (sentinel
