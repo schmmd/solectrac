@@ -87,7 +87,9 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     chgr_cmd.enable            0600 byte 4: 0=active command, 1=idle
     chgr_cmd.v_raw             0600 bytes 0-1 BE raw
     chgr_cmd.i_raw             0600 bytes 2-3 BE raw
-    vc.state                   F100D0 byte 0 (raw heartbeat state)
+    vc.state                   F100D0 byte 0 (vehicle-controller mode flag).
+                               Only ever 0x00 (init/transition) or 0x0C (ready)
+                               across 22,338 frames; bytes 1..7 are 0xFF padding
     motor.rpm_signed           FF21CA RPM with directional sign
     motor.rpm_magnitude        FF21CA RPM unsigned
     motor.direction            +1 forward / 0 idle / -1 reverse
@@ -267,11 +269,17 @@ SRC_VEHICLE = 0xD0   # vehicle controller; broadcasts a minimal F100 heartbeat
 SRC_MOTOR = 0xCA     # motor controller / drive ECU; FF21 telemetry, DM1 source
 SRC_DASH = 0x12      # dashboard / instrument-cluster heartbeat; only sends FF21
 
-# Decoded names for the byte-1 state field of 18F100D0 (used only by stdout
-# diagnostics; the numeric byte is what lands in signals.csv).
+# Decoded names for the byte-0 state field of 18F100D0 (used only by stdout
+# diagnostics; the numeric byte is what lands in signals.csv). Only these
+# two values are observed across 22,338 F100D0 frames in 30 captures (0x00
+# in 19 frames -- 0.08% -- and 0x0C in the other 22,319). The 0x00 frames
+# all occur in ignition-without-charger-inserted.asc as a brief leading-edge
+# burst (~365 ms cluster) ~0.5-1 s *before* the BMS F106 byte-1 state byte
+# transitions between drive_mode and charger_present. Bytes 1..7 of F100D0
+# are always 0xFF (the J1939 "not available" sentinel).
 VC_STATE_NAMES = {
-    0x00: "init",
-    0x0C: "ready",
+    0x00: "init",     # transient transition state (precedes BMS mode change)
+    0x0C: "ready",    # nominal steady state
 }
 
 # Cell-voltage and temperature PGN windows (BMS broadcasts).
@@ -727,6 +735,10 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     sc["f108"] += 1
 
             elif src == SRC_VEHICLE and pgn == PGN_F100:
+                # Vehicle controller F100 is a minimal 1-byte heartbeat:
+                # byte 0 is the only meaningful field (see VC_STATE_NAMES);
+                # bytes 1..7 are 0xFF "not available" sentinels in every
+                # observed frame.
                 emissions.append(("vc.state", data[0], ""))
                 sc["vc"] += 1
 
@@ -1102,7 +1114,13 @@ DECODERS = [
     ("chgr_cmd.i_raw", "0600", "F4", "2-3", "BE u16",
      "", "verified", ""),
     ("vc.state", "F100", "D0", "0", "u8 (raw)",
-     "", "verified", "0x00=init, 0x0C=ready"),
+     "", "verified",
+     "vehicle-controller mode flag; only 0x00 (init/transition) and 0x0C "
+     "(ready) observed across 22,338 frames in 30 captures. The 0x00 frames "
+     "(19 total, all in ignition-without-charger-inserted.asc) burst briefly "
+     "~0.5-1 s before BMS F106 byte 1 transitions between drive_mode and "
+     "charger_present, suggesting it leads BMS mode changes. Bytes 1..7 of "
+     "F100D0 are 0xFF (J1939 'not available') in every frame."),
     ("motor.rpm_signed", "FF21", "CA", "2-3, 7",
      "(LE u16 - 0x0C80) * direction(b7)", "rpm", "verified", ""),
     ("motor.rpm_magnitude", "FF21", "CA", "2-3", "LE u16 - 0x0C80",

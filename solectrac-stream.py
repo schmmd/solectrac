@@ -662,6 +662,11 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             state.decoded += 1
 
     elif src == SRC_VEHICLE and pgn == PGN_F100:
+        # Minimal vehicle-controller heartbeat. Across 22,338 frames in
+        # 30 captures, byte 0 only ever takes 0x00 (init/transition,
+        # 19 frames) or 0x0C (ready, 22,319 frames); bytes 1..7 are
+        # always 0xFF (J1939 "not available" sentinel). The 0x00 burst
+        # leads BMS F106 mode transitions by ~0.5-1 s.
         state.vc_state_raw.update(data[0], now)
         state.decoded += 1
 

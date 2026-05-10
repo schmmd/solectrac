@@ -211,8 +211,8 @@ CM_ BU_ Dashboard "Dashboard / instrument-cluster heartbeat ECU. J1939 source ad
 CM_ BU_ MotorECU "Motor controller / drive ECU. J1939 source address 0xCA. FF21 frame is suppressed entirely while charging (traction contactors open).";
 CM_ BU_ VehicleController "Vehicle controller. J1939 source address 0xD0. Broadcasts a minimal F100 heartbeat with a state byte.";
 
-CM_ BO_ 2565931216 "PGN F100 from VehicleController (0xD0). Minimal heartbeat; only byte 0 is decoded so far.";
-CM_ SG_ 2565931216 VC_State "Vehicle-controller state byte. 0x00=init, 0x0C=ready. Other values observed but not yet identified.";
+CM_ BO_ 2565931216 "PGN F100 from VehicleController (0xD0). Minimal heartbeat. Byte 0 is the only meaningful field (see VC_State); bytes 1..7 are always 0xFF (J1939 'not available' sentinel) across 22,338 frames in 30 captures and are intentionally not surfaced as DBC signals.";
+CM_ SG_ 2565931216 VC_State "Vehicle-controller state byte (PGN F100 from SA 0xD0). Across 22,338 F100D0 frames in 30 captures, only two values are ever observed: 0x00 (init/transition; 19 frames, 0.08%) and 0x0C (ready; 22,319 frames, 99.92%). The 19 init frames all occur in ignition-without-charger-inserted.asc as a brief leading-edge burst (~365 ms cluster) ~0.5-1 s BEFORE the BMS F106 byte-1 state byte transitions between drive_mode (0xE0) and charger_present (0xC4), suggesting VC_State leads BMS mode changes rather than following them. Bytes 1..7 of F100D0 are 0xFF (J1939 'not available' sentinel) in every observed frame and are not surfaced as DBC signals.";
 
 CM_ BO_ 2565931251 "PGN F100 from BMS (0xF3). Pack-level status. Byte 1 = pack terminal voltage; bytes 2-3 = signed pack current; byte 4 = BMS-published State-of-Charge.";
 CM_ SG_ 2565931251 Pack_Voltage "Pack voltage at the BMS terminals, 0.1 V/bit with a +76.8 V offset. Confirmed by linear regression against 20 * mean cell mV across 24 captures spanning b2 = 53..65 (82.0..83.3 V); residuals < 0.55 V. Resolution is coarse (0.1 V/bit means 8 mV per cell at 20s), but matches measured pack voltage well. Saturates below 76.8 V; NMC chemistry on this tractor never operates that low.";
