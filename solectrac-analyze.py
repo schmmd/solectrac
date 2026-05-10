@@ -37,8 +37,8 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     pack.cell_max_mv           PGN F102 derived pack-wide stats
     pack.cell_min_mv
     pack.cell_spread_mv
-    pack.byte5
-    pack.byte6_min_idx
+    pack.cell_max_n            F102 byte 5: max-cell number, 1-based (BMS GUI numbering)
+    pack.cell_min_n            F102 byte 6: min-cell number, 1-based (BMS GUI numbering)
     pack.flags
     pack.v_estimate            20 * mean(min, max) / 1000
     pack.voltage_v             F100 byte 2: pack voltage, b * 0.1 + 76.8 V
@@ -309,7 +309,9 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     base = (pgn - PGN_CELL_FIRST) * 4
                     for slot in range(4):
                         mv = be16(data[2 * slot], data[2 * slot + 1])
-                        if mv == 0:
+                        # 0 = empty slot, 0xFFFF = "not present" sentinel
+                        # for cell channels beyond the 20-cell pack.
+                        if mv == 0 or mv == 0xFFFF:
                             continue
                         emissions.append(
                             (f"cell.{base + slot:02d}.voltage_v",
@@ -354,8 +356,8 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     emissions.append(("pack.cell_min_mv", min_mv, "mv"))
                     emissions.append(
                         ("pack.cell_spread_mv", max_mv - min_mv, "mv"))
-                    emissions.append(("pack.byte5", data[4], ""))
-                    emissions.append(("pack.byte6_min_idx", data[5], ""))
+                    emissions.append(("pack.cell_max_n", data[4], ""))
+                    emissions.append(("pack.cell_min_n", data[5], ""))
                     emissions.append(("pack.flags", data[7], ""))
                     emissions.append(("pack.v_estimate", pack_v, "v"))
                     sc["f102"] += 1
@@ -450,10 +452,12 @@ DECODERS = [
      "mv", "verified", ""),
     ("pack.cell_spread_mv", "F102", "F3", "0-3", "max - min",
      "mv", "verified", ""),
-    ("pack.byte5", "F102", "F3", "4", "u8 (raw)",
-     "", "unknown", "semantics not yet identified"),
-    ("pack.byte6_min_idx", "F102", "F3", "5", "u8 (raw)",
-     "", "tentative", "appears to encode min-cell index"),
+    ("pack.cell_max_n", "F102", "F3", "4", "u8 (raw)",
+     "", "verified",
+     "max-cell number, 1-based (BMS GUI numbering); subtract 1 for 0-based cell_index"),
+    ("pack.cell_min_n", "F102", "F3", "5", "u8 (raw)",
+     "", "verified",
+     "min-cell number, 1-based (BMS GUI numbering); subtract 1 for 0-based cell_index"),
     ("pack.flags", "F102", "F3", "7", "u8 (raw)",
      "", "unknown", ""),
     ("pack.v_estimate", "F102", "F3", "0-3", "20 * (max+min)/2 / 1000",
