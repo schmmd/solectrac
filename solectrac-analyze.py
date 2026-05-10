@@ -72,7 +72,8 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
         58 A): mean decoded current matches the displayed dashboard reading
         within ~1 A across the full range, including across the 0x7D->0x7E and
         0x7F->0x80 high-byte rollovers.
-  * PGN 0xFF50 from 0xE5: byte 1 = status (0x02 = active),
+  * PGN 0xFF50 from 0xE5: byte 1 = status (0x00=idle, 0x01/0x02=handshake
+                          [transient], 0x03=active charging),
                           bytes 2-3 LE = charger output voltage (raw),
                           bytes 4-5 LE = charger output current in 0.1 A/bit.
     Voltage scale is uncertain pending a full-SOC capture; both raw and a
@@ -448,7 +449,8 @@ DECODERS = [
      "a", "verified",
      "+draw / -charge; cross-validated against amp-*.asc dashboard captures"),
     ("charger.status", "FF50", "E5", "0", "u8 (raw)",
-     "", "verified", "0x02 = active"),
+     "", "verified",
+     "0x00=idle, 0x01/0x02=handshake (transient), 0x03=active"),
     ("charger.v_raw", "FF50", "E5", "1-2", "LE u16",
      "", "verified", ""),
     ("charger.voltage_v", "FF50", "E5", "1-2", "LE u16 * (1/3)",

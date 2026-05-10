@@ -99,6 +99,14 @@ RPM_BIAS = 0x0C80
 
 VC_STATE_NAMES = {0x00: "init", 0x0C: "ready"}
 
+# Charger status byte (FF50CA byte 0). Values established empirically:
+#   0x00 = idle (charger module powered, not charging)
+#   0x01, 0x02 = transient handshake / pre-charge states (only seen briefly)
+#   0x03 = actively delivering power
+CHGR_STATUS_IDLE = 0x00
+CHGR_STATUS_ACTIVE = 0x03
+CHGR_HANDSHAKE_STATES = {0x01, 0x02}
+
 # Pack topology from the vendor BMS GUI screenshot (see NOTES.txt).
 NUM_CELLS = 20
 NUM_TEMPS = 7
@@ -366,9 +374,9 @@ def evaluate_alerts(state: State, mains_v: float, breaker_a: float,
                            f"temp delta {delta} °C ({delta * 9 / 5:.0f} °F)"
                            f" > 10 °C"))
 
-    # AC-supply budget (only meaningful while actively charging).
-    chgr_active = (state.chgr_status.value is not None
-                   and state.chgr_status.value != 0
+    # AC-supply budget (only meaningful while actively charging, status 0x03;
+    # handshake states 0x01/0x02 are too transient to draw breaker power).
+    chgr_active = (state.chgr_status.value == CHGR_STATUS_ACTIVE
                    and not state.chgr_status.is_stale(now))
     if (chgr_active and state.pack_v_est.value
             and state.pack_i_a.value is not None
@@ -428,7 +436,7 @@ def render_pack(state: State, mains_v: float, efficiency: float,
     t.add_row("voltage", fmt(state.pack_v_est, "{:.2f}", "V", now))
 
     pi = state.pack_i_a.value
-    chgr_active = ((state.chgr_status.value or 0) != 0
+    chgr_active = (state.chgr_status.value == CHGR_STATUS_ACTIVE
                    and not state.chgr_status.is_stale(now))
     if pi is None:
         i_text = Text("---", style="dim")
@@ -496,15 +504,19 @@ def render_charger(state: State, now: float) -> Panel:
         st = Text("---", style="dim")
     elif stale:
         st = Text(f"stale  (last 0x{int(cs):02X})", style="yellow dim")
-    elif cs == 0:
+    elif cs == CHGR_STATUS_IDLE:
         st = Text("idle")
+    elif cs in CHGR_HANDSHAKE_STATES:
+        st = Text(f"handshake (status=0x{int(cs):02X})", style="yellow")
+    elif cs == CHGR_STATUS_ACTIVE:
+        st = Text("CHARGING (status=0x03)", style="bold green")
     else:
-        st = Text(f"CHARGING (status=0x{int(cs):02X})", style="bold green")
+        st = Text(f"unknown (status=0x{int(cs):02X})", style="magenta")
     t.add_row("State", st)
-    t.add_row("V out", fmt(state.chgr_v, "{:.1f}", "V", now))
-    t.add_row("I out", fmt(state.chgr_i, "{:.1f}", "A", now))
+    t.add_row("voltage", fmt(state.chgr_v, "{:.1f}", "V", now))
+    t.add_row("current", fmt(state.chgr_i, "{:.1f}", "A", now))
     if state.chgr_v.value is not None and state.chgr_i.value is not None:
-        t.add_row("P out",
+        t.add_row("power",
                   Text(f"{state.chgr_v.value * state.chgr_i.value:.0f} W"))
     return Panel(t, title="Charger", border_style="green")
 
