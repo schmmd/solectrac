@@ -207,18 +207,12 @@ def describe_mc_code(code: int) -> str:
 # BMS_FAULT_DESCRIPTIONS at render time so the operator-manual text is
 # the single source of truth.
 #
-# Cross-validated against two operator-confirmed captures in
-# asc/bms-error-codes/:
-#   * bms-124-140-142-143-144-146.asc (codes 124,140,142,143,144,146):
-#     byte 7 = 0xBB = bits {0,1,3,4,5,7}
-#   * bms-fullcharge-102-109-140.asc (codes 102,109,140):
-#     byte 7 = 0x01 = bit {0}
-# The only code shared by both captures is 140, and the only byte-7 bit
-# shared by both is bit 0 -> bit 0 = 140 (not 124 as previously assumed).
-# That fixes 140 to bit 0 and forces 124 to bit 1; the remaining four set
-# bits (3,4,5,7) cover capture-A's remaining codes (142,143,144,146) in
-# numeric order. Bits 2 and 6 weren't lit in either capture, so codes
-# 141 and 145 are speculative assignments from the manual.
+# Bit 0 = 140 confirmed by injection on 2026-05-10 (spoofing F108 byte 7
+# = 0x01 alone displayed code 140 on the dashboard). That forces 124 to
+# bit 1; the remaining set bits (3,4,5,7) in bms-124-140-142-143-144-146
+# .asc (byte 7 = 0xBB) cover codes 142, 143, 144, 146 in numeric order.
+# Bits 2 and 6 weren't lit in either operator-confirmed capture; codes
+# 141 (reserved) and 145 are speculative assignments from the manual.
 #
 # These map onto the DBC's Fault_<code>_<ShortName> bit-level signals.
 BMS_FAULT_CODES_BYTE7: List[Tuple[int, int]] = [
@@ -414,7 +408,8 @@ class State:
     motor_rpm: Channel = field(default_factory=Channel)        # signed (dir * |rpm|)
     motor_rpm_mag: Channel = field(default_factory=Channel)    # |rpm| magnitude
     motor_throttle: Channel = field(default_factory=Channel)
-    motor_direction: Channel = field(default_factory=Channel)  # -1 rev / 0 idle / +1 fwd
+    motor_direction: Channel = field(default_factory=Channel)  # -1 R / 0 N / +1 F (byte 7 low nibble)
+    motor_range_gear: Channel = field(default_factory=Channel) # 1..3 (byte 7 high nibble)
     # FF21CA bytes 4 and 5 are both J1939 +40 C-offset temps; byte 4 is
     # the main controller (consistently warmer, ramps from cold-start) and
     # byte 5 is the motor housing.
@@ -457,19 +452,12 @@ class State:
     # over the SOC_ETA_WINDOW_S window and falls back to the full
     # retained history when the window lands inside a SOC plateau.
     soc_history: Deque[Tuple[float, float]] = field(default_factory=deque)
-    # F108 fault bitmap bytes. Byte 7 is decoded (BMS warning code
-    # bitmap from the operator manual). Bytes 0..6 surveyed across
-    # all 30 captures (36,952 F108 frames):
-    #   bytes 1, 3, 4, 6: always 0x00 (reserved padding)
-    #   byte 0: 0x00 or 0x10 (bit 4 only)
-    #   byte 2: 0x00 or 0x04 (bit 2 only)
-    #   byte 5: 0x00 or 0x01 (bit 0 only)
-    # Byte 0 bit 4 + byte 2 bit 2 are paired (set together in all
-    # but 3 transient frames) and track "code 140 active without
-    # code 124"; byte 5 bit 0 tracks "code 124 active". They mirror
-    # state already encoded in byte 7 rather than carrying new
-    # codes. All 8 bytes are still tracked so any future deviation
-    # (e.g. from a fault constellation not yet seen) is visible.
+    # F108 fault bitmap bytes. Bytes 0..6 carry vendor codes 100..127 at
+    # 2 bits per code (4 codes per byte; code = 100 + 4*byte + pair_index
+    # over bit pairs (0,1)(2,3)(4,5)(6,7)); see active_bms_faults. Byte 7
+    # is the system/maintenance code bitmap (1 bit per code, decoded
+    # against BMS_FAULT_CODES_BYTE7). All 8 bytes are tracked so the TUI
+    # can show raw bitmap state alongside decoded codes.
     fault_bytes: List[Channel] = field(
         default_factory=lambda: [Channel() for _ in range(8)]
     )
@@ -620,11 +608,10 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             state.decoded += 1
 
         elif pgn == PGN_F108:
-            # All zeros in healthy idle. Byte 7 = dashboard-displayed
-            # warning code bitmap (decoded). Other bytes carry fault
-            # info too (bytes 0 and 2 seen nonzero with BMS codes
-            # 102/109/140 cycling on the dashboard) but the bit-to-
-            # code mapping isn't established yet.
+            # All zeros in healthy idle. Bytes 0..6 carry vendor codes
+            # 100..127 (2 bits per code). Byte 7 carries the system /
+            # maintenance code bitmap (1 bit per code). See
+            # active_bms_faults for the full decode.
             for i in range(8):
                 state.fault_bytes[i].update(data[i], now)
             state.decoded += 1
@@ -735,22 +722,26 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
         #   byte 4 = controller temp (J1939 +40 C offset, 0=absent)
         #   byte 5 = motor temp     (J1939 +40 C offset, 0=absent)
         #   byte 6 = always 0x00 (reserved padding)
-        #   byte 7 = direction selector (0x10/0x14/0x18)
+        #   byte 7 = packed (range_gear << 4) | direction
+        #            high nibble 0x0/0x1/0x2 = Range 1/2/3
+        #            low  nibble 0x0/0x4/0x8 = N / F / R
         # bytes 2-3 little-endian, biased by 0x0C80, give RPM magnitude.
         rpm_mag = ((data[3] << 8) | data[2]) - RPM_BIAS
-        # byte 7 = directional pedal selector; only three literal values
-        # have been observed (NOTES.txt). Match exactly to avoid
-        # accepting unobserved values as forward/reverse.
-        pedal = data[7]
-        if pedal == 0x14:
-            direction = 1            # forward pedal
-        elif pedal == 0x18:
-            direction = -1           # reverse pedal
+        # Low nibble of byte 7 = F/N/R lever; verified by drive-r-n-f.asc
+        # walking R->N->F (byte 7: 0x28->0x20->0x24). High nibble = range
+        # gear; verified by range-1-2-3.asc walking 1->2->3.
+        fnr = data[7] & 0x0F
+        if fnr == 0x4:
+            direction = 1            # forward
+        elif fnr == 0x8:
+            direction = -1           # reverse
         else:
-            direction = 0            # idle / neither (0x10) or unknown
+            direction = 0            # neutral
+        range_gear = ((data[7] >> 4) & 0x0F) + 1
         state.motor_rpm_mag.update(rpm_mag, now)
         state.motor_rpm.update(direction * rpm_mag, now)
         state.motor_direction.update(direction, now)
+        state.motor_range_gear.update(range_gear, now)
         state.motor_throttle.update(data[0], now)
         # bytes 4 and 5 are both J1939 +40 C-offset temperatures; byte 4
         # is the main controller and byte 5 is the motor (per the
@@ -866,22 +857,30 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
 # --- BMS faults -------------------------------------------------------------
 
 def active_bms_faults(state: State) -> List[Tuple[int, str]]:
-    """Return [(code_number, description), ...] for currently set bits in
-    F108 byte 7 (the dashboard-visible BMS warning code bitmap).
+    """Return [(code_number, description), ...] for currently active codes
+    in F108. Bytes 0..6 use 2 bits per code (codes 100..127); byte 7 uses
+    1 bit per code per BMS_FAULT_CODES_BYTE7. Codes that fall in both
+    groups (124, 140) are deduplicated.
 
     Descriptions come from the operator-manual BMS_FAULT_DESCRIPTIONS
-    table. Byte 5's semantics aren't decoded yet, so it isn't surfaced
-    here as a code; render_faults shows its raw value separately for
-    visibility.
+    table.
     """
+    active: set = set()
+    for i in range(7):
+        b = state.fault_bytes[i].value
+        if b is None:
+            continue
+        b = int(b)
+        for pair in range(4):
+            if (b >> (pair * 2)) & 0b11:
+                active.add(100 + 4 * i + pair)
     b7 = state.fault_bytes[7].value
-    if b7 is None:
-        return []
-    out: List[Tuple[int, str]] = []
-    for bit, code in BMS_FAULT_CODES_BYTE7:
-        if (int(b7) >> bit) & 1:
-            out.append((code, describe_bms_code(code)))
-    return out
+    if b7 is not None:
+        b7 = int(b7)
+        for bit, code in BMS_FAULT_CODES_BYTE7:
+            if (b7 >> bit) & 1:
+                active.add(code)
+    return [(code, describe_bms_code(code)) for code in sorted(active)]
 
 
 # --- alerts -----------------------------------------------------------------
@@ -1533,8 +1532,15 @@ def render_motor(state: State, now: float) -> Panel:
     elif di == -1:
         di_text = Text("REVERSE", style="bold yellow")
     else:
-        di_text = Text("idle", style="dim")
-    t.add_row("direction", di_text)
+        di_text = Text("NEUTRAL", style="dim")
+    t.add_row("F/N/R", di_text)
+
+    rg = state.motor_range_gear.value
+    if rg is None:
+        rg_text = Text("---", style="dim")
+    else:
+        rg_text = Text(f"R{int(rg)}")
+    t.add_row("range", rg_text)
 
     def _temp_text(ch: Channel) -> Text:
         if ch.value is None:

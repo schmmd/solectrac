@@ -72,18 +72,17 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
                                transient values 0x4D / 0x6B / 0xA7 in init/teardown
     bms.fault.byteN            F108 bytes 0..7 raw (only emitted when frame is non-zero;
                                corresponds to DBC FaultByteN_Raw signals).
-                               Across 36,952 F108 frames (30 captures): bytes 1,3,4,6 are
-                               always 0x00 (reserved padding); byte 0 is only ever 0x00 or
-                               0x10 (bit 4); byte 2 is only ever 0x00 or 0x04 (bit 2); byte 5
-                               is only ever 0x00 or 0x01 (bit 0); byte 7 holds the dashboard
-                               warning code bitmap. Byte 0 bit 4 and byte 2 bit 2 are paired
-                               (set together in all but 3 transient frames) and track "code
-                               140 active without code 124"; byte 5 bit 0 tracks "code 124
-                               active". They appear to mirror state already conveyed by byte
-                               7 rather than encode any new codes.
-    bms.fault.code_NNN         F108 byte 7: 1 when bit set; NNN per vendor table
-                               (124, 140, 142, 143, 144, 145, 146; corresponds to
-                               DBC Fault_<NNN>_<ShortName> bit signals)
+                               Bytes 0..6 are a 2-bit-per-code bitmap covering codes
+                               100..127 (4 codes per byte; see bms.fault.code_NNN). Byte 7
+                               is the dashboard system/maintenance bitmap (1 bit per code:
+                               124, 140, 142..146). Codes 124 and 140 also fall in the
+                               bytes-0..6 layout (byte 6) and are emitted once per frame.
+    bms.fault.code_NNN         vendor BMS error code asserted (=1). Bytes 0..6 use 2 bits
+                               per code, packed sequentially: code = 100 + 4*byte +
+                               pair_index over bit pairs (0,1),(2,3),(4,5),(6,7); either
+                               bit asserts the code (J1939 status convention). Byte 7
+                               uses 1 bit per code per BMS_FAULT_CODES_BYTE7. Confirmed by
+                               injection sweep for codes 100..105; predicted for 106..127.
     charger.status             FF50 byte 0
     charger.v_raw              FF50 bytes 1-2 LE (raw, always emitted)
     charger.voltage_v          FF50 charger output voltage, raw * 0.1 + 76.8 V
@@ -103,7 +102,8 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
                                across 22,338 frames; bytes 1..7 are 0xFF padding
     motor.rpm_signed           FF21CA RPM with directional sign
     motor.rpm_magnitude        FF21CA RPM unsigned
-    motor.direction            +1 forward / 0 idle / -1 reverse
+    motor.direction            +1 forward / 0 neutral / -1 reverse (F/N/R lever, byte 7 low nibble)
+    motor.range_gear           1..3 range selector (byte 7 high nibble)
     motor.throttle_raw         FF21CA byte 0 (0..0x69 across the corpus; behaves like a
                                J1939 0..100% percent field with idle resting offset ~3
                                and controller dead-low ~14)
@@ -157,33 +157,21 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
         58 A): mean decoded current matches the displayed dashboard reading
         within ~1 A across the full range, including across the 0x7D->0x7E and
         0x7F->0x80 high-byte rollovers.
-  * PGN 0xF108 byte 7 = dashboard-displayed BMS warning code bitmap. Each
-        bit maps to a code in the vendor BMS error-code table (operator
-        manual). bit 0=140, bit 1=124, bit 3=142, bit 4=143, bit 5=144,
-        bit 7=146 (bits 2 and 6 didn't appear in either calibration
-        capture; codes 141 and 145 from the manual are speculatively
-        assigned).
-        Bytes 0..6 are surveyed across all 30 captures (36,952 F108
-        frames). Bytes 1, 3, 4, 6 are always 0x00 (reserved padding).
-        Bytes 0, 2, 5 each take only two values:
-            byte 0: 0x00 or 0x10 (bit 4)
-            byte 2: 0x00 or 0x04 (bit 2)
-            byte 5: 0x00 or 0x01 (bit 0)
-        Only six (byte0, byte2, byte5, byte7) tuples appear across the
-        corpus:
-            (00,00,00,00) idle/quiet
-            (10,04,00,01) byte 7 has code 140 only
-            (10,04,00,B9) byte 7 has codes {140,142,143,144,146}
-            (00,00,01,BB) byte 7 has codes {124,140,142,143,144,146}
-            (10,00,00,01) and (00,00,00,B8) appear < 5 times each
-                (transient).
-        Byte 0 bit 4 and byte 2 bit 2 are paired (set or clear together
-        in 36,949 / 36,952 frames; the 3-frame mismatch is transient) and
-        are set exactly when byte 7 has code 140 active *and* code 124
-        clear. Byte 5 bit 0 is set exactly when byte 7 has code 124
-        active. These appear to mirror state already conveyed by byte 7
-        rather than encode any new codes; they are still surfaced as
-        raw bms.fault.byteN values for forward compatibility.
+  * PGN 0xF108 = BMS active fault bitmap.
+        Bytes 0..6 carry vendor codes 100..127 at 2 bits per code, 4 codes
+        per byte, packed sequentially: code = 100 + 4*byte + pair_index
+        where pair_index in 0..3 addresses bit pairs (0,1),(2,3),(4,5),
+        (6,7). Either bit asserted -> code on. Layout confirmed by injection
+        sweep (solectrac-inject-f108.py) for codes 100..105 and consistent
+        with bms-fullcharge-102-109-140.asc (byte 0 bit 4 -> code 102,
+        byte 2 bit 2 -> code 109). The 2-bit-per-code shape matches the
+        SAE J1939 status convention.
+        Byte 7 carries the system/maintenance code group at 1 bit per code:
+        bit 0=140, bit 1=124, bit 3=142, bit 4=143, bit 5=144, bit 7=146
+        (bits 2 and 6 didn't appear in either calibration capture; codes
+        141 and 145 from the manual are speculatively assigned). Codes
+        124 and 140 also fall inside the bytes-0..6 layout (byte 6); the
+        active-code set is merged so each code is emitted once per frame.
   * PGN 0xFF50 from 0xE5: byte 0 = status (0x00=idle, 0x01/0x02=handshake
                           [transient], 0x03=active charging),
                           bytes 1-2 LE = charger output voltage at the pack
@@ -257,10 +245,20 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
         byte 5     = motor temperature, J1939 +40 C offset.
         byte 6     = always 0x00 across 45,086 frames in 30 captures
                      (reserved padding)
-        byte 7     = directional pedal state (foot-pedal selector):
-                       0x10 = idle / neither pedal
-                       0x14 = forward pedal pressed
-                       0x18 = reverse pedal pressed
+        byte 7     = packed transmission state: high nibble = RANGE GEAR
+                     (1..3), low nibble = F/N/R LEVER. Confirmed by two
+                     controlled captures:
+                       drive-r-n-f.asc   walks the F/N/R lever R -> N -> F
+                                         in Range 3, byte 7 = 0x28 -> 0x20
+                                         -> 0x24 (low nibble 8 -> 0 -> 4).
+                       range-1-2-3.asc   walks the range selector 1 -> 2 -> 3
+                                         in Forward, byte 7 = 0x04 -> 0x14
+                                         -> 0x24 (high nibble 0 -> 1 -> 2).
+                     Encoding:
+                       high nibble 0x0/0x1/0x2 = Range 1/2/3
+                       low  nibble 0x0/0x4/0x8 = N / F / R
+                     Direction sign (for signed RPM) comes from the low
+                     nibble; range gear is reported separately.
     Frame is suppressed entirely while charging (contactors open for traction).
   * PGN 0xFF21 from 0x12: dashboard / instrument-cluster heartbeat.
         Same PGN as the motor telemetry above, but a different sender (SA
@@ -360,19 +358,13 @@ PACK_NOMINAL_V = 72.0
 PACK_CAPACITY_WH = PACK_CAPACITY_AH * PACK_NOMINAL_V    # 21,600 Wh
 
 # F108 byte 7: dashboard-displayed BMS warning code bitmap. Bit -> (code,
-# description). Cross-validated against two operator-confirmed captures
-# in asc/bms-error-codes/:
-#   * bms-124-140-142-143-144-146.asc (codes 124,140,142,143,144,146):
-#     byte 7 = 0xBB = bits {0,1,3,4,5,7}
-#   * bms-fullcharge-102-109-140.asc (codes 102,109,140):
-#     byte 7 = 0x01 = bit {0}
-# The only code shared by both captures is 140, and the only byte-7 bit
-# shared by both is bit 0 -> bit 0 = 140 (not 124 as previously assumed).
-# That fixes 140 to bit 0 and forces 124 to bit 1; the remaining four set
-# bits (3,4,5,7) cover the four remaining capture-A codes (142,143,144,
-# 146) in numeric order. Bits 2 and 6 weren't lit in either capture, so
-# the codes assigned to them are *speculative*; codes 141 and 145 from
-# the manual are the most plausible candidates.
+# description). Bit 0 = 140 confirmed by injection on 2026-05-10
+# (spoofing F108 = 00..01 displayed code 140 on the dashboard); that
+# forces 124 to bit 1 and the remaining set bits (3,4,5,7) in capture
+# bms-124-140-142-143-144-146.asc (byte 7 = 0xBB) to codes 142, 143,
+# 144, 146 in numeric order. Bits 2 and 6 weren't lit in either
+# operator-confirmed capture; codes 141 (reserved) and 145 from the
+# manual are speculative assignments.
 BMS_FAULT_CODES_BYTE7 = [
     (0, 140, "System fault: kvst"),
     (1, 124, "Pre-charging fault"),
@@ -790,20 +782,25 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     sc["f107"] += 1
 
                 elif pgn == PGN_F108:
-                    # All zeros = healthy idle baseline. Byte 7 is the
-                    # dashboard-displayed BMS warning code bitmap (decoded
-                    # against the vendor table).
-                    # Across the 30-capture corpus (36,952 F108 frames):
-                    #   bytes 1, 3, 4, 6 are always 0x00 (reserved padding)
-                    #   byte 0   is 0x00 or 0x10  (bit 4 only)
-                    #   byte 2   is 0x00 or 0x04  (bit 2 only)
-                    #   byte 5   is 0x00 or 0x01  (bit 0 only)
-                    # Byte 0 bit 4 + byte 2 bit 2 are paired and track
-                    # "code 140 active without code 124"; byte 5 bit 0
-                    # tracks "code 124 active". They mirror state already
-                    # conveyed by byte 7 rather than carrying new codes.
-                    # Bytes 0..6 are still emitted raw (when nonzero) for
-                    # forward compatibility / parity with the DBC.
+                    # All zeros = healthy idle baseline.
+                    #
+                    # Bytes 0..6 are a 2-bit-per-code bitmap covering
+                    # vendor codes 100..127 (4 codes per byte, packed
+                    # sequentially). For byte i in 0..6 and pair index
+                    # p in 0..3, code = 100 + 4*i + p, addressing bit
+                    # pair (2p, 2p+1). Either bit asserted -> code on.
+                    # Confirmed by injection sweep (see solectrac-inject-
+                    # f108.py) for codes 100..105 and consistent with the
+                    # bms-fullcharge-102-109-140.asc snapshot (byte 0 bit
+                    # 4 -> code 102; byte 2 bit 2 -> code 109).
+                    #
+                    # Byte 7 is the dashboard-displayed system/maintenance
+                    # bitmap (1 bit per code, decoded against the vendor
+                    # table — see BMS_FAULT_CODES_BYTE7).
+                    #
+                    # Codes 124 and 140 appear in BOTH groups (byte 6 via
+                    # the bytes-0..6 layout, AND byte 7); the sets are
+                    # merged so each code is emitted once per frame.
                     if all(b == 0 for b in data):
                         sc["skipped_zero"] += 1
                         continue
@@ -811,11 +808,19 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                         if b != 0:
                             emissions.append(
                                 (f"bms.fault.byte{i}", b, ""))
+                    active_codes: set[int] = set()
+                    for i in range(7):
+                        b = data[i]
+                        for pair in range(4):
+                            if (b >> (pair * 2)) & 0b11:
+                                active_codes.add(100 + 4 * i + pair)
                     b7 = data[7]
                     for bit, code, _desc in BMS_FAULT_CODES_BYTE7:
                         if (b7 >> bit) & 1:
-                            emissions.append(
-                                (f"bms.fault.code_{code}", 1, ""))
+                            active_codes.add(code)
+                    for code in sorted(active_codes):
+                        emissions.append(
+                            (f"bms.fault.code_{code}", 1, ""))
                     sc["f108"] += 1
 
             elif src == SRC_VEHICLE and pgn == PGN_F100:
@@ -830,18 +835,21 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                 # bytes 2-3 little-endian, biased by 0x0C80, give RPM magnitude.
                 rpm_mag = ((data[3] << 8) | data[2]) - RPM_BIAS
                 throttle_raw = data[0]
-                # byte 7 selects which directional pedal is pressed.
-                pedal = data[7]
-                if pedal == 0x14:
-                    direction = 1            # forward pedal
-                elif pedal == 0x18:
-                    direction = -1           # reverse pedal
+                # byte 7 packs (range_gear << 4) | direction.
+                # low nibble: 0=N, 4=F, 8=R; high nibble: 0/1/2 = Range 1/2/3.
+                fnr = data[7] & 0x0F
+                if fnr == 0x4:
+                    direction = 1            # forward
+                elif fnr == 0x8:
+                    direction = -1           # reverse
                 else:
-                    direction = 0            # idle / neither
+                    direction = 0            # neutral
+                range_gear = ((data[7] >> 4) & 0x0F) + 1  # 0/1/2 -> 1/2/3
                 rpm_signed = direction * rpm_mag
                 emissions.append(("motor.rpm_signed", rpm_signed, "rpm"))
                 emissions.append(("motor.rpm_magnitude", rpm_mag, "rpm"))
                 emissions.append(("motor.direction", direction, ""))
+                emissions.append(("motor.range_gear", range_gear, ""))
                 emissions.append(("motor.throttle_raw", throttle_raw, ""))
                 # bytes 4 and 5 are both J1939 +40 C-offset temperatures.
                 # The operator manual lists two separate gauges on the dash:
@@ -1224,17 +1232,20 @@ DECODERS = [
      "rare transients 0x4D/0x6B/0xA7 during ignition/teardown"),
     ("bms.fault.byteN", "F108", "F3", "0..7", "u8 (raw, when nonzero)",
      "", "verified",
-     "byte 7 = dashboard warning code bitmap (see bms.fault.code_NNN); "
-     "bytes 1,3,4,6 always 0x00 across 36,952 frames (reserved padding); "
-     "byte 0 in {0x00,0x10}, byte 2 in {0x00,0x04}, byte 5 in {0x00,0x01}; "
-     "byte 0 bit 4 + byte 2 bit 2 paired and set when byte 7 has code 140 "
-     "but not 124; byte 5 bit 0 set when byte 7 has code 124; appear to "
-     "mirror byte-7 state rather than encode new codes"),
-    ("bms.fault.code_NNN", "F108", "F3", "7", "(byte7 >> bit) & 1",
+     "raw bitmap bytes; bytes 0..6 carry codes 100..127 at 2 bits per "
+     "code (see bms.fault.code_NNN); byte 7 carries the system / "
+     "maintenance code group at 1 bit per code"),
+    ("bms.fault.code_NNN", "F108", "F3", "0..7", "see notes",
      "", "verified",
-     "NNN per vendor BMS error-code table; bit 0=140, bit 1=124, bit 3=142, "
-     "bit 4=143, bit 5=144, bit 7=146 (bits 2 and 6 speculative as codes "
-     "141 and 145); emitted as 1 only when bit set"),
+     "vendor BMS error code is asserted (=1). Bytes 0..6 use 2 bits per "
+     "code, 4 codes per byte: code = 100 + 4*byte + pair_index for pair_"
+     "index in 0..3 over bit pairs (0,1),(2,3),(4,5),(6,7); confirmed by "
+     "injection sweep for codes 100..105 (predicted for 106..127). "
+     "Byte 7 uses 1 bit per code: bit 0=140, bit 1=124, bit 3=142, "
+     "bit 4=143, bit 5=144, bit 7=146 (bits 2 and 6 speculative as "
+     "codes 141 and 145); injection of byte 7 bit 0 alone would settle "
+     "the bit-0=140 vs bit-0=124 question. Codes 124 and 140 appear in "
+     "both groups; emitted once per frame regardless"),
     ("charger.status", "FF50", "E5", "0", "u8 (raw)",
      "", "verified",
      "0x00=idle, 0x01/0x02=handshake (transient), 0x03=active"),
@@ -1286,8 +1297,13 @@ DECODERS = [
      "(LE u16 - 0x0C80) * direction(b7)", "rpm", "verified", ""),
     ("motor.rpm_magnitude", "FF21", "CA", "2-3", "LE u16 - 0x0C80",
      "rpm", "verified", "verified against 0->2500 RPM acceleration trace"),
-    ("motor.direction", "FF21", "CA", "7", "0x14->+1, 0x18->-1, else 0",
-     "", "verified", "directional pedal selector"),
+    ("motor.direction", "FF21", "CA", "7",
+     "low nibble: 0x4->+1, 0x8->-1, 0x0->0",
+     "", "verified",
+     "F/N/R lever; verified by drive-r-n-f.asc walking R->N->F"),
+    ("motor.range_gear", "FF21", "CA", "7",
+     "(b7 >> 4) + 1", "", "verified",
+     "range selector 1..3; verified by range-1-2-3.asc walking 1->2->3"),
     ("motor.throttle_raw", "FF21", "CA", "0", "u8 (raw)",
      "", "verified",
      "0..0x69 (0..105) across 45,086 frames; behaves like J1939 0..100% "
@@ -1472,7 +1488,7 @@ def summarize(counts: dict, rows: list):
         })
         if active_codes:
             print(f"    BMS codes : {', '.join(str(c) for c in active_codes)} "
-                  f"(union over capture; F108 byte 7)")
+                  f"(union over capture; F108 bytes 0..7)")
         chgr_v = values_for(rows, scenario, "charger.voltage_v")
         chgr_i = values_for(rows, scenario, "charger.current_a")
         if chgr_v:
@@ -1495,11 +1511,16 @@ def summarize(counts: dict, rows: list):
         if rpms_signed:
             n_fwd = sum(1 for d in dirs if d == 1)
             n_rev = sum(1 for d in dirs if d == -1)
-            n_idle = sum(1 for d in dirs if d == 0)
+            n_neu = sum(1 for d in dirs if d == 0)
             print(f"    motor RPM : {min(rpms_signed)}..{max(rpms_signed)} (signed)")
             print(f"    |RPM|     : {min(rpms_mag)}..{max(rpms_mag)}")
             print(f"    throttle  : {min(thr)}..{max(thr)} (raw)")
-            print(f"    pedal     : fwd={n_fwd}  rev={n_rev}  idle={n_idle}")
+            print(f"    F/N/R     : F={n_fwd}  R={n_rev}  N={n_neu}")
+            ranges = values_for(rows, scenario, "motor.range_gear")
+            if ranges:
+                seen = sorted(set(ranges))
+                counts = "  ".join(f"R{g}={ranges.count(g)}" for g in seen)
+                print(f"    range     : {counts}")
 
 
 # --- main --------------------------------------------------------------------

@@ -8,6 +8,74 @@ lives. Numbers below come from the captures in this directory and are
 subject to revision when better data or vendor documentation arrives.
 
 
+Table of contents
+-----------------
+
+* Status overview (TL;DR)
+* Tractor / pack context
+* Captures used
+* Source-address (SA) map observed in these captures
+* PGN decode notes (BMS, SA = 0xF3)
+* PGN decode notes (charger, SA = 0xE5)
+* PGN decode notes (motor controller, SA = 0xCA)
+* PGN decode notes (vehicle controller, SA = 0xD0)
+* Vendor BMS error code table (operator manual)
+* Dashboard error codes — F108 carries the displayed BMS bitmap
+* Vendor MC error code table (operator manual)
+* Motor-controller error codes — methodology to decode (open)
+* Vendor BMS GUI screenshot — provenance and ground-truth values
+* Open questions / future work
+* Confidence summary
+
+
+Status overview (TL;DR)
+-----------------------
+
+This is the rolled-up state. See the Confidence summary at the bottom
+for the full per-signal log with cross-validation.
+
+Pack & topology (CONFIRMED via vendor GUI):
+    20 series cells, 7 temperature probes, NMC chemistry, 300 Ah / 72 V
+    nominal.
+
+Decoded (CONFIRMED):
+    * F113..F13C  per-cell voltages, BE u16 mV.
+    * F155..F15E  per-module temps, u8 with +40 °C offset.
+    * F102F3      cell min/max mV summary, 1-based cell-number indexing,
+                  spread.
+    * F100F3      pack voltage (V = b * 0.1 + 76.8) and signed pack
+                  current (16-bit BE, 0x7D00 bias, 0.1 A/bit).
+    * F100D0      VC heartbeat (0x00 init / 0x0C ready).
+    * F108F3      dashboard BMS warning code bitmap in the last byte
+                  (codes 124, 140, 142..146).
+    * FF50E5      charger telemetry — status, output V, output A.
+                  V/A only meaningful while status = 0x03.
+    * FF21CA      motor telemetry — RPM (magnitude, with 0x0C80 bias),
+                  throttle pedal, controller temp, packed transmission
+                  state (byte 7: high nibble = range gear 1..3, low
+                  nibble = F/N/R lever as 0/4/8). Suppressed while
+                  charging.
+
+Partially decoded (TENTATIVE):
+    * F106    running-mode vocabulary (0x00 init / 0x80 standby /
+              0x45 ready) — partial.
+    * F107    limits-frame layout (current and voltage limits with
+              0x2710 sentinel).
+    * F108    additional fault info beyond the byte-7 code bitmap;
+              bit-to-code mapping for the other bytes open.
+    * F100F3  status / limit candidate bytes near the end of the
+              payload.
+    * FF21CA  three-state byte tied to startup calibration.
+
+Open (UNKNOWN):
+    * SOC / SOH / alarm-word host PGN.
+    * KL15 / wake-up status bit location.
+    * F104 byte-level decode (temp min/max summary).
+    * Motor-controller error-code channel (DM1 stays empty even with
+      codes on the dashboard).
+    * Whether a separate drivetrain bus carries inverter / PTO telemetry.
+
+
 Tractor / pack context
 ----------------------
 
@@ -85,6 +153,12 @@ A second batch of captures (Vector ASC format, in `asc/`), taken at
 * `full-throttle-hydraulics.asc`  — full throttle plus hydraulics
                                      actuated; tractor still in neutral.
 * `accellerate-decelerate.asc`    — varying throttle, in neutral.
+* `drive-r-n-f.asc`               — F/N/R lever walked R -> N -> F
+                                     (10 s each), no pedal. Pinned down
+                                     FF21CA byte 7 low nibble = direction.
+* `range-1-2-3.asc`               — range selector walked 1 -> 2 -> 3
+                                     (10 s each) in Forward. Pinned down
+                                     FF21CA byte 7 high nibble = range.
 
 Unlike the recorded-data/*.csv captures, the ASC files carry real
 microsecond-resolution per-frame timestamps, which unblocks all
@@ -458,99 +532,86 @@ F107F3 — "BMS current/voltage limits"
     Confirming this requires a charge capture from low SOC where the
     BMS will publish meaningful charge-current limits.
 
-F108F3 — "BMS active fault bitmap" (CONFIRMED for byte 7; TENTATIVE elsewhere)
+F108F3 — "BMS active fault bitmap" (CONFIRMED layout, bytes 0..6 + byte 7)
     Active BMS fault flags. All bytes are 0x00 in healthy idle, verified
     against asc/bms-error-codes/idle-no-bms.asc (key on, neutral, no
-    charger). Byte 7 is the dashboard-visible BMS warning code bitmap;
-    the eight bits map to the vendor "BMS error code" table from the
-    operator manual, packed in numeric order with reserved-number bits
-    (141) sitting in their natural slot:
+    charger).
 
-        bit 0 (mask 0x01) = code 124  Clock fault
-        bit 1 (mask 0x02) = code 140  System fault level
-        bit 2 (mask 0x04) = code 141  reserved (no code 141 in manual)
-        bit 3 (mask 0x08) = code 142  BMS fault need maintenance
-        bit 4 (mask 0x10) = code 143  Battery fault need maintenance
-        bit 5 (mask 0x20) = code 144  Battery system fault needs maintenance
-        bit 6 (mask 0x40) = code 145  Full charge/discharge cycle needed
-        bit 7 (mask 0x80) = code 146  Maintenance mode status
+    BYTES 0..6 — vendor codes 100..127, 2 BITS PER CODE
+    ---------------------------------------------------
+    Bytes 0..6 are a 2-bit-per-code bitmap covering the vendor "BMS error
+    code" table entries 100..127 (4 codes per byte, packed sequentially):
 
-    Cross-validated against asc/bms-error-codes/
-    bms-124-140-142-143-144-146.asc, in which the operator confirmed
-    the dashboard was cycling through codes 124, 140, 142, 143, 144,
-    146 (each held on screen for ~1 s). F108 in that capture is
+        code = 100 + 4 * byte_index + pair_index
 
-        00 00 00 00 00 01 00 BB
+    where pair_index in {0,1,2,3} addresses the bit pairs (0,1), (2,3),
+    (4,5), (6,7). Either bit asserted -> code on. (This is the SAE J1939
+    "2-bit status" convention: 00 = off / not asserted, 01 / 10 / 11 =
+    asserted at varying severity; the dashboard treats any non-00 pair
+    as the code being on.)
 
-    throughout. 0xBB = 0b1011_1011 has exactly six bits set (0, 1, 3,
-    4, 5, 7), and those six bits are exactly the displayed codes under
-    the mapping above. The two zero bits (2, 6) correspond to the two
-    inactive codes in this group (141 reserved, 145 not currently
-    active).
+    Resulting per-byte code coverage:
 
-    Byte 5 takes value 0x01 in `bms-124-140-142-143-144-146.asc` and
-    0x00 in healthy idle AND in `bms-fullcharge-102-109-140.asc` (which
-    also has active faults, so byte 5 is NOT a universal master-fault
-    flag). It correlates with byte 7 having content beyond the always-
-    on bit 0 (= 124). Best current guess: byte 5 is a "byte-7 group
-    has any non-baseline code asserted" summary flag, or a related
-    severity bit. TENTATIVE.
+        byte 0: 100 101 102 103
+        byte 1: 104 105 106 107
+        byte 2: 108 109 110 111
+        byte 3: 112 113 [114] [115]   (114, 115 reserved per manual)
+        byte 4: 116 117 118 119
+        byte 5: 120 121 122 123
+        byte 6: 124 125 126 127
 
-    Bytes 0..6 — additional fault info CONFIRMED (mapping unknown).
-    `bms-fullcharge-102-109-140.asc` (operator-confirmed dashboard
-    cycling through codes 102, 109, 140) shows F108 =
+    CONFIRMED by injection sweep (solectrac-inject-f108.py --sweep), see
+    f108-mapping.csv: setting byte 0 bit 0..bit 7 individually displays
+    codes 100, 100, 101, 101, 102, 102, 103, 103 on the dashboard, and
+    setting byte 1 bit 0..bit 3 displays 104, 104, 105, 105 — exactly the
+    pattern predicted. The remaining bytes (codes 106..127) are predicted
+    by the same formula and were not directly observed; finishing the
+    sweep would close that gap.
 
-        10 00 04 00 00 00 00 01
+    The two pre-injection captures fall out cleanly under this layout:
 
-    so byte 0 = 0x10 (bit 4 set) and byte 2 = 0x04 (bit 2 set), both
-    nonzero for the first time. byte 7 = 0x01 sets only bit 0 (= 124,
-    the always-on baseline) — code 140 is *not* asserted in byte 7
-    in this snapshot, which is consistent with the dashboard cycling
-    through codes (only some are simultaneously asserted in the
-    bitmap at any instant; the "operator-saw-these" filename is a
-    union over the cycling, not a state of the snapshot).
+      * `bms-fullcharge-102-109-140.asc` (operator-confirmed cycling 102,
+        109, 140) F108 = `10 00 04 00 00 00 00 01`:
+            byte 0 = 0x10 -> bits 4-5 = 01 -> code 102  ✓
+            byte 2 = 0x04 -> bits 2-3 = 01 -> code 109  ✓
+            byte 7 = 0x01 -> code 140 (under byte-7 mapping below)
+        Combined: codes {102, 109, 140} — exactly the operator's set.
 
-    Mapping for bytes 0..6 not yet established. Full BMS error code
-    table (per operator manual; see "Vendor BMS error code table"
-    section below):
+      * `bms-124-140-142-143-144-146.asc` (operator-confirmed cycling
+        124, 140, 142, 143, 144, 146) F108 = `00 00 00 00 00 01 00 BB`:
+            byte 5 = 0x01 -> bits 0-1 = 01 -> code 120 (current detection
+                                              fault) — operator didn't
+                                              call this out; plausibly a
+                                              non-displayed flag or
+                                              missed during cycling
+            byte 7 = 0xBB -> codes {124, 140, 142, 143, 144, 146}
 
-        100..113   misc voltage / current / temperature / unbalance
-                    (14 codes; 114-115 reserved)
-        116..123   detection / monitoring faults (8 codes)
-        124..127   clock / CAN / insulation faults
-        140        system fault level
-        142..146   maintenance codes (141 reserved)
+    BYTE 7 — system/maintenance codes, 1 BIT PER CODE
+    -------------------------------------------------
+    Byte 7 is a separate 1-bit-per-code bitmap for the system / maintenance
+    code group:
 
-    32 codes total; F108 has 64 bits, so the layout has plenty of
-    room for any choice of grouping. Plausible layouts:
+        bit 0 (0x01) = code 140  System fault level
+        bit 1 (0x02) = code 124  Clock fault
+        bit 2 (0x04) = code 141  reserved (no code 141 in manual)
+        bit 3 (0x08) = code 142  BMS fault need maintenance
+        bit 4 (0x10) = code 143  Battery fault need maintenance
+        bit 5 (0x20) = code 144  Battery system fault needs maintenance
+        bit 6 (0x40) = code 145  Full charge/discharge cycle needed
+        bit 7 (0x80) = code 146  Maintenance mode status
 
-      * "8 codes per byte by category": each byte covers a coherent
-        subset (voltage codes / temp codes / detection codes / etc).
-        byte 7 already fits this — codes 124 + 140-146 are the
-        "system / maintenance" group.
-      * "8 codes per byte, sequential, with reserved gaps": byte 0
-        = 100-107, byte 1 = 108-113 + reserved, byte 2 = 116-123,
-        etc. Doesn't fit byte 7 (which jumps 124 → 140) and doesn't
-        cleanly explain byte 0 bit 4 + byte 2 bit 2 with cycling
-        codes {102, 109, 140}.
-      * Some other vendor-specific grouping that isn't apparent
-        from the manual's numeric order.
+    Codes 124 and 140 ALSO appear in the bytes-0..6 layout (byte 6); the
+    decoder merges the two groups so each code is emitted once per frame.
 
-    Pinning down the bytes-0..6 mapping needs single-code captures
-    (one displayed dashboard code per capture) — the byte-7 decode
-    only worked because the popcount and code count matched. With
-    a single set bit per capture, the layout is unambiguous.
+    Bit 0 = 140 CONFIRMED via injection on 2026-05-10: spoofing
+    F108 = `00 00 00 00 00 00 00 01` displayed code 140 on the dashboard.
+    This rules out the earlier "bit 0 = 124 (always-on baseline)" reading
+    and validates solectrac-analyze.py's mapping; the cross-capture
+    invariant argument was right.
 
-    Earlier interpretation (now superseded): the asc/*.asc captures
-    that didn't include any active codes had F108 byte 7 = 0x01
-    (driving) and 0xB9 (ignition-with-charger-inserted), which had
-    been guessed to be a charger-detected / contactor-state flag.
-    Under the now-confirmed mapping, those readings instead translate
-    to "code 124 active" and "codes 124, 142, 143, 144, 146 active",
-    respectively — consistent with a tractor that always annunciates
-    code 124 (Clock fault) once it has been on the bus for any
-    length of time, and additionally surfaces several maintenance
-    codes when the charger plug is inserted while at 100 % SOC.
+    Bits 2 and 6 weren't lit in either operator-confirmed capture; codes
+    141 (reserved) and 145 are speculatively assigned by numeric order.
+    A `--sweep --sweep-bytes 7` run would settle those last two bits.
 
 
 PGN decode notes (charger, SA = 0xE5)
@@ -629,7 +690,21 @@ FF21CA — "Motor telemetry (RPM, throttle, drive state, ctrl temp)"
                                                  captures sit 29..36;
                                                  accel-decel sweeps 1..45
                                                  leading the RPM ramp.
-      byte 2 (data[1]): 0x00                  — constant.
+      byte 2 (data[1]): 0x00                  — constant zero in every
+                                                 natural capture,
+                                                 including the
+                                                 controlled drive-r-n-f
+                                                 and range-1-2-3 walks
+                                                 where the lever and
+                                                 range selector are
+                                                 actually moved. The
+                                                 transmission state is
+                                                 in data[7]; data[1]
+                                                 stays zero throughout.
+                                                 See "Active injection
+                                                 results" below for the
+                                                 ambiguity that came
+                                                 out of the spoof test.
       bytes 3..4 (data[2..3]):                — MOTOR RPM as a 16-bit
                                                  little-endian uint with
                                                  a 0x0C80 (= 3200) bias.
@@ -644,15 +719,15 @@ FF21CA — "Motor telemetry (RPM, throttle, drive state, ctrl temp)"
                                                  54 → 14 °C). Near
                                                  ambient throughout.
       byte 7 (data[6]): 0x00                  — constant.
-      byte 8 (data[7]): directional pedal selector.
-                                                 0x10 (16) = idle / neither
-                                                              pedal pressed.
-                                                 0x14 (20) = forward pedal
-                                                              pressed.
-                                                 0x18 (24) = reverse pedal
-                                                              pressed.
+      byte 8 (data[7]): packed transmission state —
+                                                 high nibble = range gear,
+                                                 low nibble = F/N/R lever.
+                                                 Range:  0x0_/0x1_/0x2_
+                                                          = Range 1/2/3.
+                                                 FNR:    0x_0/0x_4/0x_8
+                                                          = N / F / R.
                                                  CONFIRMED — see "Direction
-                                                 encoding" below.
+                                                 + range encoding" below.
 
     RPM — CONFIRMED:
 
@@ -684,40 +759,67 @@ FF21CA — "Motor telemetry (RPM, throttle, drive state, ctrl temp)"
       data[7]; the 0x0C80 offset is best understood as a fixed
       configuration constant rather than a true signed-value zero.
 
-    Direction encoding — CONFIRMED:
+    Direction + range encoding — CONFIRMED:
 
-      data[7] selects the directional pedal that the operator is
-      pressing. The Solectrac e25 has a dual-pedal "shuttle" layout —
-      one pedal for forward, one for reverse — and FF21CA byte 8
-      reports which (if any) is currently depressed:
+      data[7] is a packed transmission-state byte:
 
-          0x10 (16)  idle / neither pedal pressed
-          0x14 (20)  forward pedal pressed
-          0x18 (24)  reverse pedal pressed
+          high nibble (data[7] >> 4)  = range gear
+              0x0 = Range 1
+              0x1 = Range 2
+              0x2 = Range 3
 
-      Verified against driving.asc, where the operator reported
-      backing out of a parking spot before pulling forward. The
-      capture has exactly three transitions:
+          low nibble  (data[7] & 0xF) = F/N/R lever
+              0x0 = Neutral
+              0x4 = Forward
+              0x8 = Reverse
 
-          t=  1.08 s   data[7] = 0x10 (idle)        boot complete
-          t= 15.93 s   0x10 → 0x18 (REVERSE pedal)  back-out begins
-          t= 55.29 s   0x18 → 0x10 (idle)           reverse pedal released
-          t= 55.79 s   0x10 → 0x14 (FORWARD pedal)  forward driving
+      Verified by two controlled captures (2026-05-10):
 
-      Phase statistics across the full capture match the maneuver:
-        idle (b7=0x10): RPM ≈ 0,   throttle ≈ 0..3 except at the
-                       brief pedal-swap moment around t=55.3 s.
-        reverse (0x18): RPM 0..1369, throttle up to 72; lower top
-                       speed consistent with creeping out of the
-                       parking spot.
-        forward (0x14): RPM 0..2529, throttle up to 82; full
-                       sustained driving.
+        drive-r-n-f.asc   — operator walks the F/N/R lever
+                            R → N → F (10 s each) with the range
+                            selector held at Range 3 and no pedal:
+              t=  0.00 s   data[7] = 0x28   Range 3, REVERSE
+              t=  9.39 s   0x28 → 0x20      Range 3, NEUTRAL
+              t= 19.49 s   0x20 → 0x24      Range 3, FORWARD
+            Low nibble walks 8 → 0 → 4. High nibble pinned at 0x2.
+
+        range-1-2-3.asc   — operator walks the range selector
+                            1 → 2 → 3 (10 s each) in Forward:
+              t=  0.00 s   data[7] = 0x04   Range 1, FORWARD
+              t=  9.29 s   0x04 → 0x14      Range 2, FORWARD
+              t= 19.07 s   0x14 → 0x24      Range 3, FORWARD
+            High nibble walks 0 → 1 → 2. Low nibble pinned at 0x4.
+
+      Reanalysis of earlier captures under the new decode:
+
+        driving.asc        — values 0x10/0x14/0x18 = Range 2 with
+                              N/F/R lever changes. The operator
+                              backed out (lever R) then drove forward
+                              (lever F), all in Range 2. Earlier read
+                              of these as "pedal selector" values was
+                              wrong — they're the FNR LEVER, encoded
+                              in the low nibble of byte 7, on top of
+                              a Range-2 high nibble.
+        regen.asc / regen2.asc — Range 3 captures stepping between
+                              N (0x20) and F (0x24).
+        full-throttle-reverse.asc — 0x18 = Range 2 / R.
+        full-throttle-range3-low.asc — 0x24 = Range 3 / F.
+        ignition-without-charger-inserted.asc — 0x14 = Range 2 / F
+                              dropping briefly to 0x00 (Range 1, N)
+                              at power-down.
+
+      Note on filenames: a couple of the older "neutral" captures
+      (full-throttle-range2-neutral.asc, full-throttle-hydraulics.asc)
+      actually have data[7] = 0x14 = Range 2, FORWARD lever. Their
+      filenames likely refer to the tractor not being driven (parking
+      brake set, hydraulics-only test) rather than the F/N/R lever
+      being in N.
 
       data[2..3] LE - 0x0C80 stays non-negative throughout — the
       motor controller reports rotational *magnitude*, with sign
-      determined separately by data[7]. Treat the decoded RPM as
-      "speed" and form a signed value as `direction × |rpm|` if
-      direction-aware analysis is needed.
+      determined separately by the low nibble of data[7]. Treat the
+      decoded RPM as "speed" and form a signed value as
+      `direction × |rpm|` if direction-aware analysis is needed.
 
     Frame suppression: FF21CA does not appear at all in
     ignition-with-charger-inserted.asc. Motor controller goes silent
@@ -759,11 +861,69 @@ FF21CA — "Motor telemetry (RPM, throttle, drive state, ctrl temp)"
       the byte-3-only decode misbehaved exactly as predicted by
       the 16-bit BE biased encoding.
 
+    Active injection results (2026-05-10):
+
+      Probed the constant-zero byte hypothesis with
+      solectrac-inject-ff21ca.py spoofing 0x0CFF21CA at 250 Hz on a
+      slcan adapter, base payload 00 00 80 0C 3C 36 00 10 (clean
+      idle). First sweep step was data[1] bit 0 — payload
+      00 01 80 0C 3C 36 00 10.
+
+      Observed (refined on second look): dashboard Range indicator
+      stepped from 3 → 2, and FNR direction stepped from F → N. No
+      numeric error code appeared. The transitions were directional,
+      not a flicker — the spoof IS reliably winning the race at
+      250 Hz.
+
+      Reinterpretation after drive-r-n-f.asc + range-1-2-3.asc
+      (2026-05-10): the apparent "data[1] = direction + range"
+      effect was almost certainly the dashboard following the
+      base-payload data[7] = 0x10, which under the now-confirmed
+      decode means "Range 2, Neutral". The pre-injection state was
+      F / Range 3 (the lever and selector positions the operator
+      left the tractor in), so the moment the spoof started winning,
+      the dashboard switched to whatever data[7] said — Range 2 / N
+      — and that's the transition that was attributed to data[1].
+      Toggling data[1] bit 0 on top of that base wouldn't have
+      changed anything; the Range/FNR change was already locked in
+      by data[7]. Two controlled captures since then show data[1]
+      stays 0x00 across an actual lever sweep AND an actual range
+      sweep, which would be impossible if data[1] truly encoded
+      either field.
+
+      Net: data[1] remains a strong constant-zero fault-bitmap
+      candidate — the original reason it was picked. The "data[1]
+      decodes Range/FNR" claim is retracted.
+
+      Status:
+        * data[1] — back to fault-bitmap candidate. Re-sweep with
+          data[7] held at the natural pre-spoof value (e.g.
+          0x24 = Range 3 / F) so that the dashboard's transmission
+          state doesn't flicker and confound the read.
+        * data[6] — strongest fault-bitmap candidate. Sweep next.
+        * data[4] — weak candidate (state-machine field).
+        * data[7] — SOLVED. Range gear (high nibble) + F/N/R lever
+          (low nibble). No further investigation needed.
+
 DM1 (FECA) — empty throughout
     Payload `00 00 00 00 00 00 FF FF` in every capture. The motor
     controller is advertising "no active diagnostic trouble codes"
     via the SAE J1939 standard channel even when the dashboard is
     showing numeric error codes. See "Dashboard error codes" below.
+
+
+PGN decode notes (vehicle controller, SA = 0xD0)
+------------------------------------------------
+
+F100D0 — "VC heartbeat"
+    Note: same PGN (F100) as the BMS pack-status frame, but a different
+    *source*. The PGN namespace is global; it's the SA that disambiguates.
+    Observed byte-0 values:
+      * 0x00 — "init" (early in startingup.csv, before key/wake completes)
+      * 0x0C — "ready" (steady state once tractor is awake)
+    The transition is sharp and aligns with the operator-described
+    wake-up event, which is what gives us confidence in the labels.
+    Other bytes change but haven't been decoded.
 
 
 Vendor BMS error code table (operator manual)
@@ -817,126 +977,25 @@ mapping is open. Bytes 1, 3, 4, 6 have not been seen nonzero in any
 capture yet.
 
 
-Dashboard error codes — F108 byte 7 is the dashboard-displayed bitmap
----------------------------------------------------------------------
+Dashboard error codes — F108 carries the displayed BMS bitmap
+-------------------------------------------------------------
 
-UPDATE (2026-05-09): the BMS broadcast DOES carry the dashboard-displayed
-warning codes after all — they live in F108 (PGN 0xF108 from SA 0xF3).
-Specifically, F108 byte 7 is a bitmap of eight codes from the vendor
-"BMS error code" table in the operator manual:
+UPDATE (2026-05-10): F108 carries the dashboard-displayed warning codes
+across both byte 7 (system/maintenance group, 1 bit per code) AND bytes
+0..6 (codes 100..127, 2 bits per code, packed sequentially). See the
+F108F3 section above for the complete decode and the injection-sweep
+evidence (f108-mapping.csv).
 
-    bit 0 = 124, bit 1 = 140, bit 2 = 141 (reserved), bit 3 = 142,
-    bit 4 = 143, bit 5 = 144, bit 6 = 145, bit 7 = 146.
+Earlier interpretation: the asc/*.asc captures with no actively-watched
+fault codes had F108 byte 7 = 0x01 (driving) and 0xB9 (ignition-with-
+charger-inserted), which had originally been guessed to be a charger-
+detected / contactor-state flag. Under the now-confirmed mapping those
+readings translate to code 140 alone, and codes {140, 142, 143, 144,
+146} respectively — consistent with a tractor that always annunciates
+code 140 (System fault level) once on the bus, and additionally surfaces
+several maintenance codes when the charger plug is inserted at 100 % SOC.
 
-Cross-validated against asc/bms-error-codes/bms-124-140-142-143-144-146.asc
-(operator confirmed dashboard cycling those six codes) where F108 byte 7
-= 0xBB exactly matches that 6-code subset, and against
-asc/bms-error-codes/idle-no-bms.asc (no faults) where F108 is all zeros.
-See the F108F3 section above for the full byte 7 + byte 5 decode.
-
-This RESOLVES the originally-observed codes 140 (which is in the byte 7
-group) for the asc/*.asc dataset. Codes 124, 142, 143, 144, 146 — none
-of which the original session was watched for — were also active in those
-captures (byte 7 = 0x01 = code 124 in driving captures, 0xB9 = codes
-{124, 142, 143, 144, 146} in ignition-with-charger-inserted) and were
-previously misinterpreted as a charger-detected flag.
-
-Codes 102 and 109 are also covered by F108, but in bytes 0..6, not
-byte 7. The `bms-fullcharge-102-109-140.asc` capture (operator-confirmed
-dashboard cycling 102 + 109 + 140 at 100 % SOC) shows F108 = `10 00
-04 00 00 00 00 01`: byte 0 = 0x10 and byte 2 = 0x04 are nonzero (one
-bit each), byte 7 = 0x01 carries only the always-on baseline 124, and
-140 is *not* asserted in byte 7 in this snapshot. The dashboard cycles
-through the listed codes so not all are simultaneously present in the
-bitmap; the snapshot shows only the codes asserted at this instant.
-
-The bit-to-code mapping for bytes 0..6 is OPEN. Pinning it down needs
-single-code captures so the popcount-matches-displayed-codes argument
-that nailed byte 7 can be replicated unambiguously.
-
-The legacy text below is preserved for historical context but predates
-the F108 decode.
-
---- Legacy section (pre-2026-05-09) ----------------------------------
-
-Operator reports that the tractor's display showed numeric BMS error
-codes 102, 109, and 140 during most of the asc/*.asc recording session
-(all of which were taken at 100% SOC). A targeted byte-level search
-across the 5 captures finds the literal values 0x66, 0x6D, 0x8C in
-exactly three places, none of which is an error-code stream:
-
-* F100F3 byte 4 (the pack-current low byte): sweeps the full
-  0x00..0xFF range during normal operation as the 16-bit BE current
-  field crosses 256-step boundaries, so 102/109/140 appear as
-  ordinary mid-range readings. Coincidental.
-
-* FF50E5 byte 1 in normal-ignition.asc: a single-frame hit on 0x8C
-  during the charger-module self-test sweep at wake-up. Coincidental.
-
-* FF21CA data[2] (the RPM low byte — see FF21CA decode section above):
-  the literal byte values 0x66 (102), 0x6D (109), 0x8C (140) appear
-  here as ordinary low bytes of in-range RPM values during normal
-  driving (since data[2] sweeps 0..255 every time RPM crosses a
-  256-step boundary, every byte value 0x00..0xFF is hit
-  routinely). Coincidental.
-
-What 0xCA *is* broadcasting on the standard diagnostic channel:
-
-* DM1 (PGN FECA from SA 0xCA) is being transmitted continuously, but
-  with payload `00 00 00 00 00 00 FF FF` — the SAE J1939-encoded
-  representation of "no active diagnostic trouble codes". That is,
-  while the dashboard is displaying error codes, the BMS is *also*
-  advertising via the standard channel that it has no active codes.
-  These two facts are not consistent under any straightforward model
-  where the BMS is the source of truth for the codes.
-
-Most likely explanations, in rough order of plausibility:
-
-1. **The codes are dashboard-synthesized, not BMS-broadcast.** The
-   dashboard sees the same FF21CA / F1xx telemetry we do and
-   independently computes "code 102 / 109 / 140" based on local
-   thresholds (e.g., a 100%-SOC + voltage-band combination). The BMS
-   itself doesn't know there's a "code"; that's why DM1 is empty.
-   This would mean the codes will never appear on the bus regardless
-   of what we capture passively.
-
-2. **The codes live on the un-tapped drivetrain bus.** The dashboard
-   is almost certainly a gateway between this bus and a second CAN
-   segment we haven't tapped yet. The codes might be broadcast there
-   (by the motor controller, traction inverter, or another ECU).
-
-3. **The codes are stored in the BMS but only reported by request.**
-   Standard J1939 has DM2 (previously-active DTCs, broadcast) and
-   DM4/DM7 (request/response for specific DTCs). None of those are
-   present in the asc captures because no client is querying them.
-   The dashboard might issue these requests internally on a tap point
-   we don't see, or via a vendor UDS/KWP2000 service we'd have to
-   trigger explicitly.
-
-4. **The codes are encoded in a multi-byte field of an existing
-   broadcast PGN that we haven't decoded.** Possible candidates:
-   F104F3 (constant payload `3A 38 06 01 02 FF FF FF` — the leading
-   `3A 38` ≈ 58 / 56 doesn't match the reported codes, but the field
-   semantics are unknown), or F108F3 byte 7 (`0x01` normal,
-   `0xB9` with charger inserted — 0xB9 = 185, not a reported code,
-   but this byte clearly carries flag bits we haven't decoded). None
-   of these PGNs *literally contain* 102/109/140, but a bit-mask
-   interpretation could in principle decode to those ordinal IDs.
-
-To pin this down, the next capture should ideally:
-
-* Be triggered specifically while one of the codes is on the display
-  (not just "during a session where they appeared at some point").
-* Cover an explicit clear/cycle of the code on the dashboard (key off
-  or whatever the operator menu offers) so we can see what frame
-  changes contemporaneously.
-* Optionally, send DM2 / DM7 request frames from the logger
-  (1806CAxx with the right payload) and capture any responses. This
-  is active, not passive, so it's a different kind of test.
-
-Until then: status of the codes' on-bus encoding is **UNKNOWN**, and
-the dashboard's display of them does NOT prove the BMS broadcasts
-them.
+Byte 7 bit 0 = code 140 was confirmed by injection on 2026-05-10.
 
 
 Vendor MC error code table (operator manual)
@@ -1063,8 +1122,10 @@ Things to watch for:
 * If the diff comes back empty (no FF21CA bytes change, no new PGNs
   from 0xCA appear, no proxy frames change), that's the answer —
   MC error codes aren't on this segment. They're then either:
-    - dashboard-synthesized from telemetry (analogous to hypothesis
-      #1 in the legacy "Dashboard error codes" section), or
+    - dashboard-synthesized from telemetry (the dashboard sees the
+      same FF21CA / F1xx telemetry we do and could compute codes
+      against local thresholds without the BMS or MC broadcasting
+      them), or
     - on the un-tapped drivetrain bus.
 * Don't intentionally induce dangerous faults to get a capture.
   Reasonable MC faults to wait for or trigger safely: motor
@@ -1088,20 +1149,6 @@ Triage order if a fault capture is obtained:
    bus or dashboard-synthesized hypotheses be advanced; both imply
    passive MC-fault capture on this segment is impossible and the
    work shifts to active probing or a second tap.
-
-
-PGN decode notes (vehicle controller, SA = 0xD0)
-------------------------------------------------
-
-F100D0 — "VC heartbeat"
-    Note: same PGN (F100) as the BMS pack-status frame, but a different
-    *source*. The PGN namespace is global; it's the SA that disambiguates.
-    Observed byte-0 values:
-      * 0x00 — "init" (early in startingup.csv, before key/wake completes)
-      * 0x0C — "ready" (steady state once tractor is awake)
-    The transition is sharp and aligns with the operator-described
-    wake-up event, which is what gives us confidence in the labels.
-    Other bytes change but haven't been decoded.
 
 
 Vendor BMS GUI screenshot — provenance and ground-truth values
@@ -1170,44 +1217,86 @@ Decoder errata exposed by the screenshot:
   that we now read both bytes instead of just the low one.
 
 
-Source-CSV timestamp column is unusable (recorded-data/*.csv only)
------------------------------------------------------------------
+Open questions / future work
+----------------------------
 
-This section applies only to the original SavvyCAN-style CSVs in
-`recorded-data/`. The newer `asc/*.asc` captures (Vector ASC format)
-do carry real per-frame microsecond timestamps and are not affected.
+Still open
+^^^^^^^^^^
+
+* F106 / F107 / F108 byte-level decoding — partial progress from the
+  asc/*.asc captures. F106 byte 0 is the running-mode candidate
+  (0x00/0x80/0x45 vocabulary observed). F107 fits the standard J1939
+  "limits" frame layout (current/voltage limits, with 0x2710 as a
+  sentinel). F108 byte 7 is now CONFIRMED as the dashboard BMS
+  warning-code bitmap; bytes 0..6 carry additional fault info but
+  bit-to-code mapping remains open. Need single-code dashboard
+  captures plus charge-from-low-SOC and in-gear-under-load runs.
+* F108 bytes 0..6 bit-to-code mapping — open. `bms-fullcharge-
+  102-109-140.asc` confirmed bytes 0 and 2 carry fault info (one bit
+  each, with displayed codes 102, 109, 140 cycling). Pinning down
+  the mapping needs single-code captures so the popcount-matches-
+  displayed-codes argument that nailed byte 7 can be replicated
+  unambiguously.
+* Whether there is *also* a separate drivetrain bus carrying inverter
+  / PTO / motor-current telemetry. RPM and throttle ARE on this bus
+  (FF21CA from SA 0xCA), but none of the asc captures cover an
+  in-gear-under-load run, so we don't yet know whether the dashboard's
+  current readout is sourced from this bus (in a frame we haven't
+  decoded) or from a second segment. If a second tap is investigated,
+  plausible locations remain:
+    - a separate diagnostic port (look for one near the controller)
+    - a 2-pin service tap (small Deutsch connector)
+    - a backshell tap on the dash harness
+  This is now a "find what *else* is on a second bus" task rather
+  than "find RPM."
+* Confirm whether the dashboard is the bus gateway, or whether a
+  dedicated gateway ECU sits between the two segments. Either is
+  plausible.
+* Identify the BMS vendor via the Escorts trail. The GUI's
+  "ESCORTS-INTERNAL" classification narrows the candidate OEM list
+  considerably; locating a protocol PDF would close out most TENTATIVE
+  items at once.
+* Hunt SOC / SOH / alarms in F104 / F106 / F107 / F108. The vendor
+  GUI snapshot gave us a vocabulary (LowSoc lvl 2, Calibrating,
+  KL15, etc.) but not enough states to disambiguate byte positions
+  from a single snapshot.
+* Motor-controller error-code channel. DM1 (FECA from SA 0xCA) stays
+  empty even when the dashboard surfaces MC codes. See the
+  "Motor-controller error codes — methodology to decode" section
+  for the planned capture-pair experiment.
+
+Recently resolved (kept here as cross-references; full details in the
+named sections above)
+^^^^^^^^^^^^^^^^^^^^
+
+* F100 byte 2 voltage / SOC proxy — RESOLVED. data[1] is pack terminal
+  voltage at 0.1 V/bit with a +76.8 V offset, anchored by linear
+  regression vs 20*mean(cell mV) across 24 captures and cross-checked
+  against the FF50 charger-frame encoding. See F100F3 section.
+* Pack-current sign and magnitude — RESOLVED on 2026-05-09. F100F3
+  bytes 3-4 BE, biased so raw 0x7D00 = 0 A, at 0.1 A/bit, signed
+  (+ draw / - charging). The earlier "byte 4 only" decode coincidentally
+  matched at idle because data[2] sits at 0x7D and the bias cancels;
+  the moment current crossed ~25.6 A the high byte ticked and the low
+  byte rolled. See F100F3 section.
+* F108 byte 7 dashboard warning code bitmap — RESOLVED. Eight bits
+  map to vendor codes 124, 140, 142..146 (bit 2 = reserved 141).
+  See F108F3 / "Dashboard error codes" section.
+* Drivetrain bus (RPM / throttle) — partially RESOLVED. Motor RPM
+  and throttle live in FF21CA on this bus. Whether there is *also*
+  a second drivetrain bus is still open (see above).
+* Full-SOC capture — DONE. Five asc/*.asc captures at 100% SOC,
+  cell-voltage band ~4.16 V/cell, pack-V band ~83.2 V, plus
+  byte-level state evidence on F106 / F107 / F108.
+* Real per-frame timestamps — DONE for the asc/*.asc batch (Vector
+  ASC carries microsecond-resolution timestamps).
 
 
+Confidence summary
+------------------
 
-The "Time Stamp" column in recorded-data/*.csv is essentially a single
-constant value across an entire capture (e.g. `62336000` is shared by
-nearly all 70,920 rows of recorded-data/charging.csv, with only sporadic
-increments to `62338000`). After parsing, this propagates into the
-output CSVs:
-
-    cells.csv         — 8960 rows, 1 unique timestamp
-    cell_summary.csv  — 4470 rows, 1 unique timestamp
-
-Consequences:
-
-* Any timestamp-based join between cells / temps / cell_summary / etc.
-  is meaningless.
-* Time-derivative quantities (dV/dt, dT/dt, frame rate, integrated Ah)
-  cannot be computed from these captures.
-* The only reliable synchronization between F102 and the surrounding
-  F113..F117 cell-voltage stream is **row order within a single source
-  CSV**. The F102 ↔ cell-snapshot correlation that established 1-based
-  indexing was done that way.
-
-Whatever logger produced these CSVs is either not configured to emit
-real per-frame timestamps, or is emitting them in a unit / field the
-parser is not consuming. Worth investigating before recording further
-captures, since fixing this at the source is the cheapest way to
-unlock all time-domain analysis.
-
-
-Confirmed quantitative findings
--------------------------------
+Empirical observations
+^^^^^^^^^^^^^^^^^^^^^^
 
 * Resting / standby pack draw (continuous.csv): on the order of
   100–200 W. Consistent with BMS + dash + accessory loads, no traction.
@@ -1240,91 +1329,8 @@ Confirmed quantitative findings
   the ~13 °C ambient. No self-heating signature in any capture (none
   of these runs are long or hard enough to warm the pack).
 
-
-Open questions / future work
-----------------------------
-
-* F100 byte 2 voltage / SOC proxy — TENTATIVE. data[1] varies inversely
-  with load (0x3B..0x41 across captures) but the dynamic range is too
-  small for a clean single-LSB voltage decode. Could be a coarser SOC
-  estimate or a low-resolution voltage proxy. Capturing a full charge
-  from low SOC to 100% should help pin it down.
-* Pack-current sign and magnitude — RESOLVED on 2026-05-09. The
-  signal is F100F3 bytes 3-4 BE, biased so raw 0x7D00 = 0 A, at 0.1
-  A/bit, signed (positive = drawing, negative = charging). The
-  earlier "byte 4 only" decode coincidentally matched at idle because
-  data[2] sits at 0x7D and the bias cancels; the moment current
-  crossed ~25.6 A the high byte ticked and the low byte rolled,
-  producing the "saturating" behavior previously reported. The
-  loader-arms.asc / loader2.asc captures (hydraulic load with the
-  motor controller silent) ruled out FF21CA as the source and made
-  the F100 BE encoding obvious. See the F100F3 section above.
-* F106 / F107 / F108 byte-level decoding — partial progress from the
-  asc/*.asc captures. F106 byte 0 is the running-mode candidate
-  (0x00/0x80/0x45 vocabulary observed). F107 fits the standard J1939
-  "limits" frame layout (current/voltage limits, with 0x2710 as a
-  sentinel). F108 byte 7 is the charger-detected flag candidate
-  (0x01 normal, 0xB9 with charger inserted). All TENTATIVE and need
-  charge-from-low-SOC and in-gear-under-load captures to confirm.
-* Dashboard error codes (102, 109, 140 ...) — chase down where these
-  are coming from. Suggested experiments:
-    - Capture again with a single code freshly triggered on the
-      display, then key-cycle to clear it; look for any frame whose
-      bytes change in lockstep. (Passive; cheap.)
-    - Issue J1939 DM2 (previously-active DTCs) and DM7 (request a
-      specific DTC) requests from a CAN tool and capture responses.
-      DM7 in particular lets you ask the BMS specifically about
-      codes 102/109/140. (Active; requires a transmit-capable tool.)
-    - If neither shows results, the codes are almost certainly
-      either dashboard-synthesized or on the drivetrain bus.
-* Drivetrain bus — partially RESOLVED. Motor RPM and throttle ARE on
-  this bus, encoded in FF21CA from SA 0xCA (motor controller). So the
-  "RPM is on a different segment" hypothesis was wrong. Whether there
-  is *also* a separate drivetrain bus carrying inverter / PTO / motor
-  current telemetry is still open — none of the asc captures cover an
-  in-gear-under-load run, so we don't yet know whether the dashboard's
-  current readout is sourced from this bus (in a frame we haven't
-  decoded) or from a second segment. If a second tap is investigated,
-  plausible locations remain:
-    - a separate diagnostic port (look for one near the controller)
-    - a 2-pin service tap (small Deutsch connector)
-    - a backshell tap on the dash harness
-  But this is now a "find what *else* is on a second bus" task rather
-  than "find RPM."
-* Full-SOC capture — DONE. Five asc/*.asc captures at 100% SOC are
-  now in `asc/`. Established cell-voltage band (~4.16 V/cell) and
-  pack-V band (~83.2 V) at full SOC; provided the first byte-level
-  state evidence on F106 / F107 / F108. The 2026-05-09 loader-arms
-  test (hydraulic load, motor silent) closed the F100 pack-current
-  decode question — see the F100F3 section.
-* Confirm whether dashboard is the bus gateway, or whether a dedicated
-  gateway ECU sits between the two segments. Either is plausible.
-* Identify the BMS vendor via the Escorts trail. The GUI's
-  "ESCORTS-INTERNAL" classification narrows the candidate OEM list
-  considerably; locating a protocol PDF would close out most TENTATIVE
-  items at once.
-* Real per-frame timestamps — DONE for the asc/*.asc batch. Vector
-  ASC format carries microsecond-resolution monotonic timestamps,
-  so all time-domain analyses (rate, dV/dt, integrated Ah, frame
-  pacing) are now possible on those captures. Original recorded-
-  data/*.csv files remain unusable for time-derivative analysis.
-* Re-validate F100 pack-current scaling — DONE on 2026-05-09 with
-  the loader-arms tests. Outcome: bytes 3-4 BE are signed pack
-  current at 0.1 A/bit with a 0x7D00 bias. The earlier conclusion
-  that "byte 4 saturates" was a mis-read of the high byte ticking
-  (0x7D → 0x7E → 0x7F) while only the low byte was being decoded.
-  Idle 0x7DC4 → +19.6 A matches dashboard at rest; loader peak
-  0x7E70 → +36.8 A matches dashboard ~34 A; driving.asc peak
-  0x7F7C → +63.6 A is consistent with the operator-reported ~72 A
-  (within sensor / sampling-window error).
-* Hunt SOC / SOH / alarms in F104 / F106 / F107 / F108. The vendor
-  GUI snapshot gave us a vocabulary (LowSoc lvl 2, Calibrating,
-  KL15, etc.) but not enough states to disambiguate byte positions
-  from a single snapshot.
-
-
-Confidence summary
-------------------
+Decoder confidence
+^^^^^^^^^^^^^^^^^^
 
 CONFIRMED:
     cell-voltage scaling (BE u16 mV)
@@ -1448,5 +1454,3 @@ UNKNOWN:
         Discharging, Fault, Sleep all still missing)
     SA 0x12 role beyond emitting a constant FF21 payload
     everything on the (un-tapped) drivetrain bus
-    why the recorded-data/*.csv "Time Stamp" column is effectively
-        constant (orthogonal to ASC having real timestamps)
