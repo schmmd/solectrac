@@ -213,6 +213,12 @@ class Channel:
 @dataclass
 class State:
     # pack-level
+    # pack_v_terminal: from F100F3 byte 1 (the BMS-published terminal
+    # voltage; load-sensitive, anchored against 24-capture regression per
+    # NOTES). Authoritative when present.
+    # pack_v_est: from F102 cell-min/max mean (20 * (max+min)/2). Cheap
+    # cross-check / fallback before any F100 frame has been seen.
+    pack_v_terminal: Channel = field(default_factory=Channel)
     pack_v_est: Channel = field(default_factory=Channel)
     pack_i_a: Channel = field(default_factory=Channel)
     # charger
@@ -258,6 +264,19 @@ class State:
     decoded: int = 0
     errors: int = 0
     started_at: float = field(default_factory=time.monotonic)
+
+
+# --- helpers ----------------------------------------------------------------
+
+def primary_pack_v(state: State) -> Channel:
+    """Return the more authoritative pack-voltage Channel: the F100F3
+    BMS-published terminal voltage when present, else the F102-derived
+    cell-mean estimate. Both are kept in state so a fallback exists
+    before the first F100 frame arrives.
+    """
+    if state.pack_v_terminal.value is not None:
+        return state.pack_v_terminal
+    return state.pack_v_est
 
 
 # --- decoder ----------------------------------------------------------------
@@ -306,6 +325,11 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
         elif pgn == PGN_F100:
             if all(b == 0 for b in data):
                 return
+            # byte 1 = pack terminal voltage (b * 0.1 + 76.8 V).
+            state.pack_v_terminal.update(
+                data[1] * PACK_VOLTAGE_LSB_V + PACK_VOLTAGE_OFFSET_V, now
+            )
+            # bytes 2-3 BE = signed pack current (biased u16, 0.1 A/bit).
             raw_i = be16(data[2], data[3])
             state.pack_i_a.update(
                 (raw_i - PACK_CURRENT_BIAS_RAW) * PACK_CURRENT_LSB_A, now
@@ -347,15 +371,16 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
     elif src == SRC_MOTOR and pgn == PGN_FF21:
         # bytes 2-3 little-endian, biased by 0x0C80, give RPM magnitude.
         rpm_mag = ((data[3] << 8) | data[2]) - RPM_BIAS
-        # byte 7 bits 2-3 encode direction: 0b00 idle, 0b01 fwd, 0b10 rev.
-        # Other bits in this byte vary across captures and aren't decoded.
-        pedal_bits = data[7] & 0x0C
-        if pedal_bits == 0x04:
-            direction = 1
-        elif pedal_bits == 0x08:
-            direction = -1
+        # byte 7 = directional pedal selector; only three literal values
+        # have been observed (NOTES.txt). Match exactly to avoid
+        # accepting unobserved values as forward/reverse.
+        pedal = data[7]
+        if pedal == 0x14:
+            direction = 1            # forward pedal
+        elif pedal == 0x18:
+            direction = -1           # reverse pedal
         else:
-            direction = 0
+            direction = 0            # idle / neither (0x10) or unknown
         state.motor_rpm_mag.update(rpm_mag, now)
         state.motor_rpm.update(direction * rpm_mag, now)
         state.motor_direction.update(direction, now)
@@ -438,10 +463,11 @@ def evaluate_alerts(state: State, mains_v: float, breaker_a: float,
     # handshake states 0x01/0x02 are too transient to draw breaker power).
     chgr_active = (state.chgr_status.value == CHGR_STATUS_ACTIVE
                    and not state.chgr_status.is_stale(now))
-    if (chgr_active and state.pack_v_est.value
+    pack_v = primary_pack_v(state)
+    if (chgr_active and pack_v.value
             and state.pack_i_a.value is not None
             and state.pack_i_a.value < 0):
-        dc_w = state.pack_v_est.value * -state.pack_i_a.value
+        dc_w = pack_v.value * -state.pack_i_a.value
         ac_w = dc_w / max(efficiency, 0.01)
         ac_a = ac_w / max(mains_v, 1.0)
         if ac_a > 0.8 * breaker_a:
@@ -499,7 +525,8 @@ def render_pack(state: State, mains_v: float, efficiency: float,
     t.add_column(justify="left")
     t.add_column(justify="left")
 
-    t.add_row("voltage", fmt(state.pack_v_est, "{:.2f}", "V", now))
+    pack_v_ch = primary_pack_v(state)
+    t.add_row("voltage", fmt(pack_v_ch, "{:.2f}", "V", now))
 
     pi = state.pack_i_a.value
     chgr_active = (state.chgr_status.value == CHGR_STATUS_ACTIVE
@@ -517,10 +544,10 @@ def render_pack(state: State, mains_v: float, efficiency: float,
             i_text = Text(f"{pi:.1f} A")
     t.add_row("current", i_text)
 
-    if state.pack_v_est.value is not None and pi is not None:
+    if pack_v_ch.value is not None and pi is not None:
         # Pack convention: positive current = discharging the pack.
         # Power into the pack (charging) is negative; power out is positive.
-        dc_w = state.pack_v_est.value * pi
+        dc_w = pack_v_ch.value * pi
         t.add_row("power", Text(f"{dc_w:+.0f} W"))
         if chgr_active and pi < 0:
             ac_w = -dc_w / max(efficiency, 0.01)

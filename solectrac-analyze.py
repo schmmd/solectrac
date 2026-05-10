@@ -37,17 +37,20 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     pack.cell_max_mv           PGN F102 derived pack-wide stats
     pack.cell_min_mv
     pack.cell_spread_mv
-    pack.cell_max_n            F102 byte 5: max-cell number, 1-based (BMS GUI numbering)
-    pack.cell_min_n            F102 byte 6: min-cell number, 1-based (BMS GUI numbering)
-    pack.flags
+    pack.cell_max_n            F102 byte 4: max-cell number, 1-based (BMS GUI numbering)
+    pack.cell_min_n            F102 byte 5: min-cell number, 1-based (BMS GUI numbering)
+    pack.flags                 F102 byte 7 (status/flag bits, raw)
     pack.v_estimate            20 * mean(min, max) / 1000
-    pack.voltage_v             F100 byte 2: pack voltage, b * 0.1 + 76.8 V
-    pack.current_raw           F100 bytes 3-4 (raw biased u16)
+    pack.voltage_v             F100 byte 1: pack voltage, b * 0.1 + 76.8 V
+    pack.current_raw           F100 bytes 2-3 (raw biased u16)
     pack.current_a             F100 signed pack current, A
-    charger.status             FF50 byte 1
-    charger.v_raw              FF50 bytes 2-3 LE (raw)
+    bms.fault.byteN            F108 bytes 0..7 raw (only emitted when frame is non-zero)
+    bms.fault.code_NNN         F108 byte 7: 1 when bit set; NNN per vendor table
+                               (124, 140, 142, 143, 144, 145, 146)
+    charger.status             FF50 byte 0
+    charger.v_raw              FF50 bytes 1-2 LE (raw)
     charger.voltage_v          FF50 charger output voltage, raw * 0.1 + 76.8 V
-    charger.i_raw              FF50 bytes 4-5 LE (raw)
+    charger.i_raw              FF50 bytes 3-4 LE (raw)
     charger.current_a          FF50 current, A
     vc.state                   F100D0 byte 0 (raw heartbeat state)
     motor.rpm_signed           FF21CA RPM with directional sign
@@ -59,31 +62,46 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
 Decoder assumptions (verify against the BMS spec before trusting numerically):
   * Source 0xF3 is the BMS, 0xE5 is the external charger, 0xF4 is a vehicle
     controller.
+    Byte numbering below is 0-based throughout (matches data[N] indexing
+    in code and the DECODERS table; NOTES.txt uses 1-based, so data[1] in
+    code = "byte 2" in NOTES).
   * PGN 0xF113..0xF13C: 4 cell voltages per frame, big-endian uint16 mV.
         cell_index = (PGN - 0xF113) * 4 + slot
+        Indexes >= NUM_CELLS (20) and 0xFFFF "not present" sentinels are
+        suppressed.
   * PGN 0xF155..0xF15E: 8 module temperatures per frame, uint8 with the
     J1939-style +40 C offset (raw 0x35 = 13 C).
         temp_index = (PGN - 0xF155) * 8 + slot
-  * PGN 0xF102: bytes 1-2 BE = max cell mV, bytes 3-4 BE = min cell mV,
-                bytes 5-6 = max/min cell index, byte 8 = spread/flags.
-  * PGN 0xF100 byte 2 (data[1]) = pack voltage at the BMS terminals,
+        Indexes >= NUM_TEMPS (7) and 0xFF "not present" sentinels are
+        suppressed.
+  * PGN 0xF102: bytes 0-1 BE = max cell mV, bytes 2-3 BE = min cell mV,
+                byte 4 = max-cell number (1-based BMS GUI numbering),
+                byte 5 = min-cell number (1-based BMS GUI numbering),
+                byte 7 = status/flag bits.
+  * PGN 0xF100 byte 1 (data[1]) = pack voltage at the BMS terminals,
         encoded as 0.1 V/bit with a +76.8 V offset (V = b * 0.1 + 76.8).
         Confirmed by linear regression of byte 1 against 20 * mean cell mV
         across 24 captures spanning byte values 53..66 (82.0..83.4 V),
         residuals < 0.55 V, and cross-checked against the FF50 charger
         frame which uses an identical encoding.
-  * PGN 0xF100 bytes 3-4 BE = signed pack current at 0.1 A/bit, biased so that
+  * PGN 0xF100 bytes 2-3 BE = signed pack current at 0.1 A/bit, biased so that
         raw 0x7D00 = 0 A (positive = drawing from pack, negative = charging).
         Cross-validated by the amp-*.asc dashboard-anchored set (1, 18, 35, 42,
         58 A): mean decoded current matches the displayed dashboard reading
         within ~1 A across the full range, including across the 0x7D->0x7E and
         0x7F->0x80 high-byte rollovers.
-  * PGN 0xFF50 from 0xE5: byte 1 = status (0x00=idle, 0x01/0x02=handshake
+  * PGN 0xF108 byte 7 = dashboard-displayed BMS warning code bitmap. Each
+        bit maps to a code in the vendor BMS error-code table (operator
+        manual). bit 0=124, bit 1=140, bit 3=142, bit 4=143, bit 5=144,
+        bit 6=145, bit 7=146 (bit 2 = code 141 reserved). Bytes 0..6
+        carry additional fault info (bit-to-code mapping not yet
+        established) and are surfaced as raw bytes for visibility.
+  * PGN 0xFF50 from 0xE5: byte 0 = status (0x00=idle, 0x01/0x02=handshake
                           [transient], 0x03=active charging),
-                          bytes 2-3 LE = charger output voltage at the pack
-                          terminals, encoded identically to F100 byte 2:
+                          bytes 1-2 LE = charger output voltage at the pack
+                          terminals, encoded identically to F100 byte 1:
                           raw * 0.1 + 76.8 V.
-                          bytes 4-5 LE = charger output current in 0.1 A/bit
+                          bytes 3-4 LE = charger output current in 0.1 A/bit
                           (no offset).
     Voltage and current scales were anchored against asc/charging-120V-90ish-
     to-100.asc (2863 active-charging frames; regression vs F100F3 gave R^2
@@ -133,8 +151,9 @@ PGN_CELL_FIRST, PGN_CELL_LAST = 0xF113, 0xF13C
 PGN_TEMP_FIRST, PGN_TEMP_LAST = 0xF155, 0xF15E
 
 # Aggregate / status PGNs from BMS.
-PGN_F100 = 0xF100   # pack status (bytes 3-4 BE = signed pack current)
+PGN_F100 = 0xF100   # pack status (bytes 2-3 BE = signed pack current)
 PGN_F102 = 0xF102   # cell min/max summary
+PGN_F108 = 0xF108   # BMS active fault bitmap (byte 7 = dashboard codes)
 
 # Charger broadcast.
 PGN_FF50 = 0xFF50   # charger telemetry (V, A)
@@ -143,6 +162,28 @@ PGN_FF50 = 0xFF50   # charger telemetry (V, A)
 PGN_FF21 = 0xFF21   # motor telemetry (RPM, throttle, drive-state, ctrl temp)
 
 TEMP_OFFSET_C = 40
+
+# Pack topology from the vendor BMS GUI screenshot (see NOTES.txt). Cell /
+# temp PGN ranges have room for many more channels but only the first
+# NUM_CELLS / NUM_TEMPS slots are real on this pack; the rest are padding
+# / "not present" sentinels.
+NUM_CELLS = 20
+NUM_TEMPS = 7
+
+# F108 byte 7: dashboard-displayed BMS warning code bitmap. Bit -> (code,
+# description). Cross-validated against asc/bms-error-codes/
+# bms-124-140-142-143-144-146.asc (byte 7 = 0xBB = bits {0,1,3,4,5,7}
+# matches operator-confirmed codes {124,140,142,143,144,146}). Bit 2 maps
+# to code 141 which is reserved (not in the manual) and is omitted.
+BMS_FAULT_CODES_BYTE7 = [
+    (0, 124, "Clock fault"),
+    (1, 140, "System fault level"),
+    (3, 142, "BMS fault need maintenance"),
+    (4, 143, "Battery fault need maintenance"),
+    (5, 144, "Battery system fault needs maintenance"),
+    (6, 145, "Full charge/discharge cycle needed"),
+    (7, 146, "Maintenance mode status"),
+]
 
 PACK_CURRENT_LSB_A = 0.1                  # F100F3 bytes 3-4 BE, 0.1 A/bit
 PACK_CURRENT_BIAS_RAW = 0x7D00            # raw value at 0 A (positive = discharge)
@@ -185,7 +226,7 @@ PGN_NAMES = {
     0x00F104: "BMS temp min/max summary",
     0x00F106: "BMS state (charger-dependent)",
     0x00F107: "BMS current/voltage limits",
-    0x00F108: "BMS aux status",
+    0x00F108: "BMS active fault bitmap",
     0x00FF50: "Charger telemetry (V, A)",
     0x00FF21: "Motor telemetry (RPM, throttle, state)",
 }
@@ -271,7 +312,7 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
     """Stream one log via python-can; append decoded rows + frames in-place."""
     sc = counts.setdefault(scenario, {
         "total": 0, "cells": 0, "temps": 0, "f100": 0, "f102": 0,
-        "charger": 0, "vc": 0, "motor": 0,
+        "f108": 0, "charger": 0, "vc": 0, "motor": 0,
         "skipped_zero": 0, "extended_false": 0,
     })
 
@@ -308,13 +349,18 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                         continue
                     base = (pgn - PGN_CELL_FIRST) * 4
                     for slot in range(4):
+                        idx = base + slot
+                        # The cell PGN range covers up to 168 channels but
+                        # this pack has only NUM_CELLS real cells; suppress
+                        # the rest along with 0 (empty) and 0xFFFF
+                        # ("not present" sentinel).
+                        if idx >= NUM_CELLS:
+                            continue
                         mv = be16(data[2 * slot], data[2 * slot + 1])
-                        # 0 = empty slot, 0xFFFF = "not present" sentinel
-                        # for cell channels beyond the 20-cell pack.
                         if mv == 0 or mv == 0xFFFF:
                             continue
                         emissions.append(
-                            (f"cell.{base + slot:02d}.voltage_v",
+                            (f"cell.{idx:02d}.voltage_v",
                              mv / 1000.0, "v"))
                     sc["cells"] += 1
 
@@ -324,10 +370,15 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                         continue
                     base = (pgn - PGN_TEMP_FIRST) * 8
                     for slot, b in enumerate(data):
-                        if b == 0:
+                        idx = base + slot
+                        # 80-channel range, only NUM_TEMPS real probes.
+                        # 0xFF is the "not present" sentinel.
+                        if idx >= NUM_TEMPS:
+                            continue
+                        if b == 0 or b == 0xFF:
                             continue
                         emissions.append(
-                            (f"temp.{base + slot:02d}.c",
+                            (f"temp.{idx:02d}.c",
                              b - TEMP_OFFSET_C, "c"))
                     sc["temps"] += 1
 
@@ -335,7 +386,7 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     if all(b == 0 for b in data):
                         sc["skipped_zero"] += 1
                         continue
-                    raw = be16(data[2], data[3])  # bytes 3-4 BE, biased u16
+                    raw = be16(data[2], data[3])  # bytes 2-3 BE, biased u16
                     amps = (raw - PACK_CURRENT_BIAS_RAW) * PACK_CURRENT_LSB_A
                     volts = data[1] * PACK_VOLTAGE_LSB_V + PACK_VOLTAGE_OFFSET_V
                     emissions.append(("pack.voltage_v", round(volts, 2), "v"))
@@ -361,6 +412,27 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     emissions.append(("pack.flags", data[7], ""))
                     emissions.append(("pack.v_estimate", pack_v, "v"))
                     sc["f102"] += 1
+
+                elif pgn == PGN_F108:
+                    # All zeros = healthy idle baseline. Byte 7 is the
+                    # dashboard-displayed BMS warning code bitmap (decoded
+                    # against the vendor table). Bytes 0..6 carry
+                    # additional fault info; bit-to-code mapping isn't
+                    # established yet, so they're surfaced as raw values
+                    # for visibility.
+                    if all(b == 0 for b in data):
+                        sc["skipped_zero"] += 1
+                        continue
+                    for i, b in enumerate(data):
+                        if b != 0:
+                            emissions.append(
+                                (f"bms.fault.byte{i}", b, ""))
+                    b7 = data[7]
+                    for bit, code, _desc in BMS_FAULT_CODES_BYTE7:
+                        if (b7 >> bit) & 1:
+                            emissions.append(
+                                (f"bms.fault.code_{code}", 1, ""))
+                    sc["f108"] += 1
 
             elif src == SRC_VEHICLE and pgn == PGN_F100:
                 emissions.append(("vc.state", data[0], ""))
@@ -442,10 +514,12 @@ DECODERS_HEADER = ["signal", "pgn", "source", "bytes", "formula",
 DECODERS = [
     ("cell.NN.voltage_v", "F113..F13C", "F3", "2*slot, 2*slot+1 (slot 0..3)",
      "BE u16 / 1000", "v", "verified",
-     "NN = (PGN-0xF113)*4 + slot; zero-mV slots suppressed"),
+     "NN = (PGN-0xF113)*4 + slot; capped at NUM_CELLS=20; "
+     "0-mV and 0xFFFF (not-present) sentinels suppressed"),
     ("temp.NN.c", "F155..F15E", "F3", "slot 0..7",
      "u8 - 40", "c", "verified",
-     "NN = (PGN-0xF155)*8 + slot; J1939 +40C offset; zero bytes suppressed"),
+     "NN = (PGN-0xF155)*8 + slot; capped at NUM_TEMPS=7; J1939 +40C offset; "
+     "0 and 0xFF (not-present) sentinels suppressed"),
     ("pack.cell_max_mv", "F102", "F3", "0-1", "BE u16",
      "mv", "verified", ""),
     ("pack.cell_min_mv", "F102", "F3", "2-3", "BE u16",
@@ -459,7 +533,7 @@ DECODERS = [
      "", "verified",
      "min-cell number, 1-based (BMS GUI numbering); subtract 1 for 0-based cell_index"),
     ("pack.flags", "F102", "F3", "7", "u8 (raw)",
-     "", "unknown", ""),
+     "", "tentative", "status/flag bits per NOTES; bit-level decode unknown"),
     ("pack.v_estimate", "F102", "F3", "0-3", "20 * (max+min)/2 / 1000",
      "v", "verified", "assumes 20-cell pack"),
     ("pack.voltage_v", "F100", "F3", "1", "u8 * 0.1 + 76.8",
@@ -470,6 +544,14 @@ DECODERS = [
     ("pack.current_a", "F100", "F3", "2-3", "(BE u16 - 0x7D00) * 0.1",
      "a", "verified",
      "+draw / -charge; cross-validated against amp-*.asc dashboard captures"),
+    ("bms.fault.byteN", "F108", "F3", "0..7", "u8 (raw, when nonzero)",
+     "", "verified",
+     "byte 7 = dashboard warning code bitmap; bytes 0..6 carry additional "
+     "fault info, bit-to-code mapping not yet established"),
+    ("bms.fault.code_NNN", "F108", "F3", "7", "(byte7 >> bit) & 1",
+     "", "verified",
+     "NNN per vendor BMS error-code table (124, 140, 142, 143, 144, 145, 146); "
+     "emitted as 1 only when bit set"),
     ("charger.status", "FF50", "E5", "0", "u8 (raw)",
      "", "verified",
      "0x00=idle, 0x01/0x02=handshake (transient), 0x03=active"),
@@ -557,11 +639,13 @@ def values_for(rows: list, scenario: str, signal: str):
 def summarize(counts: dict, rows: list):
     print()
     print(f"{'file':<28} {'frames':>7} {'cells':>6} {'temps':>6} "
-          f"{'F100':>5} {'F102':>5} {'chgr':>5} {'vc':>5} {'motor':>6}")
+          f"{'F100':>5} {'F102':>5} {'F108':>5} {'chgr':>5} {'vc':>5} "
+          f"{'motor':>6}")
     for scenario, sc in counts.items():
         print(f"{scenario:<28} {sc['total']:>7} {sc['cells']:>6} "
               f"{sc['temps']:>6} {sc['f100']:>5} {sc['f102']:>5} "
-              f"{sc['charger']:>5} {sc['vc']:>5} {sc['motor']:>6}")
+              f"{sc['f108']:>5} {sc['charger']:>5} {sc['vc']:>5} "
+              f"{sc['motor']:>6}")
 
     print("\nsummary:")
     for scenario in counts:
@@ -580,6 +664,14 @@ def summarize(counts: dict, rows: list):
         if amps:
             print(f"    I (F100)  : {min(amps):+.1f}..{max(amps):+.1f} A "
                   f"(0.1 A/bit, +draw / -charge)")
+        active_codes = sorted({
+            int(r[3].rsplit("_", 1)[1])
+            for r in rows
+            if r[0] == scenario and r[3].startswith("bms.fault.code_")
+        })
+        if active_codes:
+            print(f"    BMS codes : {', '.join(str(c) for c in active_codes)} "
+                  f"(union over capture; F108 byte 7)")
         chgr_v = values_for(rows, scenario, "charger.voltage_v")
         chgr_i = values_for(rows, scenario, "charger.current_a")
         if chgr_v:
