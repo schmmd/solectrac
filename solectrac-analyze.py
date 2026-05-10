@@ -51,6 +51,11 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     pack.temp_min_n            F104 byte 3: min-temp channel # (1-based)
     pack.temp_spread_c         F104 byte 4: max - min temp (°C)
     bms.state.byte0/1          F106 raw state bytes
+    bms.state.output_enable    F106 byte 0 bit 0 (BMS output command active)
+    bms.state.main_contactor   F106 byte 0 bit 2 (main contactor closed)
+    bms.state.operating        F106 byte 0 bit 6 (operating mode: power flowing)
+    bms.state.standby          F106 byte 0 bit 7 (standby: charger present, no
+                               main current; mutex with .operating)
     bms.state.charging         F106 byte 1 bit 3 (charger active)
     bms.state.charger_present  F106 byte 1 bit 2 (charger plugged in)
     bms.state.drive_mode       F106 byte 1 bit 5 (motor enabled)
@@ -637,31 +642,66 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     sc["f104"] += 1
 
                 elif pgn == PGN_F106:
-                    # BMS state byte pair. Across all 20 captures we see
-                    # only a small set of (byte 0, byte 1) combinations:
-                    #   (0x45, 0xE0) = drive ready (every capture with
-                    #                  motor activity)
-                    #   (0x45, 0xCC) = active charging (dominant in
-                    #                  charging-120V-90ish-to-100.asc)
-                    #   (0x80, 0xC4) = charger plugged in, idle
-                    #   (0x45, 0xC4) / (0x84, 0xC4) / (0x85, 0xC4) /
-                    #   (0x00, 0x80) = transient handshake states
-                    # byte 1 has the clearest bit semantics:
-                    #   bit 7 (0x80) = BMS alive (always set when data
-                    #                  is published)
+                    # BMS state byte pair. Across all 30 captures (36,955
+                    # F106F3 frames) only six (byte 0, byte 1) clusters
+                    # ever appear:
+                    #   (0x45, 0xCC) 28599 = active charging
+                    #   (0x45, 0xE0)  5434 = drive ready / running
+                    #   (0x80, 0xC4)  2796 = charger plugged in, no current
+                    #   (0x45, 0xC4)    96 = transient (drive/charge boot)
+                    #   (0x84, 0xC4)    10 = transient (charge teardown)
+                    #   (0x85, 0xCC)     3 = transient (charge teardown)
+                    #   (0x00, 0x80)     6 = init (deepest state, key-on)
+                    #   (others)         5 = brief boot/teardown transients
+                    # Byte 1 bit semantics (decoded into the existing
+                    # bms.state.* sub-signals):
+                    #   bit 7 (0x80) = BMS alive (set whenever published)
                     #   bit 6 (0x40) = vehicle/contactors awake
                     #   bit 5 (0x20) = drive mode (set only with motor)
                     #   bit 3 (0x08) = charging active (set only with
                     #                  charger status 0x03)
                     #   bit 2 (0x04) = charger present
-                    # bits in byte 0 are less clear; emit raw for now.
-                    # byte 2 is constant 0xFC; bytes 3-7 are 0xFF
-                    # (J1939 unused).
+                    # Byte 0 bit semantics, derived from the boot/teardown
+                    # timeline in charging-120V-90ish-to-100.asc:
+                    #   bit 0 (0x01) = BMS output command active (drive or
+                    #                  active-charge request enabled). Set
+                    #                  in 0x45/0x85; cleared in
+                    #                  0x00/0x44/0x80/0x84.
+                    #   bit 2 (0x04) = main contactor closed. Cleared
+                    #                  during init (0x00) and after the
+                    #                  contactor opens at the end of a
+                    #                  charge session (0x80).
+                    #   bit 6 (0x40) = operating mode (power flowing in
+                    #                  either direction: driving or
+                    #                  actively charging).
+                    #   bit 7 (0x80) = standby mode (charger present but
+                    #                  no main-bus current; covers
+                    #                  handshake, post-charge idle, and
+                    #                  fault-blocked charging).
+                    #   bits 6 and 7 are perfectly mutually exclusive
+                    #   across all 36,955 frames; treat them as a
+                    #   one-hot operating/standby flag pair.
+                    # Byte 2 is constant 0xFC across the corpus (vendor
+                    # static identifier?); bytes 3-7 are always 0xFF
+                    # (J1939 'not available').
                     if all(b == 0 for b in data):
                         sc["skipped_zero"] += 1
                         continue
                     emissions.append(("bms.state.byte0", data[0], ""))
                     emissions.append(("bms.state.byte1", data[1], ""))
+                    b0 = data[0]
+                    emissions.append(
+                        ("bms.state.output_enable",
+                         1 if b0 & 0x01 else 0, ""))
+                    emissions.append(
+                        ("bms.state.main_contactor",
+                         1 if b0 & 0x04 else 0, ""))
+                    emissions.append(
+                        ("bms.state.operating",
+                         1 if b0 & 0x40 else 0, ""))
+                    emissions.append(
+                        ("bms.state.standby",
+                         1 if b0 & 0x80 else 0, ""))
                     b1 = data[1]
                     emissions.append(
                         ("bms.state.charging", 1 if b1 & 0x08 else 0, ""))
@@ -1026,9 +1066,32 @@ DECODERS = [
      "linear fit through (224, 90%) and (250, 100%) from "
      "charging-120V-90ish-to-100.asc; slope loose pending deeper-discharge data"),
     ("bms.state.byte0", "F106", "F3", "0", "u8 (raw)",
+     "", "verified",
+     "BMS top-level mode bitfield; only six values observed across 36,955 "
+     "frames in 30 captures: 0x00 (init), 0x44/0x45 (operating), 0x80/0x84/"
+     "0x85 (standby). Bits decoded into bms.state.output_enable / "
+     "main_contactor / operating / standby below; bits 6 and 7 are perfectly "
+     "mutually exclusive (operating vs standby)"),
+    ("bms.state.output_enable", "F106", "F3", "0 (bit 0)", "(b0 >> 0) & 1",
      "", "tentative",
-     "BMS top-level state byte; observed values 0x00, 0x44, 0x45, 0x80, "
-     "0x84, 0x85 across 20 captures; bit semantics not fully established"),
+     "BMS output command active (drive request or active-charge request). "
+     "Set during driving and active charging; cleared during plug-in "
+     "handshake, post-charge teardown, fault-blocked charging, and init"),
+    ("bms.state.main_contactor", "F106", "F3", "0 (bit 2)", "(b0 >> 2) & 1",
+     "", "tentative",
+     "main pack contactor closed. Cleared during init (b0=0x00) and after "
+     "the contactor opens at end of charge (b0=0x80); set in all other "
+     "observed states"),
+    ("bms.state.operating", "F106", "F3", "0 (bit 6)", "(b0 >> 6) & 1",
+     "", "tentative",
+     "operating mode: power flowing in either direction (driving or actively "
+     "charging). Mutually exclusive with bms.state.standby across 36,955 "
+     "frames; cleared only in init (b0=0x00)"),
+    ("bms.state.standby", "F106", "F3", "0 (bit 7)", "(b0 >> 7) & 1",
+     "", "tentative",
+     "standby mode: charger plugged in but no main-bus current (covers "
+     "plug-in handshake, post-charge idle, and fault-blocked charging). "
+     "Mutually exclusive with bms.state.operating"),
     ("bms.state.byte1", "F106", "F3", "1", "u8 (raw)",
      "", "verified",
      "BMS state bitmap; bits decoded into bms.state.charging / "

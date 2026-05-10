@@ -415,6 +415,10 @@ class State:
     # F106 BMS state bitmap
     bms_state_byte0: Channel = field(default_factory=Channel)
     bms_state_byte1: Channel = field(default_factory=Channel)
+    bms_output_enable: Channel = field(default_factory=Channel)    # b0 bit 0
+    bms_main_contactor: Channel = field(default_factory=Channel)   # b0 bit 2
+    bms_operating: Channel = field(default_factory=Channel)        # b0 bit 6
+    bms_standby: Channel = field(default_factory=Channel)          # b0 bit 7
     bms_charging: Channel = field(default_factory=Channel)         # b1 bit 3
     bms_charger_present: Channel = field(default_factory=Channel)  # b1 bit 2
     bms_drive_mode: Channel = field(default_factory=Channel)       # b1 bit 5
@@ -633,14 +637,26 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             state.decoded += 1
 
         elif pgn == PGN_F106:
-            # BMS state. byte 1 carries the bitmap with the clearest
-            # semantics (charging / charger present / drive mode /
-            # contactors); byte 0 is a top-level state byte whose bit
-            # semantics aren't fully nailed down.
+            # BMS state. Across 36,955 frames in 30 captures only six
+            # (b0, b1) clusters appear (see analyze.py F106 block for
+            # full survey). Byte 0 is a top-level mode bitfield:
+            #   bit 0 = output_enable (drive/charge command active)
+            #   bit 2 = main_contactor closed
+            #   bit 6 = operating (power flowing)
+            #   bit 7 = standby (charger present, no main current)
+            # bits 6 and 7 are perfectly mutually exclusive across the
+            # corpus (operating vs standby).
+            # Byte 1 carries the secondary bitmap (charging / charger
+            # present / drive mode / contactors).
             if all(b == 0 for b in data):
                 return
             state.bms_state_byte0.update(data[0], now)
             state.bms_state_byte1.update(data[1], now)
+            b0 = data[0]
+            state.bms_output_enable.update(1 if b0 & 0x01 else 0, now)
+            state.bms_main_contactor.update(1 if b0 & 0x04 else 0, now)
+            state.bms_operating.update(1 if b0 & 0x40 else 0, now)
+            state.bms_standby.update(1 if b0 & 0x80 else 0, now)
             b1 = data[1]
             state.bms_charging.update(1 if b1 & 0x08 else 0, now)
             state.bms_charger_present.update(1 if b1 & 0x04 else 0, now)

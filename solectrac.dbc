@@ -57,7 +57,10 @@ BO_ 2565932275 BMS_TempSummary: 8 BMS
  SG_ Temp_Spread_C : 39|8@0+ (1,0) [0|255] "degC" VehicleController
 
 BO_ 2565932787 BMS_State: 8 BMS
- SG_ State_Byte0_Raw : 0|8@1+ (1,0) [0|255] "" VehicleController
+ SG_ State_Output_Enable : 0|1@1+ (1,0) [0|1] "" VehicleController
+ SG_ State_Main_Contactor : 2|1@1+ (1,0) [0|1] "" VehicleController
+ SG_ State_Operating : 6|1@1+ (1,0) [0|1] "" VehicleController
+ SG_ State_Standby : 7|1@1+ (1,0) [0|1] "" VehicleController
  SG_ State_BMS_Alive : 15|1@1+ (1,0) [0|1] "" VehicleController
  SG_ State_Contactors_Closed : 14|1@1+ (1,0) [0|1] "" VehicleController
  SG_ State_Drive_Mode : 13|1@1+ (1,0) [0|1] "" VehicleController
@@ -233,8 +236,11 @@ CM_ SG_ 2565932275 Temp_Max_Index "1-based channel number of the sensor reportin
 CM_ SG_ 2565932275 Temp_Min_Index "1-based channel number of the sensor reporting Temp_Min_C. Subtract 1 to map to the 0-based BMS_ModuleTemps_* signal index.";
 CM_ SG_ 2565932275 Temp_Spread_C "Max-Min temperature spread, degC. Equals Temp_Max_C - Temp_Min_C across all observed captures (not a J1939-offset value).";
 
-CM_ BO_ 2565932787 "PGN F106 from BMS. BMS state bitmap; behaviour is charger-dependent. Two state bytes observed: byte 0 carries vehicle/contactor-related flags whose bit semantics are not yet fully decoded (surfaced as raw); byte 1 has been decoded with high confidence by correlating bit transitions across drive captures, charging captures, and charger-plugged-but-idle captures. Observed (byte0, byte1) combinations include (0x45, 0xE0)=drive ready, (0x45, 0xCC)=active charging, (0x80, 0xC4)=charger plugged but idle.";
-CM_ SG_ 2565932787 State_Byte0_Raw "Byte 0 of F106 raw. Carries vehicle-state flags whose bit-to-meaning mapping is not yet established. 0x45 in drive captures and during active charging; 0x80 when charger plugged but idle. Byte 1 is omitted as a raw signal because it is fully bit-decoded into the State_* signals below (cantools rejects overlapping signal layouts).";
+CM_ BO_ 2565932787 "PGN F106 from BMS. BMS state bitmap; behaviour is charger-dependent. Two state bytes observed (both bit-decoded into the State_* signals below; cantools rejects overlapping signal layouts so neither raw byte is surfaced separately). Across 36,955 F106F3 frames in 30 captures only six (byte0, byte1) clusters appear: (0x45, 0xCC)=28599 active charging, (0x45, 0xE0)=5434 drive ready, (0x80, 0xC4)=2796 charger plugged but no main current, plus (0x45/0x84/0x85, 0xC4) and (0x00, 0x80) as brief boot/teardown transients. Byte 0 is a top-level mode bitfield (output_enable / main_contactor / operating / standby) decoded from the boot and teardown sequences in charging-120V-90ish-to-100.asc; bits 6 (operating) and 7 (standby) are perfectly mutually exclusive across the corpus. Byte 1 carries the secondary bitmap (charger_present / charging / drive_mode / contactors / alive). Byte 2 is constant 0xFC across the corpus (vendor static identifier?); bytes 3-7 are always 0xFF (J1939 'not available'). Observed (byte0, byte1) tuple labels: (0x45, 0xE0)=drive ready, (0x45, 0xCC)=active charging, (0x80, 0xC4)=charger plugged but idle.";
+CM_ SG_ 2565932787 State_Output_Enable "Byte 0 bit 0. BMS output command active (drive request or active-charge request enabled). Set in 0x45/0x85; cleared in 0x00/0x44/0x80/0x84. Cleared during plug-in handshake, post-charge teardown, fault-blocked charging, and init.";
+CM_ SG_ 2565932787 State_Main_Contactor "Byte 0 bit 2. Main pack contactor closed. Cleared during init (b0=0x00) and after the contactor opens at end of charge (b0=0x80); set in all other observed states. Tracks State_Contactors_Closed (byte 1 bit 6) closely but is sourced from byte 0.";
+CM_ SG_ 2565932787 State_Operating "Byte 0 bit 6. Operating mode: power flowing in either direction (driving or actively charging). Set in 0x44/0x45 across all drive captures and during active charging in charging-120V-90ish-to-100.asc. Mutually exclusive with State_Standby across all 36,955 observed frames; cleared only in the init state (b0=0x00).";
+CM_ SG_ 2565932787 State_Standby "Byte 0 bit 7. Standby mode: charger plugged in but no main-bus current. Set in 0x80/0x84/0x85; covers plug-in handshake, post-charge idle, and fault-blocked charging (e.g. bms-124-140-142-143-144-146.asc, where faults suspend charging). Mutually exclusive with State_Operating across all 36,955 observed frames.";
 CM_ SG_ 2565932787 State_BMS_Alive "Byte 1 bit 7. Set in every observed frame with non-zero state bytes; appears to be a BMS-alive / heartbeat indicator.";
 CM_ SG_ 2565932787 State_Contactors_Closed "Byte 1 bit 6. Set when the main contactors are closed (drive mode and active charging); cleared when charger is merely present but idle.";
 CM_ SG_ 2565932787 State_Drive_Mode "Byte 1 bit 5. Set in drive captures, clear during charging.";
@@ -323,6 +329,10 @@ VAL_ 2565933299 Fault_143_Battery_NeedsMaintenance 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_144_BatterySys_NeedsMaintenance 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_145_FullCycleNeeded 0 "inactive" 1 "active" ;
 VAL_ 2565933299 Fault_146_MaintenanceMode 0 "inactive" 1 "active" ;
+VAL_ 2565932787 State_Output_Enable 0 "off" 1 "on" ;
+VAL_ 2565932787 State_Main_Contactor 0 "open" 1 "closed" ;
+VAL_ 2565932787 State_Operating 0 "no" 1 "yes" ;
+VAL_ 2565932787 State_Standby 0 "no" 1 "yes" ;
 VAL_ 2565932787 State_BMS_Alive 0 "no" 1 "yes" ;
 VAL_ 2565932787 State_Contactors_Closed 0 "open" 1 "closed" ;
 VAL_ 2565932787 State_Drive_Mode 0 "inactive" 1 "active" ;
