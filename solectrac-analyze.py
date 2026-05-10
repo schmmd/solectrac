@@ -218,13 +218,17 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
         data; trust the lamp/state decode but treat any future SPN as
         TENTATIVE until cross-checked against vendor documentation.
   * PGN 0xFF21 from 0xCA: motor controller / drive ECU telemetry.
-        byte 0     = throttle pedal position (raw, ~0..0x34)
+        byte 0     = throttle pedal position (raw, ~0..0x34, max 0x69 observed)
+        byte 1     = always 0x00 across 45,086 frames in 30 captures
+                     (reserved padding)
         bytes 2-3  = motor RPM magnitude, little-endian uint16, biased by 0x0C80
                      (rpm = ((b3<<8)|b2) - 0x0C80; verified against a
                      0->2500 RPM acceleration trace). Always positive; sign of
                      motion comes from byte 7.
         byte 4     = main controller temperature, J1939 +40 C offset.
         byte 5     = motor temperature, J1939 +40 C offset.
+        byte 6     = always 0x00 across 45,086 frames in 30 captures
+                     (reserved padding)
         byte 7     = directional pedal state (foot-pedal selector):
                        0x10 = idle / neither pedal
                        0x14 = forward pedal pressed
