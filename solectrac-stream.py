@@ -668,6 +668,13 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             # BMS current limits, two BE u16 fields at 0.01 A/bit.
             # Drive captures: 145.0 A discharge / 100.0 A charge.
             # Charging captures: 100.0 A / 100.0 A.
+            # Byte 4 = mode flag (0=charging, 1=driving).
+            # Byte 5 = coarse-quantized pack-voltage echo. Across 5,326
+            # driving frames it tracks F100F3 V_pack at R^2=0.97 with
+            # V_pack ~= b5 * 0.2212 + 57.01 (~0.22 V/bit step); 0x00
+            # while charging; rare transients 0x4D/0x6B/0xA7 in init/
+            # teardown windows. Not surfaced separately here -- the
+            # full-precision pack voltage is already on state.pack_v.
             if all(b == 0 for b in data):
                 return
             i_dis = be16(data[0], data[1]) * LIMIT_CURRENT_LSB_A

@@ -63,7 +63,10 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     bms.limit.discharge_a      F107 bytes 0-1 BE * 0.01: max discharge current
     bms.limit.charge_a         F107 bytes 2-3 BE * 0.01: max charge current
     bms.limit.mode             F107 byte 4: 0=charging, 1=driving
-    bms.limit.byte5            F107 byte 5: slowly varying counter (raw)
+    bms.limit.byte5            F107 byte 5: pack-voltage echo at coarse quantization
+                               (~0.221 V/bit, offset ~57.0 V; R^2=0.97 vs F100F3 V_pack
+                               in driving captures); 0x00 in charging mode; rare
+                               transient values 0x4D / 0x6B / 0xA7 in init/teardown
     bms.fault.byteN            F108 bytes 0..7 raw (only emitted when frame is non-zero;
                                corresponds to DBC FaultByteN_Raw signals).
                                Across 36,952 F108 frames (30 captures): bytes 1,3,4,6 are
@@ -727,10 +730,21 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     # spec lists 200 A peak / 100 A continuous, so the
                     # 145 A figure is the BMS-published derated peak and
                     # 100 A is the continuous limit.
-                    # byte 4 = mode flag (0x00 charging, 0x01 driving),
-                    # byte 5 = slowly varying counter / status (~0x71..
-                    # 0x77 in driving captures, 0x00 in charging); not
-                    # yet fully decoded.
+                    # byte 4 = mode flag (0x00 charging, 0x01 driving).
+                    # byte 5 = coarse-quantized pack voltage echo. Across
+                    # 5,326 driving frames (b5 in 0x71..0x77), b5 tracks
+                    # F100F3 pack voltage with R^2=0.97; per-frame fit gives
+                    #   V_pack ~= b5 * 0.2212 + 57.0078
+                    #   b5     ~= 4.5198 * V_pack - 257.66
+                    # The mapping is essentially deterministic at the
+                    # ~0.22 V/bit step (every 2 ticks of F100 voltage byte
+                    # increments b5 by 1). In charging captures b5 is
+                    # 0x00 (BMS not publishing this estimate). Three rare
+                    # transient values appear briefly during ignition/
+                    # teardown windows: 0x4D, 0x6B, 0xA7 (5..98 frames
+                    # each). Likely the BMS-published "voltage limit"
+                    # echo of the pack voltage, but exact provenance
+                    # (OCV vs terminal vs cell-derived) not established.
                     if all(b == 0 for b in data):
                         sc["skipped_zero"] += 1
                         continue
@@ -1122,8 +1136,10 @@ DECODERS = [
      "0x00 in charging captures, 0x01 in drive captures"),
     ("bms.limit.byte5", "F107", "F3", "5", "u8 (raw)",
      "", "tentative",
-     "slowly varying counter / status (0x71..0x77 in drive captures, "
-     "0x00 in charging); semantics unknown"),
+     "coarse-quantized pack voltage echo: 0x71..0x77 (113..119) in "
+     "drive captures tracks F100F3 V_pack with R^2=0.97 (V_pack ~= "
+     "b5*0.2212 + 57.01, ~0.22 V/bit step); 0x00 while charging; "
+     "rare transients 0x4D/0x6B/0xA7 during ignition/teardown"),
     ("bms.fault.byteN", "F108", "F3", "0..7", "u8 (raw, when nonzero)",
      "", "verified",
      "byte 7 = dashboard warning code bitmap (see bms.fault.code_NNN); "
