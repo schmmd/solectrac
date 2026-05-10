@@ -163,6 +163,9 @@ PGN_TEMP_FIRST, PGN_TEMP_LAST = 0xF155, 0xF15E
 # Aggregate / status PGNs from BMS.
 PGN_F100 = 0xF100   # pack status (bytes 2-3 BE = signed pack current)
 PGN_F102 = 0xF102   # cell min/max summary
+PGN_F104 = 0xF104   # temp min/max summary (symmetric with F102)
+PGN_F106 = 0xF106   # BMS state / mode (bytes 0,1 = bitmap)
+PGN_F107 = 0xF107   # BMS current limits (charge/discharge)
 PGN_F108 = 0xF108   # BMS active fault bitmap (byte 7 = dashboard codes)
 
 # Charger broadcast.

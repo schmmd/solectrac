@@ -51,8 +51,9 @@ import argparse
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 
 try:
     import can
@@ -263,6 +264,13 @@ NMC_OCV_TABLE: List[Tuple[int, float]] = [
 # exceeds this. At rest the estimate is the most trustworthy.
 SOC_REST_CURRENT_A = 2.0
 
+# Time-to-full estimator: keep a sliding window of (ts, soc%) samples
+# this long, and require at least this much spread before publishing a
+# slope-based ETA. Linear extrapolation under-estimates the CV taper
+# near 100% SOC, so the readout is labelled as an estimate.
+SOC_ETA_WINDOW_S = 300.0   # 5 min sliding window
+SOC_ETA_MIN_SPAN_S = 30.0  # need at least this much data first
+
 
 def soc_from_cell_mv(mv: float) -> float:
     """Linear-interpolated SOC % from a per-cell OCV using NMC_OCV_TABLE.
@@ -356,6 +364,11 @@ class State:
     # BMS-published SOC (F100F3 byte 4). More authoritative than the
     # voltage-only estimate when present; preferred in render_pack.
     bms_soc_pct: Channel = field(default_factory=Channel)
+    # Sliding window of recent (ts, bms_soc%) samples used to estimate
+    # remaining time to 100% during charging. Pruned to SOC_ETA_WINDOW_S
+    # so the slope tracks the current charge phase rather than the
+    # full session.
+    soc_history: Deque[Tuple[float, float]] = field(default_factory=deque)
     # F108 fault bitmap bytes. Byte 7 is decoded (BMS warning code
     # bitmap from the operator manual). Bytes 0 and 2 are known to
     # carry additional fault info (seen nonzero in
@@ -455,6 +468,12 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             # saturates at 250 in soc-100-idle.asc. Slope is loose pending
             # a deeper-discharge capture.
             state.bms_soc_pct.update(data[4] * 0.385 + 3.8, now)
+            # Sliding window of SOC samples for the time-to-full ETA.
+            state.soc_history.append((now, state.bms_soc_pct.value))
+            cutoff = now - SOC_ETA_WINDOW_S
+            while (state.soc_history
+                   and state.soc_history[0][0] < cutoff):
+                state.soc_history.popleft()
             state.decoded += 1
 
         elif pgn == PGN_F108:
@@ -739,6 +758,43 @@ def render_pack(state: State, mains_v: float, efficiency: float,
     return Panel(t, title="Pack", border_style="green")
 
 
+def estimate_charge_eta_s(state: State) -> Optional[float]:
+    """Estimate seconds until BMS SOC reaches 100%.
+
+    Uses a linear fit over the recent SOC sample window. Returns None
+    when there isn't enough data, when SOC isn't rising, or when SOC is
+    already at/above 100%. Note: charging current tapers in the CV
+    phase near full, so linear extrapolation is optimistic in the last
+    ~10% of charge.
+    """
+    samples = state.soc_history
+    if len(samples) < 2:
+        return None
+    t0, s0 = samples[0]
+    t1, s1 = samples[-1]
+    span = t1 - t0
+    if span < SOC_ETA_MIN_SPAN_S:
+        return None
+    if s1 >= 100.0:
+        return 0.0
+    rate = (s1 - s0) / span  # %/s
+    if rate <= 0:
+        return None
+    return (100.0 - s1) / rate
+
+
+def format_eta(secs: float) -> str:
+    if secs <= 0:
+        return "complete"
+    if secs < 60:
+        return "<1 min"
+    hours = int(secs // 3600)
+    minutes = int((secs % 3600) // 60)
+    if hours > 0:
+        return f"~{hours}h {minutes:02d}m"
+    return f"~{minutes} min"
+
+
 def render_charger(state: State, now: float) -> Panel:
     t = Table.grid(padding=(0, 2))
     t.add_column(justify="left")
@@ -764,6 +820,22 @@ def render_charger(state: State, now: float) -> Panel:
     if state.chgr_v.value is not None and state.chgr_i.value is not None:
         t.add_row("power",
                   Text(f"{state.chgr_v.value * state.chgr_i.value:.0f} W"))
+
+    # Time-to-full estimate, shown only while actively charging. Based
+    # on the slope of recent BMS SOC samples; CV taper near full will
+    # make the linear extrapolation read low in the last ~10%.
+    if cs == CHGR_STATUS_ACTIVE and not stale:
+        soc_now = state.bms_soc_pct.value
+        if soc_now is not None and soc_now >= 99.5:
+            t.add_row("ETA to 100%", Text("complete", style="green"))
+        else:
+            eta = estimate_charge_eta_s(state)
+            if eta is None:
+                t.add_row("ETA to 100%",
+                          Text("estimating...", style="dim"))
+            else:
+                t.add_row("ETA to 100%", Text(format_eta(eta)))
+
     return Panel(t, title="Charger", border_style="green")
 
 
