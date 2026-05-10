@@ -39,7 +39,10 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     pack.cell_spread_mv
     pack.cell_max_n            F102 byte 4: max-cell number, 1-based (BMS GUI numbering)
     pack.cell_min_n            F102 byte 5: min-cell number, 1-based (BMS GUI numbering)
-    pack.flags                 F102 byte 7 (status/flag bits, raw)
+    pack.cell_spread_mv_reported  F102 byte 7: BMS-reported spread (max-min) in mV.
+                                  Verified to equal pack.cell_spread_mv in
+                                  36,950 of 36,950 corpus frames; previously
+                                  labelled 'pack.flags' but never carried flags.
     pack.v_estimate            20 * mean(min, max) / 1000
     pack.voltage_v             F100 byte 1: pack voltage, b * 0.1 + 76.8 V
     pack.current_raw           F100 bytes 2-3 (raw biased u16)
@@ -138,7 +141,10 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
   * PGN 0xF102: bytes 0-1 BE = max cell mV, bytes 2-3 BE = min cell mV,
                 byte 4 = max-cell number (1-based BMS GUI numbering),
                 byte 5 = min-cell number (1-based BMS GUI numbering),
-                byte 7 = status/flag bits.
+                byte 6 = 0x00 padding (constant across corpus),
+                byte 7 = cell spread in mV (max - min, 1 mV/bit; verified
+                         to match the computed (max-min) in 36,950/36,950
+                         corpus frames).
   * PGN 0xF100 byte 1 (data[1]) = pack voltage at the BMS terminals,
         encoded as 0.1 V/bit with a +76.8 V offset (V = b * 0.1 + 76.8).
         Confirmed by linear regression of byte 1 against 20 * mean cell mV
@@ -612,6 +618,17 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     sc["f100"] += 1
 
                 elif pgn == PGN_F102:
+                    # F102 layout (corpus survey, 36,950 active frames):
+                    #   bytes 0-1 BE = max cell mV
+                    #   bytes 2-3 BE = min cell mV
+                    #   byte 4       = max-cell channel (1-based, per BMS GUI)
+                    #   byte 5       = min-cell channel (1-based, per BMS GUI)
+                    #   byte 6       = 0x00 padding (constant across corpus)
+                    #   byte 7       = cell spread in mV (max - min, 1 mV/bit)
+                    # Byte 7 was previously labelled 'pack.flags'; full-
+                    # corpus comparison vs the computed (max_mv - min_mv)
+                    # matched in 36,950 of 36,950 frames, so byte 7 is the
+                    # BMS-reported spread, NOT a status bitmap.
                     if all(b == 0 for b in data):
                         sc["skipped_zero"] += 1
                         continue
@@ -626,7 +643,8 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                         ("pack.cell_spread_mv", max_mv - min_mv, "mv"))
                     emissions.append(("pack.cell_max_n", data[4], ""))
                     emissions.append(("pack.cell_min_n", data[5], ""))
-                    emissions.append(("pack.flags", data[7], ""))
+                    emissions.append(
+                        ("pack.cell_spread_mv_reported", data[7], "mv"))
                     emissions.append(("pack.v_estimate", pack_v, "v"))
                     sc["f102"] += 1
 
@@ -924,27 +942,76 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                 if all(b == 0 for b in data):
                     sc["skipped_zero"] += 1
                     continue
+                # Byte layout, surveyed across 3,108 FF50E5 frames in 5
+                # of 30 captures (the charger ECU only broadcasts when
+                # plugged in / shortly after key-on; otherwise silent):
+                #   byte 0     = status (0x00 idle, 0x01/0x02 transient,
+                #                0x03 active output)
+                #   bytes 1-2  = LE u16 voltage. During status==0x03 this
+                #                is the pack-side terminal voltage. During
+                #                status==0x00 with the contactor open it
+                #                tracks the charger's own output-rail
+                #                voltage which decays freely after
+                #                disconnect (e.g. 102 V -> 80 V over 136 s
+                #                in charging-120V-90ish-to-100.asc tail).
+                #                Byte 2 (high byte) is 0x00 in 100% of
+                #                frames; this 20-cell pack can't reach
+                #                raw 256 (~102.4 V engineering).
+                #   byte 3     = u8 current low byte, 0.1 A/bit. Range
+                #                0..25.5 A covers the observed 18.5 A
+                #                peak comfortably.
+                #   byte 4     = STATUS FLAGS (NOT current high byte).
+                #                Five values across the corpus, decoded
+                #                as a bitfield:
+                #                  bit 2 (0x04) = output disabled
+                #                  bit 3 (0x08) = plugged in / line OK
+                #                  bit 4 (0x10) = no AC line detected
+                #                Combined (status, flags) tuples form a
+                #                clean charger state machine; engineering
+                #                V/I are only valid when status==0x03 AND
+                #                flags==0x00. Four ghost frames in
+                #                soc-100-idle.asc have status=0x03 with
+                #                flags=0x14 (no line) -- those are NOT
+                #                real charging frames.
+                #   bytes 5-7  = reserved padding (0x00 in all 3,108
+                #                frames; not the J1939 0xFF sentinel).
                 status = data[0]
                 v_raw = le16(data[1], data[2])
-                i_raw = le16(data[3], data[4])
+                i_raw = le16(data[3], data[4])  # legacy 16-bit field;
+                # high byte (data[4]) is now known to be the flags byte,
+                # so this combination is meaningless when flags != 0x00.
+                # Kept for forward compatibility but the engineering
+                # current is computed from data[3] alone below.
+                flags = data[4]
                 emissions.append(("charger.status", status, ""))
                 emissions.append(("charger.v_raw", v_raw, ""))
                 emissions.append(("charger.i_raw", i_raw, ""))
-                # The voltage/current bytes only carry meaningful values
-                # while status == 0x03 (actively charging). In other
-                # states the bytes hold handshake/leftover values that
-                # decode to nonsense (e.g. byte 4 = 0x08 in idle ->
-                # 204.8 A). Keep status/v_raw/i_raw unconditional so the
-                # raw bytes remain visible, but only emit the engineering
-                # values while charging.
-                if status == 0x03:
+                emissions.append(("charger.flags", flags, ""))
+                emissions.append(
+                    ("charger.flag.output_disabled",
+                     1 if flags & 0x04 else 0, ""))
+                emissions.append(
+                    ("charger.flag.line_ok",
+                     1 if flags & 0x08 else 0, ""))
+                emissions.append(
+                    ("charger.flag.no_line",
+                     1 if flags & 0x10 else 0, ""))
+                # Engineering V/I are only meaningful while the charger
+                # is actively delivering power (status==0x03) AND the
+                # flags byte is clean (no "output disabled" / "no line"
+                # asserted). This excludes the 4 ghost frames in
+                # soc-100-idle.asc where status briefly reports 0x03 with
+                # flags==0x14 (no AC line).
+                if status == 0x03 and flags == 0x00:
                     emissions.append(
                         ("charger.voltage_v",
                          round(v_raw * CHARGER_V_LSB_V + CHARGER_V_OFFSET_V, 2),
                          "v"))
+                    # Current is encoded in byte 3 alone (low byte u8 *
+                    # 0.1 A/bit), since byte 4 is the flags byte.
                     emissions.append(
                         ("charger.current_a",
-                         round(i_raw * CHARGER_I_LSB_A, 1), "a"))
+                         round(data[3] * CHARGER_I_LSB_A, 1), "a"))
                 sc["charger"] += 1
 
             elif src == SRC_BMS_CHGR_IF and pgn == PGN_PROP_0600:
@@ -1052,8 +1119,11 @@ DECODERS = [
     ("pack.cell_min_n", "F102", "F3", "5", "u8 (raw)",
      "", "verified",
      "min-cell number, 1-based (BMS GUI numbering); subtract 1 for 0-based cell_index"),
-    ("pack.flags", "F102", "F3", "7", "u8 (raw)",
-     "", "tentative", "status/flag bits per NOTES; bit-level decode unknown"),
+    ("pack.cell_spread_mv_reported", "F102", "F3", "7", "u8",
+     "mv", "verified",
+     "BMS-reported cell spread in mV; matches computed (max-min) in "
+     "36,950/36,950 corpus frames. Previously labelled 'pack.flags' but "
+     "in fact carries the spread, not flag bits."),
     ("pack.v_estimate", "F102", "F3", "0-3", "20 * (max+min)/2 / 1000",
      "v", "verified", "assumes 20-cell pack"),
     ("pack.temp_max_c", "F104", "F3", "0", "u8 - 40",
