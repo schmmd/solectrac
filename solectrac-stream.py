@@ -235,10 +235,17 @@ class State:
     min_cell_n: Channel = field(default_factory=Channel)  # 1-based per BMS
     # Voltage-derived SOC (from min cell mV via NMC OCV table).
     soc_pct: Channel = field(default_factory=Channel)
-    # F108 fault bitmap bytes (byte 7 = decoded warning codes; byte 5 =
-    # tentative master "any fault present" flag).
-    fault_byte5: Channel = field(default_factory=Channel)
-    fault_byte7: Channel = field(default_factory=Channel)
+    # F108 fault bitmap bytes. Byte 7 is decoded (BMS warning code
+    # bitmap from the operator manual). Bytes 0 and 2 are known to
+    # carry fault info too (seen nonzero in
+    # asc/bms-error-codes/bms-fullcharge-102-109-140.asc) but the
+    # bit-to-code mapping isn't established yet, and codes 100-123
+    # aren't in the BMS manual table at all — so bytes 0/2 may host
+    # non-BMS dashboard codes (MC / charger / VC). All 8 bytes are
+    # tracked so undecoded fault info is at least visible.
+    fault_bytes: List[Channel] = field(
+        default_factory=lambda: [Channel() for _ in range(8)]
+    )
     # per-cell / per-temp arrays (indexed 0-based; display is 1-based)
     cells: List[Channel] = field(
         default_factory=lambda: [Channel() for _ in range(NUM_CELLS)]
@@ -307,9 +314,11 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
 
         elif pgn == PGN_F108:
             # All zeros in healthy idle. Byte 7 = dashboard-displayed
-            # warning code bitmap; byte 5 = tentative master fault flag.
-            state.fault_byte5.update(data[5], now)
-            state.fault_byte7.update(data[7], now)
+            # warning code bitmap (decoded). Other bytes carry fault
+            # info too (bytes 0 and 2 seen nonzero with non-BMS-table
+            # codes 102/109 displayed) but aren't decoded yet.
+            for i in range(8):
+                state.fault_bytes[i].update(data[i], now)
             state.decoded += 1
 
         elif pgn == PGN_F102:
@@ -375,7 +384,7 @@ def active_bms_faults(state: State) -> List[Tuple[int, str]]:
     Byte 5's semantics aren't decoded yet, so it isn't surfaced here as a
     code; render_faults shows its raw value separately for visibility.
     """
-    b7 = state.fault_byte7.value
+    b7 = state.fault_bytes[7].value
     if b7 is None:
         return []
     out: List[Tuple[int, str]] = []
@@ -731,17 +740,23 @@ def render_vc(state: State, now: float) -> Panel:
 
 
 def render_faults(state: State, now: float) -> Panel:
-    """Display the active BMS warning codes from F108 byte 7, plus the raw
-    byte5/byte7 values for visibility (byte 5 isn't fully decoded yet).
+    """Display BMS fault info from F108. Byte 7 has a decoded bit-to-code
+    mapping (vendor BMS error-code table); other bytes are shown as raw
+    values when nonzero so undecoded fault data is at least visible.
     """
-    b5 = state.fault_byte5.value
-    b7 = state.fault_byte7.value
-    stale = (state.fault_byte7.ts is None
-             or state.fault_byte7.is_stale(now))
+    bytes_seen = any(c.value is not None for c in state.fault_bytes)
+    if not bytes_seen:
+        return Panel(Text("(no F108 frame seen yet)", style="dim"),
+                     title="BMS faults", border_style="blue")
 
-    if b7 is None:
-        body = Text("(no F108 frame seen yet)", style="dim")
-        return Panel(body, title="BMS faults", border_style="blue")
+    # Stale if the most recent F108 byte update is older than STALE_S.
+    stamps = [c.ts for c in state.fault_bytes if c.ts is not None]
+    stale = (not stamps) or ((now - max(stamps)) > STALE_S)
+
+    vals = [int(c.value) if c.value is not None else 0
+            for c in state.fault_bytes]
+    nonzero_other = [(i, v) for i, v in enumerate(vals)
+                     if v != 0 and i != 7]
 
     faults = active_bms_faults(state)
 
@@ -749,30 +764,38 @@ def render_faults(state: State, now: float) -> Panel:
     t.add_column(justify="right")
     t.add_column(justify="left")
 
-    if not faults:
-        t.add_row(Text("status", style="dim"),
-                  Text("no active codes", style="green"))
-    else:
+    if faults:
         for code, desc in faults:
             t.add_row(Text(f"{code}", style="bold red"), Text(desc))
+    else:
+        t.add_row(Text("byte 7", style="dim"),
+                  Text("no codes from byte-7 group", style="green"))
+
+    if nonzero_other:
+        # Bytes 0..6 (excluding 7) with bit-position breakdown. Useful
+        # while the bit-to-code mapping for these bytes is still open.
+        for i, v in nonzero_other:
+            bits = ", ".join(str(b) for b in range(8) if (v >> b) & 1)
+            t.add_row(
+                Text(f"byte {i}", style="yellow"),
+                Text(f"0x{v:02X}  bits {{{bits}}}  (undecoded)",
+                     style="yellow"),
+            )
 
     raw_style = "yellow dim" if stale else "dim"
+    raw_hex = " ".join(f"{v:02X}" for v in vals)
     raw = Text(
-        f"raw  byte5=0x{int(b5 or 0):02X}  byte7=0x{int(b7):02X}"
-        + ("  (stale)" if stale else ""),
+        f"raw  {raw_hex}" + ("  (stale)" if stale else ""),
         style=raw_style,
     )
 
-    if faults:
-        border = "red"
-    elif b5:
-        # byte 5 is a tentative master flag — flag yellow if it's set even
-        # without a decoded byte-7 code.
-        border = "yellow"
+    if faults or nonzero_other:
+        border = "red" if faults else "yellow"
     else:
         border = "green"
 
-    return Panel(Group(t, raw), title="BMS faults", border_style=border)
+    return Panel(Group(t, raw), title="BMS faults (F108)",
+                 border_style=border)
 
 
 def render_alerts(alerts: List[Tuple[str, str]]) -> Panel:
@@ -797,7 +820,7 @@ def build_layout(state: State, args, now: float) -> Layout:
         Layout(name="cells", size=NUM_CELLS + 4),
         Layout(name="row3", size=5),
         Layout(name="row4", size=8),
-        Layout(name="faults", size=11),
+        Layout(name="faults", size=13),
         Layout(name="alerts", size=8),
     )
     layout["header"].update(render_header(state, now))

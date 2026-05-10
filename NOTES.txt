@@ -140,6 +140,31 @@ matched-mode pair that nailed down F108 as the BMS active-fault bitmap:
 The diff between these two captures localized the fault encoding to
 F108 and is what enabled the byte 7 decode. See the F108F3 section.
 
+A subsequent capture extends F108 evidence to bytes outside byte 7:
+
+* `bms-fullcharge-102-109-140.asc` — captured at 100 % SOC with the
+                                      dashboard cycling through codes
+                                      102 (Total voltage too high),
+                                      109 (Battery over voltage), and
+                                      140 (System fault level). F108
+                                      payload `10 00 04 00 00 00 00 01`
+                                      throughout. byte 7 = 0x01 sets
+                                      only bit 0 (= 124, the always-on
+                                      Clock fault baseline); 140 is NOT
+                                      asserted in byte 7 in this
+                                      snapshot, consistent with the
+                                      dashboard *cycling* through codes
+                                      so not all listed codes are
+                                      simultaneously active in the
+                                      bitmap. **bytes 0 = 0x10 and byte
+                                      2 = 0x04 are nonzero for the
+                                      first time in any capture**, so
+                                      F108 carries fault info beyond
+                                      byte 7. The bit-to-code mapping
+                                      for those bytes is not yet
+                                      established. See the F108F3
+                                      section.
+
 Side-by-side toggle captures (top-level, 2026-05-09) document attempts
 to find body-control signals on this bus:
 
@@ -463,22 +488,58 @@ F108F3 — "BMS active fault bitmap" (CONFIRMED for byte 7; TENTATIVE elsewhere)
     inactive codes in this group (141 reserved, 145 not currently
     active).
 
-    Byte 5 takes value 0x01 in the same capture and 0x00 in healthy
-    idle. TENTATIVE — most likely a master "any fault present" summary
-    flag (it would explain why the bitmap shows 7 set bits while the
-    dashboard cycles only 6 displayed codes); alternatively it could
-    be its own fault-category bitmap covering codes from another part
-    of the vendor table. Single-fault captures would disambiguate.
+    Byte 5 takes value 0x01 in `bms-124-140-142-143-144-146.asc` and
+    0x00 in healthy idle AND in `bms-fullcharge-102-109-140.asc` (which
+    also has active faults, so byte 5 is NOT a universal master-fault
+    flag). It correlates with byte 7 having content beyond the always-
+    on bit 0 (= 124). Best current guess: byte 5 is a "byte-7 group
+    has any non-baseline code asserted" summary flag, or a related
+    severity bit. TENTATIVE.
 
-    Bytes 0-4 and byte 6 are all 0x00 in both captures. Under the
-    natural "8 codes per byte, sequential" extrapolation they would
-    cover codes 100..107 / 108..115 / 116..123 / 124..131 / 132..139
-    / 148..155, but that hypothesis can't be tested without captures
-    in which one of codes 100-127 is active. (Note that this would put
-    code 124 at byte 3 bit 0, contradicting the byte 7 mapping above —
-    so the encoding is *not* a simple sequential pack across the whole
-    byte stream; byte 7 is its own dedicated "system / maintenance
-    warning" group.)
+    Bytes 0..6 — additional fault info CONFIRMED (mapping unknown).
+    `bms-fullcharge-102-109-140.asc` (operator-confirmed dashboard
+    cycling through codes 102, 109, 140) shows F108 =
+
+        10 00 04 00 00 00 00 01
+
+    so byte 0 = 0x10 (bit 4 set) and byte 2 = 0x04 (bit 2 set), both
+    nonzero for the first time. byte 7 = 0x01 sets only bit 0 (= 124,
+    the always-on baseline) — code 140 is *not* asserted in byte 7
+    in this snapshot, which is consistent with the dashboard cycling
+    through codes (only some are simultaneously asserted in the
+    bitmap at any instant; the "operator-saw-these" filename is a
+    union over the cycling, not a state of the snapshot).
+
+    Mapping for bytes 0..6 not yet established. Full BMS error code
+    table (per operator manual; see "Vendor BMS error code table"
+    section below):
+
+        100..113   misc voltage / current / temperature / unbalance
+                    (14 codes; 114-115 reserved)
+        116..123   detection / monitoring faults (8 codes)
+        124..127   clock / CAN / insulation faults
+        140        system fault level
+        142..146   maintenance codes (141 reserved)
+
+    32 codes total; F108 has 64 bits, so the layout has plenty of
+    room for any choice of grouping. Plausible layouts:
+
+      * "8 codes per byte by category": each byte covers a coherent
+        subset (voltage codes / temp codes / detection codes / etc).
+        byte 7 already fits this — codes 124 + 140-146 are the
+        "system / maintenance" group.
+      * "8 codes per byte, sequential, with reserved gaps": byte 0
+        = 100-107, byte 1 = 108-113 + reserved, byte 2 = 116-123,
+        etc. Doesn't fit byte 7 (which jumps 124 → 140) and doesn't
+        cleanly explain byte 0 bit 4 + byte 2 bit 2 with cycling
+        codes {102, 109, 140}.
+      * Some other vendor-specific grouping that isn't apparent
+        from the manual's numeric order.
+
+    Pinning down the bytes-0..6 mapping needs single-code captures
+    (one displayed dashboard code per capture) — the byte-7 decode
+    only worked because the popcount and code count matched. With
+    a single set bit per capture, the layout is unambiguous.
 
     Earlier interpretation (now superseded): the asc/*.asc captures
     that didn't include any active codes had F108 byte 7 = 0x01
@@ -486,15 +547,10 @@ F108F3 — "BMS active fault bitmap" (CONFIRMED for byte 7; TENTATIVE elsewhere)
     been guessed to be a charger-detected / contactor-state flag.
     Under the now-confirmed mapping, those readings instead translate
     to "code 124 active" and "codes 124, 142, 143, 144, 146 active",
-    respectively — which is consistent with a tractor that always
-    annunciates code 124 (Clock fault) once it has been on the bus
-    for any length of time, and additionally surfaces several
-    maintenance codes when the charger plug is inserted while at
-    100 % SOC. The "byte 0 = 0x10 / byte 2 = 0x04" content seen in
-    those captures remains undecoded; under the byte-7 evidence those
-    are NOT byte-7-style fault bitmaps, so the sequential-packing
-    extrapolation above is most likely wrong and bytes 0..6 hold
-    something else.
+    respectively — consistent with a tractor that always annunciates
+    code 124 (Clock fault) once it has been on the bus for any
+    length of time, and additionally surfaces several maintenance
+    codes when the charger plug is inserted while at 100 % SOC.
 
 
 PGN decode notes (charger, SA = 0xE5)
@@ -707,6 +763,57 @@ DM1 (FECA) — empty throughout
     showing numeric error codes. See "Dashboard error codes" below.
 
 
+Vendor BMS error code table (operator manual)
+---------------------------------------------
+
+Full text of the BMS error-code table from the operator manual:
+
+      100  SOC is too high
+      101  SOC is too low
+      102  Total voltage is too high
+      103  Total voltage is too low
+      104  Charge current fault
+      105  Discharge current fault
+      106  Battery temperature is too low
+      107  Battery temperature is too high
+      108  Battery under voltage
+      109  Battery over voltage
+      110  Battery temperature unbalance
+      111  Battery voltage unbalance
+      112  The battery does not match
+      113  The temperature of the output pole is too high
+      [114, 115 not in manual — reserved]
+      116  The parameters of memory fault
+      117  Data memory fault
+      118  Cell voltage detection fault
+      119  Temperature detection fault
+      120  Current detection fault
+      121  Internal total voltage detection fault
+      122  External total voltage detection fault
+      123  Insulation monitoring fault
+      124  Clock fault
+      125  Internal CAN communication fault
+      126  Serious insulation fault
+      127  Slight insulation fault
+      [128..139 not in manual — reserved]
+      140  System fault level
+      [141 not in manual — reserved]
+      142  BMS fault need maintenance
+      143  Battery fault need maintenance
+      144  Battery system fault needs maintenance
+      145  The battery needs to maintenance (full charging and full discharging)
+      146  Maintenance mode status
+
+32 codes total. F108 has 8 bytes = 64 bits, so the layout has plenty
+of headroom regardless of how the codes are grouped.
+
+Confirmed bit-to-code mapping so far is byte 7 only — see the F108F3
+section. Bytes 0..6 carry additional fault info (`bms-fullcharge-
+102-109-140.asc` shows byte 0 = 0x10 and byte 2 = 0x04) but the
+mapping is open. Bytes 1, 3, 4, 6 have not been seen nonzero in any
+capture yet.
+
+
 Dashboard error codes — F108 byte 7 is the dashboard-displayed bitmap
 ---------------------------------------------------------------------
 
@@ -731,10 +838,18 @@ captures (byte 7 = 0x01 = code 124 in driving captures, 0xB9 = codes
 {124, 142, 143, 144, 146} in ignition-with-charger-inserted) and were
 previously misinterpreted as a charger-detected flag.
 
-Codes 102 and 109 from the original observation are NOT covered by byte
-7 and remain UNRESOLVED. They are presumably in one of bytes 0-6 of F108
-(all of which are 0x00 in every capture so far), or possibly in F104,
-F106, or F107 — see "Open questions" for the next experiments.
+Codes 102 and 109 are also covered by F108, but in bytes 0..6, not
+byte 7. The `bms-fullcharge-102-109-140.asc` capture (operator-confirmed
+dashboard cycling 102 + 109 + 140 at 100 % SOC) shows F108 = `10 00
+04 00 00 00 00 01`: byte 0 = 0x10 and byte 2 = 0x04 are nonzero (one
+bit each), byte 7 = 0x01 carries only the always-on baseline 124, and
+140 is *not* asserted in byte 7 in this snapshot. The dashboard cycles
+through the listed codes so not all are simultaneously present in the
+bitmap; the snapshot shows only the codes asserted at this instant.
+
+The bit-to-code mapping for bytes 0..6 is OPEN. Pinning it down needs
+single-code captures so the popcount-matches-displayed-codes argument
+that nailed byte 7 can be replicated unambiguously.
 
 The legacy text below is preserved for historical context but predates
 the F108 decode.
@@ -819,6 +934,67 @@ To pin this down, the next capture should ideally:
 Until then: status of the codes' on-bus encoding is **UNKNOWN**, and
 the dashboard's display of them does NOT prove the BMS broadcasts
 them.
+
+
+Vendor MC error code table (operator manual)
+--------------------------------------------
+
+Full text of the motor-controller error-code table from the operator
+manual:
+
+       12  Controller Over Current
+       13  Current Sensor Fault
+       15  Controller Severe Undertemp
+       16  Controller Severe Over temp
+       17  Severe B+ Under voltage
+       18  Severe B+ Overvoltage
+       18  Severe KSI Overvoltage           [duplicate S.No. 18]
+       22  Controller Over temp Cutback
+       23  B+ Under voltage Cutback
+       24  B+ Overvoltage Cutback
+       25  +5V Supply Failure
+       28  Motor Temp Hot Cutback
+       29  Motor Temp Sensor Fault
+       31  Coil1 Driver Open/Short
+       31  Main Open/Short                  [duplicate S.No. 31]
+       32  Coil2 Driver Open/Short
+       32  EM Brake Open/Short              [duplicate S.No. 32]
+       36  Encoder Fault
+       36  Sin/Cos Sensor Fault             [duplicate S.No. 36]
+       37  Motor Open
+       38  Main Contactor Welded
+       39  Main Contactor Did Not Close
+       41  Throttle Wiper High
+       42  Throttle Wiper Low
+       43  Pot2 Wiper High
+       44  Pot2 Wiper Low
+       45  Pot Low Over Current
+       46  EEPROM Failure
+       47  HPD/Sequencing Fault
+       49  Parameter Change Fault
+       72  PDO Timeout
+       73  Stall Detected
+       83  Driver Supply
+       87  Motor Characterization Fault
+       51  Vehicle lock without applying hand brake   [out of order in manual]
+       88  Encoder Pulse Count Fault
+       89  Motor Type Fault
+       92  EM Brake failed to set
+       99  Parameter Mismatch
+
+39 entries total, but only 35 distinct S.No. values — codes 18, 31, 32,
+and 36 each have two definitions sharing a single number. This means a
+numeric code on the dashboard does not uniquely identify the underlying
+fault for those four S.No.s; disambiguation needs additional context
+(which subsystem is implicated by other simultaneous symptoms, vendor
+service-tool readout, etc.). Code 51 is listed out of numeric order in
+the manual (between 87 and 88), suggesting it was appended later.
+
+Numeric range is 12..99, which overlaps the BMS range (100..146) only
+at the boundary — they don't collide. So a dashboard showing "code 47"
+is unambiguously MC, and "code 124" is unambiguously BMS, *if* the
+dashboard surfaces both subsystems through the same numeric channel.
+See the methodology section below for how to verify that.
 
 
 Motor-controller error codes — methodology to decode (open)
@@ -1235,27 +1411,32 @@ TENTATIVE / GUESSED:
     F107 limits-frame layout: bytes 0..1 = current limit (sentinel
         0x2710 when zero, 0x38A4 = 14500 when driving), bytes 4..5
         = voltage limit (0x0176 = 374 → ~74.8 V). LSBs unconfirmed.
-    F108 byte 5 = master "any fault present" flag candidate. 0x00 in
-        healthy idle, 0x01 in the only fault capture so far. Could
-        instead be its own fault-category bitmap; single-fault captures
-        would disambiguate.
+    F108 byte 5 = "byte-7 group has any non-baseline code asserted"
+        summary flag candidate. 0x01 in the bms-124-140-142-143-144-146
+        capture (multiple byte-7 codes active), 0x00 in healthy idle
+        AND in bms-fullcharge-102-109-140 (which has byte 0 / byte 2
+        codes active but only the always-on 124 in byte 7). Rules out
+        a universal "any fault present" reading.
+    F108 bytes 0 and 2 = additional (non-byte-7) fault info.
+        bms-fullcharge-102-109-140.asc shows byte 0 = 0x10 and
+        byte 2 = 0x04 with displayed codes 102, 109, 140 cycling
+        (only some asserted at any instant). Bit-to-code mapping
+        not yet pinned down — needs single-code captures.
     FF21CA byte 5 (data[4], three-state field 0x28 / 0x3B / 0x3C) —
         not yet attributed to a specific signal.
 
 UNKNOWN:
     SOC / SOH host PGN
     alarm word location (screenshot showed "LowSoc lvl 2")
-    dashboard numeric error codes outside the byte-7 group —
-        codes 102 (Total voltage too high) and 109 (Battery
-        over voltage) from the original asc/*.asc session are
-        not in the byte-7 bitmap (which only covers 124, 140,
-        141, 142, 143, 144, 145, 146). All of bytes 0..6 of
-        F108 are 0x00 in every capture so far, so we have no
-        evidence yet that those codes live in F108 at all —
-        they may be in F104, F106, or F107, or the original
-        observation may have been from a different session
-        than the asc/*.asc one. Single-fault captures of any
-        100..127 code would resolve this.
+    F108 bytes 0..6 bit-to-code mapping. bms-fullcharge-102-109-140
+        confirms bytes 0 and 2 carry fault info (one bit each set
+        with displayed codes 102, 109, 140 cycling). Bytes 1, 3, 4,
+        and 6 have not been seen nonzero in any capture. Mapping
+        the 32 vendor-table codes (100..113, 116..127, 124, 140,
+        142..146) to specific bit positions in bytes 0..6 needs
+        single-code captures so the popcount-matches-displayed-
+        codes argument that nailed byte 7 can be replicated
+        unambiguously.
     KL15 / wake-up status bit location
     F104 byte-level decoding (temp min/max summary)
     FF21CA bytes 2, 5, 7 (data[1], data[4], data[6]) — counter /
