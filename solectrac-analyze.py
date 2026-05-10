@@ -70,6 +70,13 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     charger.i_raw              FF50 bytes 3-4 LE (raw, always emitted)
     charger.current_a          FF50 current, A
                                (only emitted while status == 0x03)
+    chgr_cmd.voltage_v         0600 bytes 0-1 BE * 0.1: BMS->charger V setpoint
+                               (no +76.8 V offset; suppressed when idle)
+    chgr_cmd.current_a         0600 bytes 2-3 BE * 0.1: BMS->charger I setpoint
+                               (suppressed when idle)
+    chgr_cmd.enable            0600 byte 4: 0=active command, 1=idle
+    chgr_cmd.v_raw             0600 bytes 0-1 BE raw
+    chgr_cmd.i_raw             0600 bytes 2-3 BE raw
     vc.state                   F100D0 byte 0 (raw heartbeat state)
     motor.rpm_signed           FF21CA RPM with directional sign
     motor.rpm_magnitude        FF21CA RPM unsigned
@@ -89,8 +96,10 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     dm1.dtc.oc                 FECA Occurrence Count (7-bit)
 
 Decoder assumptions (verify against the BMS spec before trusting numerically):
-  * Source 0xF3 is the BMS, 0xE5 is the external charger, 0xF4 is a vehicle
-    controller.
+  * Source 0xF3 is the BMS (broadcasts), 0xE5 is the external charger,
+    0xCA is the motor / drive ECU, 0xD0 is the vehicle controller, 0xF4
+    is the BMS again in its charger-interface role (sends only PGN
+    0x000600 destination-addressed to 0xE5).
     Byte numbering below is 0-based throughout (matches data[N] indexing
     in code and the DECODERS table; NOTES.txt uses 1-based, so data[1] in
     code = "byte 2" in NOTES).
@@ -139,6 +148,28 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
     = 0.986 for V and R^2 = 0.999 for I). V/I bytes only carry meaningful
     values while status == 0x03; other states leave them at handshake / idle
     values.
+  * PGN 0x000600 from 0xF4 to 0xE5 (charger): vendor-proprietary
+        BMS->charger command frame. Reverse-engineered by correlating
+        58,584 frames in charging-120V-90ish-to-100.asc against
+        contemporaneous F100 (pack V/I/SoC), FF50 (charger V/I/status),
+        and F107 (BMS current limits). Source 0xF4 sends only this PGN,
+        and only to destination 0xE5 -- consistent with a dedicated SA
+        for the BMS's charger-control role (likely the same physical
+        BMS module that uses 0xF3 for broadcasts).
+            bytes 0-1 BE u16 = voltage setpoint, 0.1 V/bit, no offset.
+                               0x034E = 84.6 V (4.23 V/cell * 20 cells)
+                               in every active-request frame.
+            bytes 2-3 BE u16 = current setpoint, 0.1 A/bit, no offset.
+                               Observed 3.0..39.0 A across the charge.
+                               When the request <= the charger's delivery
+                               capability (~14 A from a 120V/15A wall
+                               outlet at 84 V), the charger tracks within
+                               ~0.5 A. When the request exceeds capability
+                               the charger saturates ~18 A regardless.
+            byte 4           = enable: 0x00 = active command,
+                               0x01 = idle / no-request (charger drops
+                               to status 0x00 within a few frames).
+            bytes 5-7        = padding 0xFF.
   * PGN 0xFECA from 0xCA: DM1 (Active Diagnostic Trouble Codes), per
         SAE J1939-73. Single-frame layout (multi-DTC BAM not observed):
             byte 0     = lamp status, 4 lamps x 2 bits each:
@@ -184,6 +215,8 @@ except ImportError:
 
 # --- bus map -----------------------------------------------------------------
 SRC_BMS = 0xF3
+SRC_BMS_CHGR_IF = 0xF4   # BMS in its charger-interface role; only sender of
+                         # PGN 0x000600 to 0xE5 (proprietary charger commands)
 SRC_CHARGER = 0xE5
 SRC_VEHICLE = 0xD0   # vehicle controller; broadcasts a minimal F100 heartbeat
 SRC_MOTOR = 0xCA     # motor controller / drive ECU; FF21 telemetry, DM1 source
@@ -215,6 +248,10 @@ PGN_FF21 = 0xFF21   # motor telemetry (RPM, throttle, drive-state, ctrl temp)
 
 # Standard SAE J1939-73 diagnostic message (Active DTCs).
 PGN_FECA = 0xFECA   # DM1 (Active Diagnostic Trouble Codes)
+
+# Vendor proprietary BMS->charger command channel.
+PGN_PROP_0600 = 0x0600   # PDU1, src 0xF4 -> dest 0xE5: charger setpoints
+                         # (V/I requests + enable flag)
 
 # DM1 lamp-status enum per J1939-73 (2 bits per lamp, same encoding for byte 0
 # "lamp on/off" and byte 1 "flash status"):
@@ -305,6 +342,7 @@ PGN_NAMES = {
     0x00F108: "BMS active fault bitmap",
     0x00FF50: "Charger telemetry (V, A)",
     0x00FF21: "Motor telemetry (RPM, throttle, state)",
+    0x000600: "BMS->Charger command (V/I setpoint, enable)",
 }
 
 
@@ -746,6 +784,58 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                          round(i_raw * CHARGER_I_LSB_A, 1), "a"))
                 sc["charger"] += 1
 
+            elif src == SRC_BMS_CHGR_IF and pgn == PGN_PROP_0600:
+                # BMS->Charger command frame (vendor proprietary PGN
+                # 0x000600, src 0xF4 -> dest 0xE5). Reverse-engineered
+                # by correlating contemporaneous F100 (pack V/I/SoC),
+                # FF50 (charger V/I/status), and F107 (BMS limits)
+                # across charging-120V-90ish-to-100.asc:
+                #   bytes 0-1 BE = voltage setpoint, 0.1 V/bit, no offset
+                #     (always 0x034E = 84.6 V during active requests --
+                #      4.23 V/cell * 20 cells, the NMC max charge V).
+                #   bytes 2-3 BE = current setpoint, 0.1 A/bit, no offset
+                #     (3.0..39.0 A across the charge; charger faithfully
+                #      tracks the request when within its delivery
+                #      capability and saturates near its power-limit
+                #      otherwise).
+                #   byte 4 = enable flag: 0x00 = command power output,
+                #            0x01 = idle / no request (charger drops to
+                #            status 0x00 within a few frames).
+                #   bytes 5-7 = padding 0xFF.
+                # Idle-only frames (00 00 00 00 01 FF FF FF) are
+                # suppressed to keep the CSV compact, the same way
+                # FF50 idle is handled.
+                v_set_raw = be16(data[0], data[1])
+                i_set_raw = be16(data[2], data[3])
+                enable = data[4]
+                if (v_set_raw == 0 and i_set_raw == 0
+                        and enable in (0, 1) and all(b == 0xFF
+                                                     for b in data[5:])):
+                    if enable == 1:
+                        # Idle / no-request frame -- emit just the
+                        # enable flag so analyses can find idle periods,
+                        # but skip the V/I zeros to avoid noise.
+                        emissions.append(
+                            ("chgr_cmd.enable", enable, ""))
+                        sc.setdefault("chgr_cmd", 0)
+                        sc["chgr_cmd"] += 1
+                    else:
+                        # all-zero with enable=0 hasn't been observed;
+                        # treat as malformed and skip.
+                        sc["skipped_zero"] += 1
+                    continue
+                emissions.append(
+                    ("chgr_cmd.voltage_v",
+                     round(v_set_raw * 0.1, 1), "v"))
+                emissions.append(
+                    ("chgr_cmd.current_a",
+                     round(i_set_raw * 0.1, 1), "a"))
+                emissions.append(("chgr_cmd.enable", enable, ""))
+                emissions.append(("chgr_cmd.v_raw", v_set_raw, ""))
+                emissions.append(("chgr_cmd.i_raw", i_set_raw, ""))
+                sc.setdefault("chgr_cmd", 0)
+                sc["chgr_cmd"] += 1
+
             if emissions:
                 frame_index = len(frames)
                 frames.append((
@@ -895,6 +985,28 @@ DECODERS = [
      "a", "verified",
      "emitted only while status==0x03 (in idle the raw bytes would "
      "decode to a spurious 204.8 A)"),
+    ("chgr_cmd.voltage_v", "0600", "F4", "0-1", "BE u16 * 0.1",
+     "v", "verified",
+     "BMS-commanded charger voltage setpoint; always 84.6 V during "
+     "active requests (20s NMC * 4.23 V/cell); no +76.8 V offset "
+     "(unlike F100/FF50). Suppressed during idle frames."),
+    ("chgr_cmd.current_a", "0600", "F4", "2-3", "BE u16 * 0.1",
+     "a", "verified",
+     "BMS-commanded charger current setpoint; 3.0..39.0 A observed "
+     "across the 90%->100% charge in charging-120V-90ish-to-100.asc; "
+     "charger.current_a tracks within ~0.5 A when request <= charger "
+     "delivery capability, saturates ~18 A on a 120V/15A wall outlet "
+     "when request exceeds it. Suppressed during idle frames."),
+    ("chgr_cmd.enable", "0600", "F4", "4", "u8 (raw)",
+     "", "verified",
+     "0x00 = active charging command, 0x01 = idle / no-request "
+     "(charger.status drops to 0x00 within a few frames)"),
+    ("chgr_cmd.v_raw", "0600", "F4", "0-1", "BE u16",
+     "", "verified",
+     "raw setpoint, emitted alongside the engineering value for parity "
+     "with charger.v_raw / pack.current_raw"),
+    ("chgr_cmd.i_raw", "0600", "F4", "2-3", "BE u16",
+     "", "verified", ""),
     ("vc.state", "F100", "D0", "0", "u8 (raw)",
      "", "verified", "0x00=init, 0x0C=ready"),
     ("motor.rpm_signed", "FF21", "CA", "2-3, 7",
