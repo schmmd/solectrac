@@ -44,6 +44,7 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     pack.voltage_v             F100 byte 1: pack voltage, b * 0.1 + 76.8 V
     pack.current_raw           F100 bytes 2-3 (raw biased u16)
     pack.current_a             F100 signed pack current, A
+    pack.power_w               F100 derived: pack.voltage_v * pack.current_a (signed; + draw / - charge)
     pack.temp_max_c            F104 byte 0: pack max module temp, b - 40
     pack.temp_min_c            F104 byte 1: pack min module temp, b - 40
     pack.temp_max_n            F104 byte 2: max-temp channel # (1-based)
@@ -217,6 +218,7 @@ import argparse
 import csv
 import sys
 from pathlib import Path
+from typing import Tuple
 
 try:
     import can
@@ -283,6 +285,13 @@ TEMP_OFFSET_C = 40
 # / "not present" sentinels.
 NUM_CELLS = 20
 NUM_TEMPS = 7
+
+# Pack ratings from the vendor BMS GUI (see NOTES.txt): 300 Ah at 72.0 V
+# nominal -> 21.6 kWh nominal energy. Used by stream.py for the SOC->Wh
+# remaining estimate; not used for any decoding here.
+PACK_CAPACITY_AH = 300.0
+PACK_NOMINAL_V = 72.0
+PACK_CAPACITY_WH = PACK_CAPACITY_AH * PACK_NOMINAL_V    # 21,600 Wh
 
 # F108 byte 7: dashboard-displayed BMS warning code bitmap. Bit -> (code,
 # description). Cross-validated against two operator-confirmed captures
@@ -518,6 +527,14 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     emissions.append(("pack.voltage_v", round(volts, 2), "v"))
                     emissions.append(("pack.current_raw", raw, ""))
                     emissions.append(("pack.current_a", round(amps, 1), "a"))
+                    # Derived: instantaneous pack power (signed). Sign
+                    # convention follows pack.current_a: + = drawing
+                    # (discharging), - = charging. Watts = V * A; the
+                    # voltage offset of +76.8 V means the pack never
+                    # decodes below that threshold, so power is well-
+                    # defined whenever current is.
+                    emissions.append(("pack.power_w",
+                                      round(volts * amps, 1), "w"))
                     # byte 4: BMS-published State-of-Charge. Identified by
                     # cross-capture comparison: byte 4 is constant within
                     # short captures (e.g. 250 across 489 frames in
@@ -945,6 +962,10 @@ DECODERS = [
     ("pack.current_a", "F100", "F3", "2-3", "(BE u16 - 0x7D00) * 0.1",
      "a", "verified",
      "+draw / -charge; cross-validated against amp-*.asc dashboard captures"),
+    ("pack.power_w", "F100", "F3", "1, 2-3", "pack.voltage_v * pack.current_a",
+     "w", "verified",
+     "derived (not transmitted): instantaneous pack power, signed; "
+     "+ = discharging, - = charging. Emitted on every F100F3 frame."),
     ("pack.soc_raw", "F100", "F3", "4", "u8 (raw)",
      "", "tentative",
      "BMS-published SoC raw byte; saturates at 250 in soc-100-idle.asc"),
@@ -1149,6 +1170,32 @@ def values_for(rows: list, scenario: str, signal: str):
     return [r[4] for r in rows if r[0] == scenario and r[3] == signal]
 
 
+def integrate_power(rows: list, scenario: str) -> Tuple[float, float, float]:
+    """Trapezoidal integration of pack.power_w over the capture, returning
+    (wh_drawn, wh_charged, capture_seconds). Drawn / charged are positive
+    energies; sign is folded by clamping each sample to >=0 / <=0 before
+    integrating each side. Skips samples whose dt is implausibly large
+    (>5 s) so any gaps don't smear arbitrary power across the gap."""
+    samples = [(r[1], r[4]) for r in rows
+               if r[0] == scenario and r[3] == "pack.power_w"]
+    samples.sort()
+    wh_out = 0.0    # drawn
+    wh_in = 0.0     # charged
+    if len(samples) < 2:
+        return 0.0, 0.0, 0.0
+    span = samples[-1][0] - samples[0][0]
+    for (t0, p0), (t1, p1) in zip(samples, samples[1:]):
+        dt = t1 - t0
+        if dt <= 0 or dt > 5.0:
+            continue
+        # trapezoidal rule, split by sign so a + . - mix doesn't cancel
+        avg_pos = (max(p0, 0.0) + max(p1, 0.0)) / 2.0
+        avg_neg = (min(p0, 0.0) + min(p1, 0.0)) / 2.0
+        wh_out += avg_pos * dt / 3600.0
+        wh_in += -avg_neg * dt / 3600.0
+    return wh_out, wh_in, span
+
+
 def summarize(counts: dict, rows: list):
     print()
     print(f"{'file':<28} {'frames':>7} {'cells':>6} {'temps':>6} "
@@ -1177,6 +1224,22 @@ def summarize(counts: dict, rows: list):
         if amps:
             print(f"    I (F100)  : {min(amps):+.1f}..{max(amps):+.1f} A "
                   f"(0.1 A/bit, +draw / -charge)")
+        powers = values_for(rows, scenario, "pack.power_w")
+        if powers:
+            wh_out, wh_in, span = integrate_power(rows, scenario)
+            net = wh_out - wh_in
+            avg_pos = (sum(p for p in powers if p > 0)
+                       / max(1, sum(1 for p in powers if p > 0)))
+            avg_neg = (sum(p for p in powers if p < 0)
+                       / max(1, sum(1 for p in powers if p < 0)))
+            print(f"    P (F100)  : {min(powers):+.0f}..{max(powers):+.0f} W "
+                  f"(V*I, signed)")
+            print(f"    P avg     : draw {avg_pos:+.0f} W  /  "
+                  f"charge {avg_neg:+.0f} W  "
+                  f"(over {span:.1f} s of samples)")
+            print(f"    energy    : drawn {wh_out:.1f} Wh  /  "
+                  f"charged {wh_in:.1f} Wh  /  net {net:+.1f} Wh "
+                  f"(of {PACK_CAPACITY_WH/1000:.1f} kWh nominal)")
         active_codes = sorted({
             int(r[3].rsplit("_", 1)[1])
             for r in rows

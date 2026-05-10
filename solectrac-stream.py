@@ -246,6 +246,12 @@ CHARGER_V_OFFSET_V = PACK_VOLTAGE_OFFSET_V
 CHARGER_I_LSB_A = 0.1
 RPM_BIAS = 0x0C80
 LIMIT_CURRENT_LSB_A = 0.01     # F107 bytes 0-1 / 2-3 BE, 0.01 A/bit
+# Pack ratings from the vendor BMS GUI (NOTES.txt): 300 Ah at 72.0 V
+# nominal -> 21.6 kWh nominal energy. Used for the "% of pack" display
+# only; not used for any decoding.
+PACK_CAPACITY_AH = 300.0
+PACK_NOMINAL_V = 72.0
+PACK_CAPACITY_WH = PACK_CAPACITY_AH * PACK_NOMINAL_V    # 21,600 Wh
 
 VC_STATE_NAMES = {0x00: "init", 0x0C: "ready"}
 
@@ -361,6 +367,17 @@ class State:
     pack_v_terminal: Channel = field(default_factory=Channel)
     pack_v_est: Channel = field(default_factory=Channel)
     pack_i_a: Channel = field(default_factory=Channel)
+    # Derived: instantaneous pack power (V*I, signed). + draw / - charge.
+    # Session-cumulative energy in Wh, integrated trapezoidally between
+    # successive F100F3 frames; gated against gaps > 5 s (likely bus
+    # dropouts) so we don't smear arbitrary power across the gap. The
+    # last_energy_ts tracks the timestamp / power of the previous F100F3
+    # frame for the trapezoidal step.
+    pack_power_w: Channel = field(default_factory=Channel)
+    energy_wh_drawn: float = 0.0
+    energy_wh_charged: float = 0.0
+    last_energy_ts: Optional[float] = None
+    last_energy_p: Optional[float] = None
     # charger
     chgr_v: Channel = field(default_factory=Channel)
     chgr_i: Channel = field(default_factory=Channel)
@@ -528,6 +545,28 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
             state.pack_i_a.update(
                 (raw_i - PACK_CURRENT_BIAS_RAW) * PACK_CURRENT_LSB_A, now
             )
+            # Derived: instantaneous pack power (V * I, signed; + draw /
+            # - charge). Integrate trapezoidally over the gap to the
+            # previous F100F3 frame for session Wh totals; gap > 5 s is
+            # treated as a bus dropout and skipped (we don't know what
+            # was happening in between). F100F3 publishes at ~10 Hz so
+            # the typical dt is ~100 ms.
+            volts = state.pack_v_terminal.value
+            amps = state.pack_i_a.value
+            if volts is not None and amps is not None:
+                power = volts * amps
+                state.pack_power_w.update(power, now)
+                if (state.last_energy_ts is not None
+                        and state.last_energy_p is not None):
+                    dt = now - state.last_energy_ts
+                    if 0.0 < dt <= 5.0:
+                        p0, p1 = state.last_energy_p, power
+                        avg_pos = (max(p0, 0.0) + max(p1, 0.0)) / 2.0
+                        avg_neg = (min(p0, 0.0) + min(p1, 0.0)) / 2.0
+                        state.energy_wh_drawn += avg_pos * dt / 3600.0
+                        state.energy_wh_charged += -avg_neg * dt / 3600.0
+                state.last_energy_ts = now
+                state.last_energy_p = power
             # byte 4 = BMS-published State-of-Charge. Linear fit through
             # (224, 90%) and (250, 100%) from charging-120V-90ish-to-100.asc;
             # saturates at 250 in soc-100-idle.asc. Slope is loose pending
@@ -891,6 +930,22 @@ def render_pack(state: State, mains_v: float, efficiency: float,
             t.add_row("AC est",
                       Text(f"~{ac_w:.0f} W  ({ac_a:.1f} A @ {mains_v:.0f} V, "
                            f"{efficiency * 100:.0f}% eff)"))
+
+    # Session-cumulative energy. Integrated across F100F3 frames since
+    # stream start. Net is positive when the session has drawn more
+    # than it charged.
+    wh_out = state.energy_wh_drawn
+    wh_in = state.energy_wh_charged
+    if wh_out > 0.5 or wh_in > 0.5:
+        t.add_row("", "")
+        t.add_row("session draw", Text(f"{wh_out:.0f} Wh", style="red"))
+        t.add_row("session charge", Text(f"{wh_in:.0f} Wh", style="green"))
+        net = wh_out - wh_in
+        net_style = "red" if net > 0 else "green"
+        t.add_row("session net",
+                  Text(f"{net:+.0f} Wh  "
+                       f"({net / PACK_CAPACITY_WH * 100:+.1f}% of pack)",
+                       style=net_style))
 
     # Tag the reading when the pack is under significant load: terminal
     # voltage is depressed (discharging) or elevated (charging) and the
