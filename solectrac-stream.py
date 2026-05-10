@@ -993,6 +993,46 @@ def power_sparkline(state: State, width: int = POWER_SPARK_WIDTH) -> Text:
     return out
 
 
+# F106 flag display order. Tuples of (channel attribute, short label,
+# style-when-active). Mode-style flags (operating/standby/charging/drive)
+# get bold so they read as "what the BMS is currently doing"; the rest
+# get plain green for "yes, this is on". Ordered to keep mutually
+# exclusive primary-mode pills (op / stby / chg) adjacent.
+_BMS_FLAGS: List[Tuple[str, str, str]] = [
+    ("bms_main_contactor", "MC",     "bold green"),
+    ("bms_contactors",     "ctct",   "green"),
+    ("bms_output_enable",  "out",    "green"),
+    ("bms_operating",      "OPER",   "bold green"),
+    ("bms_standby",        "STBY",   "bold cyan"),
+    ("bms_charging",       "CHG",    "bold green"),
+    ("bms_drive_mode",     "DRIVE",  "bold yellow"),
+    ("bms_charger_present", "chgr",  "green"),
+]
+
+
+def bms_flags_pills(state: State) -> Text:
+    """Compact pill row for the eight F106 BMS state flags.
+
+    Each pill is the abbreviated flag name; bright when the flag is set,
+    dim when clear. Pills are separated by a thin '·' so the row reads
+    as one line of state at a glance.
+    """
+    out = Text()
+    sep = Text(" ")  # single space; pill colours give the visual break
+    for i, (attr, label, style) in enumerate(_BMS_FLAGS):
+        if i > 0:
+            out.append_text(sep)
+        ch: Channel = getattr(state, attr)
+        v = ch.value
+        if v is None:
+            out.append(label, style="dim")
+        elif int(v):
+            out.append(label, style=style)
+        else:
+            out.append(label, style="dim")
+    return out
+
+
 def fmt(c: Channel, fmt_spec: str = "{:.2f}", unit: str = "",
         now: Optional[float] = None) -> Text:
     if c.value is None:
@@ -1050,17 +1090,18 @@ def render_pack(state: State, mains_v: float, efficiency: float,
     # when charging. ideas.txt: "you're at 18 A of a 200 A budget".
     if pi is not None:
         if pi >= 0 and state.limit_discharge_a.value is not None:
-            limit = state.limit_discharge_a.value
+            limit_ch = state.limit_discharge_a
             kind = "discharge"
             used = pi
         elif pi < 0 and state.limit_charge_a.value is not None:
-            limit = state.limit_charge_a.value
+            limit_ch = state.limit_charge_a
             kind = "charge"
             used = -pi
         else:
-            limit = None
+            limit_ch = None
             kind = None
             used = 0.0
+        limit = limit_ch.value if limit_ch is not None else None
         if limit is not None and limit > 0:
             frac = max(0.0, min(1.0, used / limit))
             bar_w = 14
@@ -1072,7 +1113,7 @@ def render_pack(state: State, mains_v: float, efficiency: float,
                 style = "yellow"
             else:
                 style = None
-            tag = " (stale)" if state.limit_discharge_a.is_stale(now) else ""
+            tag = " (stale)" if limit_ch.is_stale(now) else ""
             short = "dis" if kind == "discharge" else "chg"
             t.add_row(
                 "limit",
@@ -1107,6 +1148,14 @@ def render_pack(state: State, mains_v: float, efficiency: float,
                 Text(f"  last {int(POWER_HISTORY_S)}s", style="dim"),
             ),
         )
+
+    # F106 BMS state flags. Eight booleans decoded from byte 0/1; we
+    # render them as pills so the operator can see at a glance whether
+    # the contactor is closed, what mode the BMS is in, and whether the
+    # charger is present. Bright = set, dim = clear, "?" = no F106 yet.
+    if state.bms_state_byte0.value is not None:
+        flags_row = bms_flags_pills(state)
+        t.add_row("flags", flags_row)
 
     # Session-cumulative energy. Integrated across F100F3 frames since
     # stream start. Net is positive when the session has drawn more
@@ -1654,7 +1703,7 @@ def build_layout(state: State, args, now: float) -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="row1", size=16),
+        Layout(name="row1", size=17),
         Layout(name="cells", size=11),
         Layout(name="row4", size=8),
         Layout(name="faults", size=15),
