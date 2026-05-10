@@ -912,13 +912,16 @@ def render_cells(state: State, now: float) -> Panel:
 
     lo, hi = min(vals), max(vals)
     span = max(1, hi - lo)
-    bar_w = 24
+    bar_w = 6
+    cols = 4  # cells per row (row-major: 5 rows × 4 cols for 20 cells)
 
     t = Table.grid(padding=(0, 1))
-    t.add_column(justify="right")
-    t.add_column()
-    t.add_column(justify="right")
+    for _ in range(cols):
+        t.add_column(justify="right")
+        t.add_column()
+        t.add_column(justify="right")
 
+    row: list = []
     for i, c in enumerate(cells):
         n = i + 1  # BMS-style 1-based display
         if c.value is None:
@@ -937,7 +940,15 @@ def render_cells(state: State, now: float) -> Panel:
             else:
                 style = None
             mv_text = Text(f"{int(c.value)} mV", style=style)
-        t.add_row(f"#{n:>2}", bar, mv_text)
+        row.extend([f"#{n:>2}", bar, mv_text])
+        if len(row) == cols * 3:
+            t.add_row(*row)
+            row = []
+    if row:
+        # pad final row so add_row gets the right column count
+        while len(row) < cols * 3:
+            row.extend(["", Text(""), ""])
+        t.add_row(*row)
 
     summary = Text()
     if state.max_cell_n.value is not None:
@@ -953,32 +964,27 @@ def render_cells(state: State, now: float) -> Panel:
 
 
 def render_temps(state: State, now: float) -> Panel:
-    t = Table.grid(padding=(0, 2))
-    for _ in range(NUM_TEMPS):
-        t.add_column(justify="center")
-    t.add_row(*[Text(f"T{i}", style="dim") for i in range(NUM_TEMPS)])
-    cells_row = []
-    for ch in state.temps:
+    t = Table.grid(padding=(0, 1))
+    t.add_column(justify="right")
+    t.add_column(justify="left")
+    for i, ch in enumerate(state.temps):
+        label = Text(f"T{i+1}", style="dim")
         if ch.value is None:
-            cells_row.append(Text("---", style="dim"))
+            val = Text("---", style="dim")
         else:
             style = "yellow dim" if ch.is_stale(now) else None
-            cells_row.append(Text(
-                f"{int(ch.value)}°C ({int(c_to_f(ch.value))}°F)",
-                style=style))
-    t.add_row(*cells_row)
+            val = Text(f"{int(ch.value)}°C ({int(c_to_f(ch.value))}°F)",
+                       style=style)
+        t.add_row(label, val)
 
     vals = [c.value for c in state.temps if c.value is not None]
     if vals:
         lo, hi = min(vals), max(vals)
         delta = hi - lo
-        sub = Text(f"  Δ {delta} °C ({delta * 9 / 5:.0f} °F)    "
-                   f"range {lo}–{hi} °C "
-                   f"({c_to_f(lo):.0f}–{c_to_f(hi):.0f} °F)",
-                   style="dim")
+        sub = Text(f"Δ {delta}°C  {lo}–{hi}°C", style="dim")
     else:
         sub = Text("")
-    return Panel(Group(t, sub), title="Temperatures", border_style="blue")
+    return Panel(Group(t, sub), title="Temps", border_style="blue")
 
 
 def render_motor(state: State, now: float) -> Panel:
@@ -1133,8 +1139,7 @@ def build_layout(state: State, args, now: float) -> Layout:
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="row1", size=9),
-        Layout(name="cells", size=NUM_CELLS + 4),
-        Layout(name="row3", size=5),
+        Layout(name="cells", size=11),
         Layout(name="row4", size=8),
         Layout(name="faults", size=13),
         Layout(name="alerts", size=8),
@@ -1144,8 +1149,10 @@ def build_layout(state: State, args, now: float) -> Layout:
         Layout(render_pack(state, args.mains_v, args.efficiency, now)),
         Layout(render_charger(state, now)),
     )
-    layout["cells"].update(render_cells(state, now))
-    layout["row3"].update(render_temps(state, now))
+    layout["cells"].split_row(
+        Layout(render_cells(state, now), ratio=1),
+        Layout(render_temps(state, now), ratio=1),
+    )
     layout["row4"].split_row(
         Layout(render_motor(state, now)),
         Layout(render_vc(state, now)),
