@@ -532,86 +532,87 @@ F107F3 — "BMS current/voltage limits"
     Confirming this requires a charge capture from low SOC where the
     BMS will publish meaningful charge-current limits.
 
-F108F3 — "BMS active fault bitmap" (CONFIRMED layout, bytes 0..6 + byte 7)
+F108F3 — "BMS active fault bitmap" (CONFIRMED via injection 2026-05-10)
     Active BMS fault flags. All bytes are 0x00 in healthy idle, verified
     against asc/bms-error-codes/idle-no-bms.asc (key on, neutral, no
-    charger).
+    charger). Every per-bit assignment below was established by spoofing
+    F108 with the corresponding single bit set and reading the resulting
+    code off the dashboard (see solectrac-inject-f108.py and the
+    f108-mapping.csv / f108-byte7.csv / f108-byte6.csv result files).
 
-    BYTES 0..6 — vendor codes 100..127, 2 BITS PER CODE
-    ---------------------------------------------------
-    Bytes 0..6 are a 2-bit-per-code bitmap covering the vendor "BMS error
-    code" table entries 100..127 (4 codes per byte, packed sequentially):
+    BYTES 0..6 — mixed encoding (2-bit for bytes 0..3, 1-bit for bytes 4..5)
+    ------------------------------------------------------------------------
+    Bytes 0..6 don't use a uniform per-bit-rate. The actual layout — from
+    a complete 56-bit injection sweep — is:
 
-        code = 100 + 4 * byte_index + pair_index
+        byte 0: 2 bits/code -> codes 100, 101, 102, 103
+        byte 1: 2 bits/code -> codes 104, 105, 106, 107
+        byte 2: 2 bits/code -> codes 108, 109, 110, 111
+        byte 3: 2 bits/code -> codes 112, 113 (bits 4..7 SILENT — codes
+                               114, 115 are reserved per the manual and
+                               take zero bits, not a 2-bit slot)
+        byte 4: 1 BIT/code  -> bit 0=116, bit 1=117, bit 2=118, bit 3=119,
+                               bit 4=120, bit 5=121, bit 6=122, bit 7=123
+        byte 5: 1 bit/code  -> bit 0=124, bit 1=125, bit 2=126, bit 3=127
+                               (bits 4..7 silent)
+        byte 6: fully silent — all 8 bits produce no dashboard response
 
-    where pair_index in {0,1,2,3} addresses the bit pairs (0,1), (2,3),
-    (4,5), (6,7). Either bit asserted -> code on. (This is the SAE J1939
-    "2-bit status" convention: 00 = off / not asserted, 01 / 10 / 11 =
-    asserted at varying severity; the dashboard treats any non-00 pair
-    as the code being on.)
+    For the 2-bit bytes the dashboard treats either bit of a pair as the
+    code being asserted (SAE J1939 "2-bit status" convention: 00=off,
+    01/10/11=on at varying severity, dashboard renders any non-00 pair
+    as the code on). For the 1-bit bytes each bit independently asserts
+    its own code.
 
-    Resulting per-byte code coverage:
+    The transition from 2-bit (codes 100..113) to 1-bit (codes 116..127)
+    is at the byte 3/4 boundary, with reserved codes 114, 115 occupying
+    no bits at all (byte 3 bits 4..7 silent).
 
-        byte 0: 100 101 102 103
-        byte 1: 104 105 106 107
-        byte 2: 108 109 110 111
-        byte 3: 112 113 [114] [115]   (114, 115 reserved per manual)
-        byte 4: 116 117 118 119
-        byte 5: 120 121 122 123
-        byte 6: 124 125 126 127
+    Result files: f108-mapping.csv (byte 0 full, byte 1 partial),
+    f108-bytes1to5.csv (bytes 1, 2, byte 3 partial), f108-bytes3to5.csv
+    (bytes 3..5 full), f108-byte6.csv (byte 6 silent confirmed),
+    f108-byte7.csv (byte 7 — see below).
 
-    CONFIRMED by injection sweep (solectrac-inject-f108.py --sweep), see
-    f108-mapping.csv: setting byte 0 bit 0..bit 7 individually displays
-    codes 100, 100, 101, 101, 102, 102, 103, 103 on the dashboard, and
-    setting byte 1 bit 0..bit 3 displays 104, 104, 105, 105 — exactly the
-    pattern predicted. The remaining bytes (codes 106..127) are predicted
-    by the same formula and were not directly observed; finishing the
-    sweep would close that gap.
-
-    The two pre-injection captures fall out cleanly under this layout:
+    The two pre-injection captures decode cleanly under this layout:
 
       * `bms-fullcharge-102-109-140.asc` (operator-confirmed cycling 102,
         109, 140) F108 = `10 00 04 00 00 00 00 01`:
-            byte 0 = 0x10 -> bits 4-5 = 01 -> code 102  ✓
-            byte 2 = 0x04 -> bits 2-3 = 01 -> code 109  ✓
-            byte 7 = 0x01 -> code 140 (under byte-7 mapping below)
-        Combined: codes {102, 109, 140} — exactly the operator's set.
+            byte 0 = 0x10 -> bits 4-5 (pair 2) -> code 102  ✓
+            byte 2 = 0x04 -> bits 2-3 (pair 1) -> code 109  ✓
+            byte 7 = 0x01 -> code 140 (per byte-7 mapping below)
+        Combined: {102, 109, 140} — exactly the operator's set.
 
       * `bms-124-140-142-143-144-146.asc` (operator-confirmed cycling
         124, 140, 142, 143, 144, 146) F108 = `00 00 00 00 00 01 00 BB`:
-            byte 5 = 0x01 -> bits 0-1 = 01 -> code 120 (current detection
-                                              fault) — operator didn't
-                                              call this out; plausibly a
-                                              non-displayed flag or
-                                              missed during cycling
-            byte 7 = 0xBB -> codes {124, 140, 142, 143, 144, 146}
+            byte 5 = 0x01 -> bit 0 -> code 124  ✓
+            byte 7 = 0xBB -> {140, 142, 143, 144, 145}
+        Combined: {124, 140, 142, 143, 144, 145}. The operator listed
+        ..., 146, but 146 has no source anywhere in F108 — this is
+        almost certainly a 145 transcription, not a missing decode.
 
-    BYTE 7 — system/maintenance codes, 1 BIT PER CODE
-    -------------------------------------------------
-    Byte 7 is a separate 1-bit-per-code bitmap for the system / maintenance
-    code group:
+    BYTE 7 — 1 bit per code, with gaps and a duplicate
+    --------------------------------------------------
+    Byte 7 is a 1-bit-per-code bitmap covering codes 140 and 142..145.
+    The full mapping per f108-byte7.csv:
 
-        bit 0 (0x01) = code 140  System fault level
-        bit 1 (0x02) = code 124  Clock fault
-        bit 2 (0x04) = code 141  reserved (no code 141 in manual)
-        bit 3 (0x08) = code 142  BMS fault need maintenance
-        bit 4 (0x10) = code 143  Battery fault need maintenance
-        bit 5 (0x20) = code 144  Battery system fault needs maintenance
-        bit 6 (0x40) = code 145  Full charge/discharge cycle needed
-        bit 7 (0x80) = code 146  Maintenance mode status
+        bit 0 (0x01) = code 140     System fault level
+        bit 1 (0x02) = (silent)     (dashboard shows nothing)
+        bit 2 (0x04) = (silent)     (dashboard shows nothing)
+        bit 3 (0x08) = code 142     BMS fault need maintenance
+        bit 4 (0x10) = code 143     Battery fault need maintenance
+        bit 5 (0x20) = code 144     Battery system fault needs maintenance
+        bit 6 (0x40) = code 144     duplicate of bit 5 (re-verified)
+        bit 7 (0x80) = code 145     Full charge/discharge cycle needed
 
-    Codes 124 and 140 ALSO appear in the bytes-0..6 layout (byte 6); the
-    decoder merges the two groups so each code is emitted once per frame.
+    Notable: code 146 ("Maintenance mode status") is NOT encoded in byte 7
+    or anywhere else in F108 under injection. Bit 6 genuinely re-asserts
+    code 144 — the duplicate was re-tested with a single-bit injection and
+    the dashboard displayed 144 again, not 145 or 146. Two bits asserting
+    the same code might be a warning-vs-fault severity pair the dashboard
+    renders identically. Bits 1 and 2 are silent on the dashboard but
+    might still carry internal flags that don't surface as numeric codes.
 
-    Bit 0 = 140 CONFIRMED via injection on 2026-05-10: spoofing
-    F108 = `00 00 00 00 00 00 00 01` displayed code 140 on the dashboard.
-    This rules out the earlier "bit 0 = 124 (always-on baseline)" reading
-    and validates solectrac-analyze.py's mapping; the cross-capture
-    invariant argument was right.
-
-    Bits 2 and 6 weren't lit in either operator-confirmed capture; codes
-    141 (reserved) and 145 are speculatively assigned by numeric order.
-    A `--sweep --sweep-bytes 7` run would settle those last two bits.
+    Code 124 is in byte 5 (not byte 7); the bytes-0..6 and byte-7 active
+    sets are merged and deduplicated by the decoder.
 
 
 PGN decode notes (charger, SA = 0xE5)
@@ -980,22 +981,32 @@ capture yet.
 Dashboard error codes — F108 carries the displayed BMS bitmap
 -------------------------------------------------------------
 
-UPDATE (2026-05-10): F108 carries the dashboard-displayed warning codes
-across both byte 7 (system/maintenance group, 1 bit per code) AND bytes
-0..6 (codes 100..127, 2 bits per code, packed sequentially). See the
-F108F3 section above for the complete decode and the injection-sweep
-evidence (f108-mapping.csv).
+UPDATE (2026-05-10): every per-bit assignment in F108 was established by
+direct injection — spoofing each bit individually and reading the
+resulting code off the dashboard. See the F108F3 section above for the
+full per-byte mapping. Key findings:
 
-Earlier interpretation: the asc/*.asc captures with no actively-watched
-fault codes had F108 byte 7 = 0x01 (driving) and 0xB9 (ignition-with-
-charger-inserted), which had originally been guessed to be a charger-
-detected / contactor-state flag. Under the now-confirmed mapping those
-readings translate to code 140 alone, and codes {140, 142, 143, 144,
-146} respectively — consistent with a tractor that always annunciates
-code 140 (System fault level) once on the bus, and additionally surfaces
-several maintenance codes when the charger plug is inserted at 100 % SOC.
+* Bytes 0..6 use MIXED encoding by byte:
+    - bytes 0..3: 2 bits per code (codes 100..113; byte 3 bits 4..7 are
+                  silent because the manual's 114, 115 are reserved)
+    - bytes 4..5: 1 bit per code (byte 4 = codes 116..123 across all 8
+                  bits; byte 5 = codes 124..127, bits 4..7 silent)
+    - byte 6: fully silent
+* Byte 7 uses 1 bit per code with gaps: bit 0 = 140, bits 1,2 silent,
+  bit 3 = 142, bit 4 = 143, bits 5 AND 6 both = 144 (re-verified
+  duplicate), bit 7 = 145. Code 146 ("Maintenance mode status") is not
+  encoded in F108 anywhere — the operator's "146" in the
+  bms-124-140-142-143-144-146.asc cycling capture was almost certainly a
+  145 transcription.
 
-Byte 7 bit 0 = code 140 was confirmed by injection on 2026-05-10.
+The asc/*.asc captures with no actively-watched fault codes had F108
+byte 7 = 0x01 (driving) and 0xB9 (ignition-with-charger-inserted), which
+had originally been guessed to be a charger-detected / contactor-state
+flag. Under the confirmed mapping those readings translate to code 140
+alone, and codes {140, 142, 143, 144, 145} respectively — consistent
+with a tractor that always annunciates code 140 (System fault level)
+once on the bus, and additionally surfaces several maintenance codes
+when the charger plug is inserted at 100 % SOC.
 
 
 Vendor MC error code table (operator manual)

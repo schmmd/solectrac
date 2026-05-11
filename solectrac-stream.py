@@ -202,29 +202,44 @@ def describe_mc_code(code: int) -> str:
     return " / ".join(entries)
 
 
-# F108 byte 7 carries a bitmap of dashboard-displayed BMS warning codes.
-# Each entry is (bit, code). The description is looked up from
-# BMS_FAULT_DESCRIPTIONS at render time so the operator-manual text is
-# the single source of truth.
+# F108 byte 7: bit -> code, 1 bit per code with gaps. Mapping established
+# by per-bit injection on 2026-05-10 (see solectrac-inject-f108.py and
+# f108-byte7.csv): bit 0 = 140, bits 1,2 silent (dashboard shows nothing),
+# bit 3 = 142, bit 4 = 143, bit 5 = 144, bit 6 = 144 (genuine duplicate
+# of bit 5, re-verified), bit 7 = 145. Code 146 does NOT appear anywhere
+# in F108; the operator's "146" in bms-124-140-142-143-144-146.asc was
+# almost certainly a 145 transcription.
 #
-# Bit 0 = 140 confirmed by injection on 2026-05-10 (spoofing F108 byte 7
-# = 0x01 alone displayed code 140 on the dashboard). That forces 124 to
-# bit 1; the remaining set bits (3,4,5,7) in bms-124-140-142-143-144-146
-# .asc (byte 7 = 0xBB) cover codes 142, 143, 144, 146 in numeric order.
-# Bits 2 and 6 weren't lit in either operator-confirmed capture; codes
-# 141 (reserved) and 145 are speculative assignments from the manual.
-#
-# These map onto the DBC's Fault_<code>_<ShortName> bit-level signals.
+# Descriptions are looked up from BMS_FAULT_DESCRIPTIONS at render time
+# so the operator-manual text remains the single source of truth.
 BMS_FAULT_CODES_BYTE7: List[Tuple[int, int]] = [
     (0, 140),
-    (1, 124),
-    (2, 141),  # speculative: bit not seen lit in any capture
-    (3, 142),  # tentative: manual omits 142 (lists 141 here)
+    # bit 1: silent on dashboard
+    # bit 2: silent on dashboard
+    (3, 142),
     (4, 143),
     (5, 144),
-    (6, 145),  # speculative: bit not seen lit in any capture
-    (7, 146),
+    (6, 144),  # duplicate of bit 5 (re-verified by injection)
+    (7, 145),
 ]
+
+# F108 bytes 0..6: per-bit code table. Indexed by (byte, bit); None means
+# the bit is silent on the dashboard. Layout uses MIXED encoding:
+# bytes 0..3 are 2 bits per code (each pair of adjacent bits displays the
+# same code), bytes 4..5 are 1 bit per code, byte 6 is fully silent. The
+# manual's reserved codes (114, 115) take zero bits — bits 4..7 of byte 3
+# are silent. Codes 120..123 live in byte 4 bits 4..7 (1 bit each).
+#
+# Confirmed end-to-end by injection sweep on 2026-05-10.
+BMS_FAULT_CODES_BYTES_0_TO_6: dict = {
+    0: (100, 100, 101, 101, 102, 102, 103, 103),
+    1: (104, 104, 105, 105, 106, 106, 107, 107),
+    2: (108, 108, 109, 109, 110, 110, 111, 111),
+    3: (112, 112, 113, 113, None, None, None, None),  # 114, 115 reserved
+    4: (116, 117, 118, 119, 120, 121, 122, 123),
+    5: (124, 125, 126, 127, None, None, None, None),
+    # byte 6: all 8 bits silent
+}
 
 TEMP_OFFSET_C = 40
 
@@ -858,22 +873,25 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
 
 def active_bms_faults(state: State) -> List[Tuple[int, str]]:
     """Return [(code_number, description), ...] for currently active codes
-    in F108. Bytes 0..6 use 2 bits per code (codes 100..127); byte 7 uses
-    1 bit per code per BMS_FAULT_CODES_BYTE7. Codes that fall in both
-    groups (124, 140) are deduplicated.
+    in F108. Bytes 0..6 are decoded per BMS_FAULT_CODES_BYTES_0_TO_6
+    (mixed 2-bit/1-bit encoding by byte); byte 7 is decoded per
+    BMS_FAULT_CODES_BYTE7 (1 bit per code with gaps; bits 5 and 6 both
+    = 144).
 
     Descriptions come from the operator-manual BMS_FAULT_DESCRIPTIONS
     table.
     """
     active: set = set()
-    for i in range(7):
-        b = state.fault_bytes[i].value
+    for byte_idx, codes in BMS_FAULT_CODES_BYTES_0_TO_6.items():
+        b = state.fault_bytes[byte_idx].value
         if b is None:
             continue
         b = int(b)
-        for pair in range(4):
-            if (b >> (pair * 2)) & 0b11:
-                active.add(100 + 4 * i + pair)
+        for bit_idx, code in enumerate(codes):
+            if code is None:
+                continue
+            if (b >> bit_idx) & 1:
+                active.add(code)
     b7 = state.fault_bytes[7].value
     if b7 is not None:
         b7 = int(b7)

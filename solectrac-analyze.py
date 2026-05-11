@@ -77,12 +77,17 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
                                is the dashboard system/maintenance bitmap (1 bit per code:
                                124, 140, 142..146). Codes 124 and 140 also fall in the
                                bytes-0..6 layout (byte 6) and are emitted once per frame.
-    bms.fault.code_NNN         vendor BMS error code asserted (=1). Bytes 0..6 use 2 bits
-                               per code, packed sequentially: code = 100 + 4*byte +
-                               pair_index over bit pairs (0,1),(2,3),(4,5),(6,7); either
-                               bit asserts the code (J1939 status convention). Byte 7
-                               uses 1 bit per code per BMS_FAULT_CODES_BYTE7. Confirmed by
-                               injection sweep for codes 100..105; predicted for 106..127.
+    bms.fault.code_NNN         vendor BMS error code asserted (=1). F108 bytes 0..6 use
+                               mixed encoding: bytes 0..3 are 2 bits per code (codes
+                               100..113; 114/115 reserved -> bits 4..7 of byte 3 silent),
+                               bytes 4..5 are 1 bit per code (byte 4 = 116..123, byte 5
+                               = 124..127 with bits 4..7 silent), byte 6 is silent.
+                               Byte 7 uses 1 bit per code with gaps (bit 0 = 140; bits
+                               1,2 silent; bit 3 = 142; bit 4 = 143; bits 5,6 both =
+                               144; bit 7 = 145). Code 146 is not encoded in F108.
+                               Per-bit tables live in BMS_FAULT_CODES_BYTES_0_TO_6 and
+                               BMS_FAULT_CODES_BYTE7. All mappings injection-confirmed
+                               on 2026-05-10.
     charger.status             FF50 byte 0
     charger.v_raw              FF50 bytes 1-2 LE (raw, always emitted)
     charger.voltage_v          FF50 charger output voltage, raw * 0.1 + 76.8 V
@@ -157,21 +162,27 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
         58 A): mean decoded current matches the displayed dashboard reading
         within ~1 A across the full range, including across the 0x7D->0x7E and
         0x7F->0x80 high-byte rollovers.
-  * PGN 0xF108 = BMS active fault bitmap.
-        Bytes 0..6 carry vendor codes 100..127 at 2 bits per code, 4 codes
-        per byte, packed sequentially: code = 100 + 4*byte + pair_index
-        where pair_index in 0..3 addresses bit pairs (0,1),(2,3),(4,5),
-        (6,7). Either bit asserted -> code on. Layout confirmed by injection
-        sweep (solectrac-inject-f108.py) for codes 100..105 and consistent
-        with bms-fullcharge-102-109-140.asc (byte 0 bit 4 -> code 102,
-        byte 2 bit 2 -> code 109). The 2-bit-per-code shape matches the
-        SAE J1939 status convention.
-        Byte 7 carries the system/maintenance code group at 1 bit per code:
-        bit 0=140, bit 1=124, bit 3=142, bit 4=143, bit 5=144, bit 7=146
-        (bits 2 and 6 didn't appear in either calibration capture; codes
-        141 and 145 from the manual are speculatively assigned). Codes
-        124 and 140 also fall inside the bytes-0..6 layout (byte 6); the
-        active-code set is merged so each code is emitted once per frame.
+  * PGN 0xF108 = BMS active fault bitmap. All per-bit assignments
+        established by injection sweep (solectrac-inject-f108.py) on
+        2026-05-10. The per-bit code tables live in
+        BMS_FAULT_CODES_BYTES_0_TO_6 and BMS_FAULT_CODES_BYTE7.
+        Bytes 0..6 use MIXED encoding by byte:
+          byte 0: 2 bits per code → 100, 101, 102, 103
+          byte 1: 2 bits per code → 104, 105, 106, 107
+          byte 2: 2 bits per code → 108, 109, 110, 111
+          byte 3: 2 bits per code → 112, 113 (bits 4..7 silent; 114/115
+                  are reserved per the manual and take zero bits)
+          byte 4: 1 BIT per code  → 116, 117, 118, 119, 120, 121, 122, 123
+          byte 5: 1 bit per code  → 124, 125, 126, 127 (bits 4..7 silent)
+          byte 6: fully silent
+        Byte 7 uses 1 bit per code with gaps and a duplicate:
+          bit 0 = 140, bits 1,2 silent, bit 3 = 142, bit 4 = 143,
+          bits 5 AND 6 both display 144 (re-verified duplicate), bit 7
+          = 145. Code 146 ("Maintenance mode status") does NOT appear in
+          F108 — the operator's "146" in bms-124-140-142-143-144-146.asc
+          was almost certainly a 145 transcription.
+        The bytes-0..6 and byte-7 active code sets are merged and
+        deduplicated.
   * PGN 0xFF50 from 0xE5: byte 0 = status (0x00=idle, 0x01/0x02=handshake
                           [transient], 0x03=active charging),
                           bytes 1-2 LE = charger output voltage at the pack
@@ -357,24 +368,45 @@ PACK_CAPACITY_AH = 300.0
 PACK_NOMINAL_V = 72.0
 PACK_CAPACITY_WH = PACK_CAPACITY_AH * PACK_NOMINAL_V    # 21,600 Wh
 
-# F108 byte 7: dashboard-displayed BMS warning code bitmap. Bit -> (code,
-# description). Bit 0 = 140 confirmed by injection on 2026-05-10
-# (spoofing F108 = 00..01 displayed code 140 on the dashboard); that
-# forces 124 to bit 1 and the remaining set bits (3,4,5,7) in capture
-# bms-124-140-142-143-144-146.asc (byte 7 = 0xBB) to codes 142, 143,
-# 144, 146 in numeric order. Bits 2 and 6 weren't lit in either
-# operator-confirmed capture; codes 141 (reserved) and 145 from the
-# manual are speculative assignments.
+# F108 byte 7: 1 bit per dashboard-displayed BMS warning code. Bit -> code.
+# Mapping established by per-bit injection (solectrac-inject-f108.py) on
+# 2026-05-10 and recorded in f108-byte7.csv: bit 0 = 140, bits 1,2 silent
+# (dashboard shows nothing), bit 3 = 142, bit 4 = 143, bit 5 = 144,
+# bit 6 = 144 (duplicate of bit 5, re-verified), bit 7 = 145. Code 146
+# does NOT appear anywhere in F108; the operator's "146" in the
+# bms-124-140-142-143-144-146.asc cycling capture was almost certainly
+# a transcription of 145.
 BMS_FAULT_CODES_BYTE7 = [
-    (0, 140, "System fault: kvst"),
-    (1, 124, "Pre-charging fault"),
-    (2, 141, "BMS fault need maintenance"),       # speculative
-    (3, 142, "BMS fault (manual omits 142)"),     # tentative; manual lists 141
-    (4, 143, "Battery fault need maintenance"),
-    (5, 144, "Battery system fault needs maintenance"),
-    (6, 145, "Full charge/discharge cycle needed"),  # speculative
-    (7, 146, "Maintenance mode status"),
+    (0, 140),
+    # bit 1: silent on dashboard
+    # bit 2: silent on dashboard
+    (3, 142),
+    (4, 143),
+    (5, 144),
+    (6, 144),  # duplicate of bit 5 (confirmed by re-injection)
+    (7, 145),
 ]
+
+# F108 bytes 0..6: per-bit code table. Indexed by (byte, bit); None means
+# the bit is silent on the dashboard. Layout uses MIXED encoding:
+# bytes 0..3 are 2 bits per code (each pair of adjacent bits displays the
+# same code), bytes 4..5 are 1 bit per code, byte 6 is fully silent. The
+# manual's reserved codes (114, 115) take zero bits — bits 4..7 of byte 3
+# are silent. Codes 120..123 live in byte 4 bits 4..7 (1 bit each), not
+# in byte 5 as a per-byte sequential formula would predict.
+#
+# Confirmed end-to-end by injection sweep on 2026-05-10 across all 56
+# bits of bytes 0..6 (f108-mapping.csv, f108-bytes1to5.csv,
+# f108-bytes3to5.csv, f108-byte6.csv).
+BMS_FAULT_CODES_BYTES_0_TO_6 = {
+    0: (100, 100, 101, 101, 102, 102, 103, 103),
+    1: (104, 104, 105, 105, 106, 106, 107, 107),
+    2: (108, 108, 109, 109, 110, 110, 111, 111),
+    3: (112, 112, 113, 113, None, None, None, None),  # 114, 115 reserved
+    4: (116, 117, 118, 119, 120, 121, 122, 123),
+    5: (124, 125, 126, 127, None, None, None, None),
+    # byte 6: all 8 bits silent
+}
 
 PACK_CURRENT_LSB_A = 0.1                  # F100F3 bytes 3-4 BE, 0.1 A/bit
 PACK_CURRENT_BIAS_RAW = 0x7D00            # raw value at 0 A (positive = discharge)
@@ -784,23 +816,12 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                 elif pgn == PGN_F108:
                     # All zeros = healthy idle baseline.
                     #
-                    # Bytes 0..6 are a 2-bit-per-code bitmap covering
-                    # vendor codes 100..127 (4 codes per byte, packed
-                    # sequentially). For byte i in 0..6 and pair index
-                    # p in 0..3, code = 100 + 4*i + p, addressing bit
-                    # pair (2p, 2p+1). Either bit asserted -> code on.
-                    # Confirmed by injection sweep (see solectrac-inject-
-                    # f108.py) for codes 100..105 and consistent with the
-                    # bms-fullcharge-102-109-140.asc snapshot (byte 0 bit
-                    # 4 -> code 102; byte 2 bit 2 -> code 109).
-                    #
-                    # Byte 7 is the dashboard-displayed system/maintenance
-                    # bitmap (1 bit per code, decoded against the vendor
-                    # table — see BMS_FAULT_CODES_BYTE7).
-                    #
-                    # Codes 124 and 140 appear in BOTH groups (byte 6 via
-                    # the bytes-0..6 layout, AND byte 7); the sets are
-                    # merged so each code is emitted once per frame.
+                    # Bytes 0..6 carry vendor codes per BMS_FAULT_CODES_
+                    # BYTES_0_TO_6 (mixed 2-bit and 1-bit encoding by
+                    # byte). Byte 7 carries system/maintenance codes per
+                    # BMS_FAULT_CODES_BYTE7 (1 bit per code, with gaps;
+                    # bits 5 and 6 both = 144). The active code set is
+                    # deduplicated so each code is emitted once per frame.
                     if all(b == 0 for b in data):
                         sc["skipped_zero"] += 1
                         continue
@@ -809,13 +830,15 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                             emissions.append(
                                 (f"bms.fault.byte{i}", b, ""))
                     active_codes: set[int] = set()
-                    for i in range(7):
-                        b = data[i]
-                        for pair in range(4):
-                            if (b >> (pair * 2)) & 0b11:
-                                active_codes.add(100 + 4 * i + pair)
+                    for byte_idx, codes in BMS_FAULT_CODES_BYTES_0_TO_6.items():
+                        b = data[byte_idx]
+                        for bit_idx, code in enumerate(codes):
+                            if code is None:
+                                continue
+                            if (b >> bit_idx) & 1:
+                                active_codes.add(code)
                     b7 = data[7]
-                    for bit, code, _desc in BMS_FAULT_CODES_BYTE7:
+                    for bit, code in BMS_FAULT_CODES_BYTE7:
                         if (b7 >> bit) & 1:
                             active_codes.add(code)
                     for code in sorted(active_codes):
@@ -1237,15 +1260,14 @@ DECODERS = [
      "maintenance code group at 1 bit per code"),
     ("bms.fault.code_NNN", "F108", "F3", "0..7", "see notes",
      "", "verified",
-     "vendor BMS error code is asserted (=1). Bytes 0..6 use 2 bits per "
-     "code, 4 codes per byte: code = 100 + 4*byte + pair_index for pair_"
-     "index in 0..3 over bit pairs (0,1),(2,3),(4,5),(6,7); confirmed by "
-     "injection sweep for codes 100..105 (predicted for 106..127). "
-     "Byte 7 uses 1 bit per code: bit 0=140, bit 1=124, bit 3=142, "
-     "bit 4=143, bit 5=144, bit 7=146 (bits 2 and 6 speculative as "
-     "codes 141 and 145); injection of byte 7 bit 0 alone would settle "
-     "the bit-0=140 vs bit-0=124 question. Codes 124 and 140 appear in "
-     "both groups; emitted once per frame regardless"),
+     "vendor BMS error code asserted (=1). Mixed encoding per "
+     "BMS_FAULT_CODES_BYTES_0_TO_6: bytes 0..3 are 2 bits per code "
+     "(byte 0=100-103, byte 1=104-107, byte 2=108-111, byte 3=112-113; "
+     "114,115 reserved); bytes 4..5 are 1 bit per code (byte 4=116-123, "
+     "byte 5=124-127); byte 6 silent. Byte 7 per BMS_FAULT_CODES_BYTE7 "
+     "is 1 bit per code with gaps: bit 0=140, bits 1,2 silent, bit 3=142, "
+     "bit 4=143, bits 5,6=144 (duplicate), bit 7=145. All mappings "
+     "injection-confirmed on 2026-05-10; code 146 does not appear in F108"),
     ("charger.status", "FF50", "E5", "0", "u8 (raw)",
      "", "verified",
      "0x00=idle, 0x01/0x02=handshake (transient), 0x03=active"),
