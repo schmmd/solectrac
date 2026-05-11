@@ -95,8 +95,8 @@ Live (or replayed) BMS / charger / motor dashboard. Decodes the same
 J1939 frames as `solectrac-analyze.py`.
 
 ```sh
-# Live capture from SocketCAN
-solectrac-stream.py --interface socketcan --channel can0 --bitrate 250000
+# Live capture using slcan
+solectrac-stream.py --interface slcan --channel /dev/cu.usbmodem101 --bitrate 250000
 
 # Replay an existing capture
 solectrac-stream.py --replay session.log

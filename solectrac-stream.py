@@ -24,9 +24,8 @@ SOC estimate notes:
       limiting cell (the one that will trip the BMS first), not the pack
       average.
     * Terminal voltage drops below OCV under load and rises above OCV
-      while charging. The dashboard tags the estimate as "(loaded)" when
-      |I| exceeds a small threshold so a depressed reading isn't taken
-      as ground truth.
+      while charging, so the OCV row will diverge from the BMS's
+      coulomb-counted SOC whenever the pack is under significant load.
 
 Data sources:
     --interface socketcan --channel can0    live SocketCAN bus
@@ -1216,17 +1215,6 @@ def render_pack(state: State, mains_v: float, efficiency: float,
                        f"({net / PACK_CAPACITY_WH * 100:+.1f}% of pack)",
                        style=net_style))
 
-    # Tag the reading when the pack is under significant load: terminal
-    # voltage is depressed (discharging) or elevated (charging) and the
-    # voltage-only SOC won't match the true coulomb-counted state.
-    # Applied to both rows; the BMS row is also tagged but not for the
-    # same reason -- the BMS does its own coulomb counting -- it just
-    # gives the user a hint that the two readings may diverge under load.
-    if pi is not None and abs(pi) > SOC_REST_CURRENT_A:
-        load_tag = " (loaded)" if pi > 0 else " (charging)"
-    else:
-        load_tag = ""
-
     def _soc_row(label: str, ch: Channel) -> Optional[Text]:
         if ch.value is None:
             return None
@@ -1240,7 +1228,7 @@ def render_pack(state: State, mains_v: float, efficiency: float,
             soc_style = "yellow"
         else:
             soc_style = "green"
-        tag = load_tag + (" stale" if ch.is_stale(now) else "")
+        tag = " stale" if ch.is_stale(now) else ""
         return Text.assemble(
             bar,
             Text(f"  {soc:>3.0f}%", style=soc_style),
