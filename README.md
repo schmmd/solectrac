@@ -3,11 +3,9 @@
 Reverse-engineered J1939 CAN-bus tooling for a Solectrac electric tractor:
 
 * `solectrac-analyze.py` — offline batch decoder. Reads CAN logs and writes
-  tidy long-format CSVs suitable for spreadsheets, pandas, or plotting.
+  long-format CSVs suitable for spreadsheets, pandas, or plotting.
 * `solectrac-stream.py` — live TUI dashboard. Decodes the same frames in
-  real time from a SocketCAN bus or replayed log file.
-
-Both scripts share the same protocol assumptions; see [J1939 ID reference](#j1939-id-reference) below.
+  real time or replayed log file.
 
 ## solectrac-analyze.py
 
@@ -17,8 +15,7 @@ python3 solectrac-analyze.py [-o OUTDIR] file1.asc [file2.blf ...]
 
 Inputs are read via `python-can`'s `LogReader`, so any format `python-can`
 understands works: `.asc` (Vector ASCII), `.blf`, `.log` (canutils), `.trc`,
-and python-can's own `.csv` format. (SavvyCAN's CSV dialect is **not**
-supported.)
+and python-can's own `.csv` format.
 
 Outputs are written to the current working directory by default, or to
 `OUTDIR` if `-o` / `--output-dir` is given (created if it doesn't exist).
@@ -157,9 +154,8 @@ named constants so they can be revised in one place once a definitive spec
 becomes available. Scalings not yet confirmed against vendor documentation
 are commented as "tentative" in the source.
 
-## License / disclaimer
+## Disclaimer
 
 This is a personal reverse-engineering exercise based on observed CAN
 traffic, not on vendor documentation. PGN meanings beyond the SAE-standard
-DM1 frame are inferred from data and may be wrong. Do not use these scripts
-for any safety-relevant decision-making.
+DM1 frame are inferred from data and may be wrong.
