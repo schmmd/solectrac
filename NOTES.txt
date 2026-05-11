@@ -34,7 +34,7 @@ Status overview (TL;DR)
 This is the rolled-up state. See the Confidence summary at the bottom
 for the full per-signal log with cross-validation.
 
-Pack & topology (CONFIRMED via vendor GUI):
+Pack & topology (CONFIRMED via [vendor GUI](https://2758547507-files.gitbook.io/~/files/v0/b/gitbook-x-prod.appspot.com/o/spaces%2FKQJ6j30UbUXhtNJMkJQP%2Fuploads%2Fffjy1KG6NFQEvQqlw8zn%2FBMS%20Update%20Error%20and%20Data%20Extraction%20-%20MS%20Soundon%20Battery.pdf?alt=media&token=eb0bc6a8-46a8-40db-b428-833f94d925dd)):
     20 series cells, 7 temperature probes, NMC chemistry, 300 Ah / 72 V
     nominal.
 
@@ -63,12 +63,14 @@ Partially decoded (TENTATIVE):
               0x2710 sentinel).
     * F108    additional fault info beyond the byte-7 code bitmap;
               bit-to-code mapping for the other bytes open.
-    * F100F3  status / limit candidate bytes near the end of the
-              payload.
+    * F100F3  byte 5 (data[4]) = BMS-published SOC, calibrated only on
+              the top 10% (raw 224→90%, raw 250→100%) from charging-
+              120V-90ish-to-100.asc. Plus residual status / limit
+              candidate bytes near the end of the payload.
     * FF21CA  three-state byte tied to startup calibration.
 
 Open (UNKNOWN):
-    * SOC / SOH / alarm-word host PGN.
+    * SOH / alarm-word host PGN.
     * KL15 / wake-up status bit location.
     * F104 byte-level decode (temp min/max summary).
     * Motor-controller error-code channel (DM1 stays empty even with
@@ -88,7 +90,7 @@ Tractor / pack context
   channels across F155..F15E but the pack has **7 temperature probes**
   ("Temp. probe count: 7" / "Online temp. count: 7" in the GUI) — anything
   beyond the first 7 channels in `temps.csv` is padding/noise.
-* Pack capacity / ratings (from the GUI, not derivable from CAN alone):
+* Pack capacity / ratings (from the BMS GUI, not derivable from CAN alone):
     - Rated capacity: 300 Ah
     - Rated total voltage: 72.0 V nominal
     - Rated discharge current: 300 A
@@ -440,10 +442,23 @@ F100F3 — "BMS pack status" (CONFIRMED pack-current source)
                                                  A/bit, biased so that
                                                  raw 0x7D00 = 0 A.
                                                  CONFIRMED — see below.
-      byte 5 (data[4]): 0xF8..0xFA (248..250) — near-constant. Plausibly
-                                                 a current limit / status
-                                                 byte; further decoded
-                                                 below as TENTATIVE.
+      byte 5 (data[4]): 0xF8..0xFA (248..250) — BMS-published SOC.
+                                                 TENTATIVE. Calibrated
+                                                 on charging-120V-90ish-
+                                                 to-100.asc: raw 224 at
+                                                 90% and raw 250 at
+                                                 100%, with the streamer
+                                                 fit SOC% = raw*0.385 +
+                                                 3.8. Saturates at 250
+                                                 in soc-100-idle.asc.
+                                                 Slope is provisional —
+                                                 only the top 10% of
+                                                 the range has been
+                                                 observed; a deeper-
+                                                 discharge capture is
+                                                 needed to pin down the
+                                                 LSB and confirm
+                                                 linearity below 90%.
       byte 6 (data[5]): 0xFA                  — constant. = 250 raw.
       byte 7 (data[6]): 0x14                  — constant. = 20, the
                                                  SERIES CELL COUNT.
@@ -528,10 +543,13 @@ F100F3 — "BMS pack status" (CONFIRMED pack-current source)
       varying current on the bus, and the only signal that tracks
       it is F100F3 bytes 3-4 BE.
 
-    Bytes 5..6 (~0xFA = 250 throughout): plausibly a BMS-published
-      flag / limit field. The transient drop to 0xF8 in some
-      loader-arms frames hints at a status bit but is not yet
-      decoded. TENTATIVE.
+    Byte 5 (data[4]): BMS-published SOC — see byte-table entry above.
+      The "transient drop to 0xF8" in some loader-arms frames is
+      consistent with a SOC tick down during sustained discharge,
+      not a separate status bit.
+
+    Byte 6 (data[5]): ~0xFA = 250 throughout. Plausibly a BMS-published
+      flag / limit field. TENTATIVE.
 
     Byte 7 = 0x14 (20): matches the series cell count exactly. Either
       the BMS broadcasts cell count as a sanity field here, or it
@@ -1291,10 +1309,12 @@ Implications for decoding work the screenshot does *not* close out:
   "Discharging", "Fault", "Sleep" are likely. The full enumeration of
   F100D0 byte 0 (and probably an analogous BMS-side mode byte in
   F106F3) cannot be filled in from a single snapshot.
-* SOC and SOH are not yet decoded from any captured PGN. Candidate
-  homes: F104, F106, F107, F108. With SOC=0% and SOH=100% in the
-  screenshot, the values are not specific enough to grep for; richer
-  states are needed to pin them down.
+* SOC is now decoded TENTATIVELY from F100F3 byte 5 (data[4]) — see
+  the F100F3 section. Calibration covers only the top 10% of the
+  range, but the streamer's linear fit reads ~100% at full charge
+  and tracks the charge ramp in charging-120V-90ish-to-100.asc. SOH
+  is still not decoded from any captured PGN; candidate homes remain
+  F104, F106, F107, F108.
 * Alarms are reported with severity ("lvl 2"), implying a multi-level
   alarm word — likely in F108. Not yet decoded.
 * Wake-up signal source ("KL15") implies an ignition-status bit
@@ -1354,10 +1374,17 @@ Still open
   "ESCORTS-INTERNAL" classification narrows the candidate OEM list
   considerably; locating a protocol PDF would close out most TENTATIVE
   items at once.
-* Hunt SOC / SOH / alarms in F104 / F106 / F107 / F108. The vendor
-  GUI snapshot gave us a vocabulary (LowSoc lvl 2, Calibrating,
-  KL15, etc.) but not enough states to disambiguate byte positions
-  from a single snapshot.
+* Hunt SOH / alarms in F104 / F106 / F107 / F108. The vendor GUI
+  snapshot gave us a vocabulary (LowSoc lvl 2, Calibrating, KL15,
+  etc.) but not enough states to disambiguate byte positions from a
+  single snapshot. SOC is now tentatively assigned to F100F3
+  data[4] — see Recently resolved.
+* Pin down the SOC LSB and confirm linearity below 90%. The
+  F100F3 data[4] decode is calibrated on charging-120V-90ish-
+  to-100.asc only; a sustained discharge capture from a known
+  starting SOC down to a lower known SOC would lock in the slope
+  and tell us whether the field is truly linear or just locally
+  linear near full charge.
 * Motor-controller error-code channel. DM1 (FECA from SA 0xCA) stays
   empty even when the dashboard surfaces MC codes. See the
   "Motor-controller error codes — methodology to decode" section
@@ -1397,6 +1424,14 @@ named sections above)
 * Full-SOC capture — DONE. Five asc/*.asc captures at 100% SOC,
   cell-voltage band ~4.16 V/cell, pack-V band ~83.2 V, plus
   byte-level state evidence on F106 / F107 / F108.
+* BMS-published SOC host PGN — TENTATIVELY RESOLVED. F100F3 byte 5
+  (data[4]) holds the BMS SOC. Streamer fit: SOC% = data[4] * 0.385
+  + 3.8, anchored on (raw 224, 90%) and (raw 250, 100%) from
+  charging-120V-90ish-to-100.asc and saturating at raw 250 in
+  soc-100-idle.asc. Earlier "near-constant 0xF8..0xFA" reading
+  across other captures is consistent with those captures sitting
+  at high SOC. LSB and below-90% linearity still want a deeper-
+  discharge capture. See F100F3 section.
 * Real per-frame timestamps — DONE for the asc/*.asc batch (Vector
   ASC carries microsecond-resolution timestamps).
 
@@ -1522,9 +1557,13 @@ CONFIRMED:
 
 TENTATIVE / GUESSED:
     F102 byte 8 (flags) semantics
-    F100 byte 5 (data[4]) — 0xF8..0xFA. Plausibly a current-limit /
-        status flag. Rare drops to 0xF8 under sustained hydraulic
-        load hint at a status bit but not yet decoded.
+    F100 byte 5 (data[4]) = BMS-published SOC. Streamer fit:
+        SOC% = data[4] * 0.385 + 3.8, calibrated on (raw 224, 90%)
+        and (raw 250, 100%) from charging-120V-90ish-to-100.asc and
+        saturating at raw 250 in soc-100-idle.asc. Slope is
+        provisional; only the top 10% has been observed. Rare drops
+        to 0xF8 under sustained hydraulic load are consistent with
+        a slow SOC tick-down, not a separate status bit.
     F100 byte 6 (data[5]) = 0xFA constant — possibly a related
         limit / config value.
     F100 byte 7 = 0x14 constant: probably the series cell count.
