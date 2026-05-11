@@ -13,7 +13,6 @@ Table of contents
 
 * Status overview (TL;DR)
 * Tractor / pack context
-* Captures used
 * Source-address (SA) map observed in these captures
 * PGN decode notes (BMS, SA = 0xF3)
 * PGN decode notes (charger, SA = 0xE5)
@@ -118,195 +117,6 @@ Tractor / pack context
   directly from FF21CA on this bus, or it could be a dual-bus gateway
   with FF21CA being a re-broadcast. Either way, the most operator-
   visible drive-side data is reachable from here.
-
-
-Captures used
--------------
-
-* `continuous.csv`  — long resting baseline at ~40% SOC. Useful for noise
-                      floor, standby draw, and temperature stability.
-* `startingup.csv`  — wake-up transition. Vehicle-controller heartbeat
-                      transitions from 0x00 (init) to 0x0C (ready).
-* `driving.csv`     — ~30 s of normal driving with no implements.
-* `dph.csv`         — driving *plus hydraulics*. Same drive activity as
-                      `driving.csv` with the hydraulic circuit active in
-                      addition. Despite the name "driving plus hydraulics"
-                      this capture also contains substantial idle/parked
-                      time that drags its mean current down — compare
-                      *peak* / high-percentile values, not means, when
-                      contrasting it with `driving.csv`.
-* `charging.csv`    — charging from ~40% SOC.
-* `data.csv`        — *excluded*. Contains additional injected/unrelated
-                      OBD-II "Tester Present" traffic the operator was
-                      generating at the same time. Not part of the BMS/
-                      charger conversation we're trying to characterize.
-
-A second batch of captures (Vector ASC format, in `asc/`), taken at
-~100% SOC with the tractor in neutral, is also referenced below:
-
-* `normal-ignition.asc`           — wake-up baseline, no charger.
-* `ignition-with-charger-inserted.asc` — wake-up with charger plug
-                                          inserted in the tractor's
-                                          charge port BUT no AC power
-                                          to the charger. Useful for
-                                          isolating "charger detected"
-                                          flags vs. "actively charging".
-* `full-throttle.asc`             — throttle pedal pressed, in neutral.
-* `full-throttle-hydraulics.asc`  — full throttle plus hydraulics
-                                     actuated; tractor still in neutral.
-* `accellerate-decelerate.asc`    — varying throttle, in neutral.
-* `drive-r-n-f.asc`               — F/N/R lever walked R -> N -> F
-                                     (10 s each), no pedal. Pinned down
-                                     FF21CA byte 7 low nibble = direction.
-* `range-1-2-3.asc`               — range selector walked 1 -> 2 -> 3
-                                     (10 s each) in Forward. Pinned down
-                                     FF21CA byte 7 high nibble = range.
-
-Unlike the recorded-data/*.csv captures, the ASC files carry real
-microsecond-resolution per-frame timestamps, which unblocks all
-time-domain analysis (rate, dV/dt, integrated current, etc.).
-
-A third batch of captures (top-level `amp-*.asc`, 2026-05-09) provides
-operator-confirmed dashboard-amperage ground truth for the F100F3 pack-
-current decode. Each filename's number is the approximate dashboard-
-displayed current at the time of recording:
-
-* `amp-1.asc`   — dashboard ~1 A   (true idle, in neutral)
-* `amp-18.asc`  — dashboard ~18 A
-* `amp-35.asc`  — dashboard ~35 A
-* `amp-42.asc`  — dashboard ~42 A
-* `amp-58.asc`  — dashboard ~58 A
-
-These were the captures that finally pinned down the high-byte / low-
-byte rollover behavior across the 25.5 / 51.1 / 76.7 A boundaries, and
-are now the cleanest cross-validation set for the F100F3 decode (see
-the F100F3 section below).
-
-A charging trace (`asc/charging-120V-90ish-to-100.asc`, 2026-05-09)
-provides the first capture with the charger actively delivering power
-to the pack, taken from ~90 % SOC on a 120 V outlet:
-
-* `charging-120V-90ish-to-100.asc` — 2863/3007 active-charging frames
-                                       (FF50 status = 0x03). End-to-end
-                                       it shows a textbook CC→CV taper
-                                       (~18.5 A → ~9.9 A → ~2.9 A) at
-                                       constant ~83 V. This is what
-                                       finally anchored the FF50
-                                       voltage and current scales (see
-                                       the FF50E5 section).
-
-A 100%-SOC idle capture with the charger plug inserted but no real
-charging happening (BMS done topping off):
-
-* `soc-100-idle.asc`                — charger present, current near
-                                       zero. Useful as the "plugged in,
-                                       BMS done" reference point.
-
-Fault-bitmap captures (`asc/bms-error-codes/`, 2026-05-09) gave us a
-matched-mode pair that nailed down F108 as the BMS active-fault bitmap:
-
-* `bms-124-140-142-143-144-146.asc` — operator confirmed the dashboard
-                                       was cycling through codes 124,
-                                       140, 142, 143, 144, 146 (each
-                                       held on screen ~1 s) for the
-                                       duration of this capture.
-* `idle-no-bms.asc`                   — same key state, no charger,
-                                       no faults; the clean baseline.
-
-The diff between these two captures localized the fault encoding to
-F108 and is what enabled the byte 7 decode. See the F108F3 section.
-
-A subsequent capture extends F108 evidence to bytes outside byte 7:
-
-* `bms-fullcharge-102-109-140.asc` — captured at 100 % SOC with the
-                                      dashboard cycling through codes
-                                      102 (Total voltage too high),
-                                      109 (Battery over voltage), and
-                                      140 (System fault level). F108
-                                      payload `10 00 04 00 00 00 00 01`
-                                      throughout. byte 7 = 0x01 sets
-                                      only bit 0 (= 124, the always-on
-                                      Clock fault baseline); 140 is NOT
-                                      asserted in byte 7 in this
-                                      snapshot, consistent with the
-                                      dashboard *cycling* through codes
-                                      so not all listed codes are
-                                      simultaneously active in the
-                                      bitmap. **bytes 0 = 0x10 and byte
-                                      2 = 0x04 are nonzero for the
-                                      first time in any capture**, so
-                                      F108 carries fault info beyond
-                                      byte 7. The bit-to-code mapping
-                                      for those bytes is not yet
-                                      established. See the F108F3
-                                      section.
-
-A real-world field capture (`real-world-on-driving-mowing-off.asc`,
-2026-05-10) is the first capture in the corpus taken under genuine
-traction load rather than neutral pedal tests:
-
-* `real-world-on-driving-mowing-off.asc` — 570 s wall-clock; operator
-                                            drove forward, reversed,
-                                            mowed, and shifted. The bus
-                                            actually went silent
-                                            mid-capture (key-off?) from
-                                            t=134.6 s to t=554.3 s — all
-                                            PGNs (BMS F100F3, FF21CA
-                                            motor, FF2112 dash) stopped
-                                            and resumed together — so
-                                            the useful drive data lives
-                                            in the first ~135 s plus a
-                                            short ~17 A idle tail at the
-                                            end. The sustained-load
-                                            segment t=90..135 s (mean
-                                            77 A, peak 153 A, V sag
-                                            0.6 V, peak 12.6 kW at
-                                            ~2500 RPM) is the highest-
-                                            amperage cross-validation
-                                            point in the corpus, well
-                                            above the amp-*.asc set's
-                                            58 A. Operator stayed in
-                                            **Range 2** for the entire
-                                            session (R1 and R3 never
-                                            engaged); FF21CA byte 0
-                                            (throttle) reached 0xCC =
-                                            204 in forward (vs. 0x96 =
-                                            150 in reverse) — see the
-                                            FF21CA byte 0 section for
-                                            the rescale. FF21CA byte 7
-                                            = 0x10 was observed for the
-                                            first time (Range 2 + N
-                                            lever), completing the
-                                            F/N/R × Range cross-product.
-                                            **No new CAN IDs and no
-                                            byte-level signature
-                                            appeared when the mower was
-                                            engaged**, reinforcing the
-                                            discrete-wiring / hydraulic-
-                                            bus hypothesis for PTO.
-                                            F107 byte 5 also showed a
-                                            new ignition transient
-                                            value 0xA5 (t=0.56..0.96 s),
-                                            extending the existing
-                                            transient list.
-
-Side-by-side toggle captures (top-level, 2026-05-09) document attempts
-to find body-control signals on this bus:
-
-* `fwd-on-and-off.asc`     — 4WD selector toggled mid-recording.
-* `pto-off-on.asc`         — PTO toggled on at ~t=5 s.
-* `pto-on-off.asc`         — PTO toggled off at ~t=5 s.
-* `headlights-off-on.asc`  — headlights toggled on at ~t=5 s.
-
-Outcome: **none of the 4WD / PTO / headlight switch *states* appear
-on this bus as a discrete flag.** Every byte was checked across all 62
-broadcast IDs and no byte transitions cleanly with any of those toggles.
-What headlights and PTO *do* produce is a clean step in F100F3 pack
-current (the auxiliary load shifts the BMS-reported pack draw); 4WD
-selection produces no visible signature at all. This is consistent with
-those switches being either hard-wired discrete I/O or carried on a
-second CAN segment we don't have a tap on. See "Open questions" for
-the two-bus hypothesis.
 
 
 Source-address (SA) map observed in these captures
@@ -1591,7 +1401,7 @@ TENTATIVE / GUESSED:
         not yet attributed to a specific signal.
 
 UNKNOWN:
-    SOC / SOH host PGN
+    SOH host PGN (SOC tentatively in F100F3 data[4] — see TENTATIVE)
     alarm word location (screenshot showed "LowSoc lvl 2")
     F108 bytes 0..6 bit-to-code mapping. bms-fullcharge-102-109-140
         confirms bytes 0 and 2 carry fault info (one bit each set
