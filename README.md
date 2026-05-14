@@ -7,6 +7,27 @@ Reverse-engineered J1939 CAN-bus tooling for a Solectrac electric tractor:
 * `solectrac-stream.py` — live TUI dashboard. Decodes the same frames in
   real time or replayed log file.
 
+## solectrac-stream.py
+
+Live (or replayed) BMS / charger / motor dashboard. Decodes the same
+J1939 frames as `solectrac-analyze.py`.
+
+```sh
+# Live capture using slcan
+solectrac-stream.py --interface slcan --channel /dev/cu.usbmodem101 --bitrate 250000
+
+# Replay an existing capture
+solectrac-stream.py --replay session.log
+```
+
+Displays pack voltage / current / DC and estimated AC power, SOC estimate
+(NMC OCV curve, taken from the lowest cell), charger output, per-cell
+voltages with min/max/spread, module temperatures, vehicle-controller
+heartbeat, and live alerts (low/high cell, spread, temp, AC budget,
+stale BMS).
+
+Requires `python-can` and `rich` (`pip install -r requirements.txt`).
+
 ## solectrac-analyze.py
 
 ```sh
@@ -89,49 +110,7 @@ id, ext, count, priority, R, DP, PF, PS, SA, PGN, PDU, PS_role, name
 One row per distinct CAN ID seen, with the J1939 field breakdown described
 [below](#j1939-id-reference).
 
-## solectrac-stream.py
-
-Live (or replayed) BMS / charger / motor dashboard. Decodes the same
-J1939 frames as `solectrac-analyze.py`.
-
-```sh
-# Live capture using slcan
-solectrac-stream.py --interface slcan --channel /dev/cu.usbmodem101 --bitrate 250000
-
-# Replay an existing capture
-solectrac-stream.py --replay session.log
-```
-
-Displays pack voltage / current / DC and estimated AC power, SOC estimate
-(NMC OCV curve, taken from the lowest cell), charger output, per-cell
-voltages with min/max/spread, module temperatures, vehicle-controller
-heartbeat, and live alerts (low/high cell, spread, temp, AC budget,
-stale BMS).
-
-Requires `python-can` and `rich` (`pip install -r requirements.txt`).
-
-## J1939 ID reference
-
-Each 29-bit J1939 identifier breaks down as:
-
-| Bits   | Field               | Notes                                                                 |
-|--------|---------------------|-----------------------------------------------------------------------|
-| 28..26 | Priority (P)        | 0 = highest, 7 = lowest. Priority 6 is typical for periodic broadcasts.|
-| 25     | Reserved (R) / EDP  | Always 0 in classic J1939.                                            |
-| 24     | Data Page (DP)      | Selects between page 0 (default) and page 1.                          |
-| 23..16 | PDU Format (PF)     | PF < 0xF0 → PDU1 (destination-specific). PF ≥ 0xF0 → PDU2 (broadcast).|
-| 15..8  | PDU Specific (PS)   | Destination Address (DA) for PDU1, or Group Extension (GE) for PDU2.  |
-| 7..0   | Source Address (SA) | The transmitter's J1939 address.                                      |
-
-The Parameter Group Number (PGN) is reconstructed as:
-
-* PDU1: `PGN = (DP << 16) | (PF << 8)` (DA is **not** part of the PGN).
-* PDU2: `PGN = (DP << 16) | (PF << 8) | PS`.
-
-`decode_can_id()` in `solectrac-analyze.py` performs this for every unique
-ID it sees, populating `ids.csv`.
-
-## Adding a decoder
+### Adding a decoder
 
 1. Add any new PGN / source-address constants near the top of
    `solectrac-analyze.py`. Existing ones include `PGN_F100`, `PGN_F102`,
