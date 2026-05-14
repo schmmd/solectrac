@@ -72,10 +72,19 @@ Escorts Kubota is the corporate parent of Farmtrac; the BMS-GUI
 pack-vendor attribution. The service manual's BMS troubleshooting
 section delegates all live-data inspection to a host-side application
 called **UDAAN** (referenced repeatedly: "Connect UDAAN and check the
-minimum cell voltage", etc.). UDAAN is the most promising single lead
-for obtaining a real BMS payload spec / DBC-equivalent; the service
-manual itself contains no byte-level payload tables for the BMS
-broadcast frames.
+minimum cell voltage", etc.). UDAAN has been identified as the
+**UDAN iBMS Upper Utility** from **Anhui UDAN Technology Co., Ltd.**
+— a Chinese BMS vendor. The Solectrac/Farmtrac pack is rebadged UDAN
+hardware. The tool is publicly downloadable Windows software (CAN @
+250 kbit/s, supports cheap CANalyst-II / PCAN / USBCAN dongles); the
+V3.1 user manual is in this repo at
+`docs/UDAN_iBMS_Upper_Utility_v3.1_manual.pdf`. The service manual
+itself contains no byte-level payload tables for the BMS broadcast
+frames, but UDAN's tool has a `Comm. Message` recording feature that
+captures the raw CAN exchange alongside a labeled Excel export of
+every System Overview UI field — running both simultaneously produces
+a time-aligned raw-CAN + labeled-field log, i.e. an empirical DBC.
+See the open-questions section for the practical decode path.
 
 **BMS field connector** is part number **`RT061412SNHEC03`** (12-pin
 circular). Per the manual's DTC 125 troubleshooting (page 30 of the
@@ -1000,13 +1009,25 @@ Code 51 is listed out of numeric order in the manual.
   previously-suspected "Kelly KLS hydraulic CAN" interpretation is
   ruled out by schematic 5.11, which shows the e-hydraulic controller
   has no CAN pins at all.
-- **UDAAN tool.** The service manual delegates all BMS live-data
-  inspection to a host-side application called UDAAN ("Connect UDAAN
-  and check the minimum cell voltage", etc.). UDAAN almost certainly
-  contains a DBC-equivalent payload spec for the BMS frames. Obtaining
-  it via a Solectrac/Farmtrac dealer would close out the F100/F102/
-  F107/F113..F117/F108 byte-decoding work in one stroke. Likely
-  proprietary to Escorts, distributed via the dealer channel.
+- **UDAAN tool — identified, downloadable; one practical blocker.**
+  UDAAN is the **UDAN iBMS Upper Utility** from Anhui UDAN Technology
+  Co., Ltd. (Chinese BMS vendor); the Solectrac pack is rebadged UDAN
+  hardware. Windows software, CAN @ 250 kbit/s (matches our bus),
+  supports cheap CANalyst-II / PCAN / USBCAN dongles. V3.1 manual is
+  in `docs/UDAN_iBMS_Upper_Utility_v3.1_manual.pdf`. Download portal:
+  `https://www.ievcloud.com/burner_en.html`. Practical decode path:
+  install the tool + a CANalyst-II dongle, tap the OBD-II port (pin 6
+  CAN_H, pin 14 CAN_L), enable both the `Comm. Message` checkbox (raw
+  CAN log) and the `Data Storage` checkbox (Excel of every System
+  Overview UI field every 2 s), and operate the tractor through known
+  states. Cross-referencing the two logs produces an empirical DBC for
+  every BMS broadcast frame — closing out F100/F102/F104/F107/
+  F113..F117 byte-decoding without vendor cooperation. The one
+  practical blocker: read/write features require login, and the
+  manual doesn't document credential acquisition. View-only mode may
+  expose the System Overview screen without login; if not, request
+  access via Solectrac/Farmtrac support citing the service-manual
+  references to UDAAN by name.
 - **FF21CA byte 1, 4, 6 semantics.** data[1] and data[6] are
   constant-zero fault-bitmap candidates; data[4] is a three-state
   field changing near startup calibration.
@@ -1079,10 +1100,18 @@ Code 51 is listed out of numeric order in the manual.
     F108, SA 0xF3).
   - §**Hydraulic System** (p295) — confirms lift / 3-point / remotes
     are fully mechanical with zero electrical interface.
-- **UDAAN** — Escorts host-side BMS diagnostic application
-  referenced throughout the service manual's battery section.
-  Strongest known lead for a real BMS payload spec / DBC. Likely only
-  available via the Farmtrac/Solectrac dealer channel.
+- **UDAAN = UDAN iBMS Upper Utility** from Anhui UDAN Technology
+  Co., Ltd. — the Chinese BMS vendor whose hardware is rebadged into
+  the Solectrac/Farmtrac pack. Public download:
+  `https://www.ievcloud.com/burner_en.html`. Corporate site:
+  `https://www.udantech.com/en/`. V3.1 user manual (35 pages, dated
+  2023-10-07) is in this repo at
+  `docs/UDAN_iBMS_Upper_Utility_v3.1_manual.pdf`. CAN @ 250 kbit/s,
+  supports CANalyst-II / PCAN / USBCAN dongles. `Comm. Message` +
+  `Data Storage` recording features produce a time-aligned raw-CAN +
+  labeled-UI-field log — effectively an empirical DBC for the BMS
+  broadcast frames. Login required for full read/write; view-only
+  mode permitted without login.
 - Solectrac Parts Catalog (e25):
   https://docs.thebackyard.engineer/solectrac/troubleshooting-guides/documentation
   — source for the component identifications in the "Identified
