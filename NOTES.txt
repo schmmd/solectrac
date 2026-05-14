@@ -1239,87 +1239,163 @@ Connector
   rows; 36 cavities total).
 * Mating connector (harness side): Tyco / TE **1-0640526-0**.
 * Terminals: Tyco / TE **0-0641294-1**.
+* Cavity numbering follows **row-major, left-to-right** order:
+  J1 = row 1 col 1, J2 = row 1 col 2, ..., J4 = row 1 col 4,
+  J5 = row 2 col 1, ..., J36 = row 9 col 4. This was inferred from
+  the COBO datasheet J-table cross-referenced with the Solectrac
+  harness wiring diagram (where pin 35/36 = CAN L/H, pin 8 = GND,
+  pin 4 = IGN), and confirmed empirically by DMM probing on
+  2026-05-13 (see "Empirical verification" below).
 * Observed population on this Solectrac unit: 15 of 36 cavities
   populated. Layout (`x` = pin, `o` = empty, viewed from the harness
   mating face, oriented as the connector sits in the dashboard):
 
       col→  1 2 3 4
-      row 1 . x x x
-      row 2 . x x x
-      row 3 . x . x
-      row 4 . x . .
-      row 5 x x . x
-      row 6 . . x .
-      row 7 . . . .
-      row 8 . . . .
-      row 9 . . x x
+      row 1 . x x x      (J1 empty;  J2,  J3,  J4  populated)
+      row 2 . x x x      (J5 empty;  J6,  J7,  J8  populated)
+      row 3 . x . x      (J9 empty;  J10 pop; J11 empty; J12 pop)
+      row 4 . x . .      (J13 empty; J14 pop; J15, J16 empty)
+      row 5 x x . x      (J17 pop;   J18 pop; J19 empty; J20 pop)
+      row 6 . . x .      (J21, J22 empty; J23 pop; J24 empty)
+      row 7 . . . .      (J25..J28 all empty)
+      row 8 . . . .      (J29..J32 all empty)
+      row 9 . . x x      (J33, J34 empty; J35, J36 populated)
 
-  Solectrac uses a subset of the available I/O. The bottom-row pair
-  (row 9, cols 3-4) is almost certainly CAN L / CAN H (J35 / J36 in
-  the table below); rows 7-8 being empty is consistent with the
-  cluster's discrete-input bank not being fully utilised.
+Pinout (J1–J36, per the COBO ECO MATRIX VT3 datasheet, with Solectrac usage)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Pinout (J1–J36, per the COBO ECO MATRIX VT3 datasheet)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+The J-number is the cluster's logical pin index from the COBO datasheet.
+"Generic function" is what COBO documents for that pin on the platform;
+"Solectrac usage" is what the harness on this tractor actually does with
+it (from the Solectrac wiring diagram, with corrections verified on the
+physical tractor).
 
-The J-number is the cluster's logical pin index from the datasheet. The
-physical cavity-to-J mapping on the Tyco 1-0640526-0 housing is not
-covered in the COBO datasheet — it lives in the TE connector datasheet
-and still needs to be pulled. Once mapped, the populated-cavity layout
-above can be translated to a function-by-function wire list.
-
-    J1   RELE'    Out 1 high-side, 150 mA max (relay drive)
-    J2   IDBL     Positive digital input
-    J3   30       + Battery (constant 12 V)                  ★
-    J4   15       + Key (ignition / KL15)                    ★
-    J5   FR1      Frequency input, 33 kΩ pull-up, max 1500 Hz
-                  (speed-sender style)
-    J6   ID9      Positive digital input
-    J7   ID10     Positive digital input
-    J8   31       GND                                        ★
-    J9   ID3      Negative digital input
-    J10  ID1      Negative digital input
-    J11  ID5      Negative digital input
-    J12  ID20     Positive digital input
-    J13  ID2      Negative digital input
-    J14  ID8      Positive digital input
-    J15  AN2      Analog resistive input, 90 Ω pull-up (sender)
-    J16  AN1      Analog resistive input, 90 Ω pull-up (sender)
-    J17  ID12     Positive digital input
-    J18  ID13     Negative digital input
-    J19  P/BR     Positive digital input (likely "Park Brake")
-    J20  ID17     Positive digital input
-    J21  ID6      Positive digital input
-    J22  ID21     Negative digital input
-    J23  ID18     Negative digital input
-    J24  ID16     Positive digital input
-    J25  PB/L     Positive digital input (likely "Park Brake Light")
-    J26  ID15     Negative digital input
-    J27  ID19     Negative digital input
-    J28  ID14     Negative digital input
-    J29  ID11     Negative digital input
-    J30  ID7      Positive digital input
-    J31  ID4      Negative digital input
-    J32  BUZZER   Out 2 low-side, 150 mA max (audible alert)
-    J33  D+       D+ alternator excite, neg. digital input with
-                  170 mA excitation resistor (battery warning lamp)
-    J34  CS       CAN shield                                 ★
-    J35  CL       CAN L                                      ★
-    J36  CH       CAN H                                      ★
+    Pin  COBO ID  Generic function                                Solectrac usage
+    ---  -------  ----------------------------------------------  -----------------------------
+    J1   RELE'    Out 1 high-side, 150 mA max (relay drive)       (unused — empty cavity)
+    J2   IDBL     Positive digital input                          BACK LIGHT (+)
+    J3   30       + Battery (constant 12 V)                  ★    +BATTERY  (diagram mislabels
+                                                                  this as "Pin 1"; the actual
+                                                                  cavity is J3 — verified by the
+                                                                  empty J1 cavity in the grid)
+    J4   15       + Key (ignition / KL15)                    ★    IGN ON (+)
+    J5   FR1      Frequency input, 33 kΩ pull-up, ≤1500 Hz        (unused — no speed sender;
+                                                                  vehicle speed comes via CAN)
+    J6   ID9      Positive digital input                          TURN RIGHT (+)
+    J7   ID10     Positive digital input                          TURN LEFT (+)
+    J8   31       GND                                        ★    GND
+    J9   ID3      Negative digital input                          (unused)
+    J10  ID1      Negative digital input                          FWD (-)
+                                                                  (forward-direction indicator;
+                                                                  redundant with F/N/R lever
+                                                                  byte in FF21CA. Tractor-tested
+                                                                  2026-05-13; supersedes the
+                                                                  wiring diagram's "4WD" label)
+    J11  ID5      Negative digital input                          (unused)
+    J12  ID20     Positive digital input                          TURN TRAILER (+)
+    J13  ID2      Negative digital input                          (unused)
+    J14  ID8      Positive digital input                          HEADLIGHTS (+)
+                                                                  (tractor-confirmed 2026-05-13;
+                                                                  diagram labelled this "DIPPED
+                                                                  BEAM" — the European/EU term
+                                                                  for low-beam headlights)
+    J15  AN2      Analog resistive input, 90 Ω pull-up (sender)   (unused — no resistive
+                                                                  fuel/temp sender; senders
+                                                                  come via CAN)
+    J16  AN1      Analog resistive input, 90 Ω pull-up (sender)   (unused — same reasoning)
+    J17  ID12     Positive digital input                          RUNNING LIGHTS (+)
+                                                                  (= POSITION LAMPS / EU term;
+                                                                  parking lights / marker lights
+                                                                  in US English)
+    J18  ID13     Negative digital input                          PTO (-)
+                                                                  (PTO-engaged interlock,
+                                                                  switch-to-ground when engaged.
+                                                                  Identified empirically on
+                                                                  2026-05-13 — wire was not on
+                                                                  the Solectrac wiring diagram
+                                                                  we had access to)
+    J19  P/BR     Positive digital input (likely "Park Brake")    (unused — Solectrac wires
+                                                                  parking brake to J23 instead,
+                                                                  using the negative input)
+    J20  ID17     Positive digital input                          BATTERY CHARGING (+)
+                                                                  (logic state from VC; replaces
+                                                                  the classic D+ alternator
+                                                                  excite of a diesel tractor)
+    J21  ID6      Positive digital input                          (unused)
+    J22  ID21     Negative digital input                          (unused)
+    J23  ID18     Negative digital input                          PARKING BRAKE (-)
+    J24  ID16     Positive digital input                          (unused)
+    J25  PB/L     Positive digital input (likely "Park Brake      (unused)
+                  Light")
+    J26  ID15     Negative digital input                          (unused)
+    J27  ID19     Negative digital input                          (unused)
+    J28  ID14     Negative digital input                          (unused)
+    J29  ID11     Negative digital input                          (unused)
+    J30  ID7      Positive digital input                          (unused)
+    J31  ID4      Negative digital input                          (unused)
+    J32  BUZZER   Out 2 low-side, 150 mA max (audible alert)      (unused — audible alerts not
+                                                                  routed through the cluster)
+    J33  D+       D+ alternator excite, neg. digital input with   (unused — no alternator on
+                  170 mA excitation resistor                      an electric tractor)
+    J34  CS       CAN shield                                 ★    (unused — no shield drain
+                                                                  on this harness)
+    J35  CL       CAN L                                      ★    CAN L
+    J36  CH       CAN H                                      ★    CAN H
 
 ★ = minimum pins required for a powered cluster on CAN: J3, J4, J8,
-J35, J36 (five pins). Everything else is discretes / analog senders /
-indicator outputs that Solectrac may or may not have wired.
+J35, J36 (five pins). Solectrac populates 15 cavities total: the five
+required plus 10 discrete-input wires (turn signals, lights, brake,
+FWD indicator, PTO, battery-charging state, back light).
+
+Diagram errata
+^^^^^^^^^^^^^^
+
+The Solectrac harness wiring diagram available to this project has at
+least three labelling issues:
+
+1. The +BATTERY pin is labelled "Pin 1" — actually J3 (the row 1 col 1
+   cavity = J1 is empty in the populated grid, confirming the typo).
+2. The pin at row 3 col 2 (J10) is labelled "4WD (-)" — actually FWD
+   (Forward direction). Tractor-confirmed 2026-05-13.
+3. The pin at row 4 col 2 (J14) is labelled "DIPPED BEAM (+)" —
+   Solectrac uses it as the general HEADLIGHTS indicator.
+
+Plus one wire on the cluster connector that the diagram doesn't mention
+at all:
+
+4. J18 (row 5 col 2) is populated but not in the diagram. Identified
+   on the tractor as PTO indicator (-).
+
+Empirical verification (2026-05-13)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* CAN H/L resistance at the harness (cluster plugged in, key OFF,
+  measured across J35/J36 = row 9 col 3 / col 4): **30 Ω**.
+  Interpretation: four 120 Ω terminators in parallel. The cluster
+  itself has no internal terminator (per COBO datasheet), so the
+  four terminators must live in the other four nodes on the bus —
+  most likely **BMS + MC + VC + Charger** (SAs 0xF3, 0xCA, 0xD0,
+  0xE5). The bus is over-terminated by a factor of 2 vs. textbook
+  CAN (60 Ω). Drivers tolerate this — captures have been clean — but
+  it's worth knowing if removing a node ever changes the bus
+  behaviour.
+* The 30 Ω measurement also confirms our row-major cavity numbering
+  hypothesis: if J35/J36 weren't actually at row 9 cols 3-4, we'd
+  expect open / kΩ instead.
+* Pin-by-pin function identification (FWD at J10, HEADLIGHTS at J14,
+  PTO at J18, RUNNING LIGHTS at J17) confirmed on the physical
+  tractor by the operator on the same date.
 
 Bus speed / termination notes
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 * The ECO MATRIX VT3 supports 125 / 250 / 500 kbaud and **does not
   contain an internal 120 Ω termination resistor**. The cluster is
-  therefore a mid-bus node electrically — termination has to be
-  provided elsewhere on the harness.
+  therefore a mid-bus tap electrically.
 * J1939 default is 250 kbaud, which is what our captures use, so this
   is consistent.
+* Bus-resistance reality (vs. textbook CAN): 30 Ω instead of 60 Ω —
+  see "Empirical verification" above.
 
 Implications for the reverse-engineering work
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
