@@ -1,17 +1,15 @@
 NOTES — Solectrac CAN-bus reverse-engineering findings
 ======================================================
 
-These notes record what we learned about *this specific tractor* and *these
-specific captures*. The README covers the parser itself in generic terms;
-this file is where the experimental, observational, and tentative material
-lives. Numbers below come from the captures in this directory and are
+These notes record what we learned about the Solectrac electric tractor.
+Numbers below come from the captures in this directory and are
 subject to revision when better data or vendor documentation arrives.
 
 
 Table of contents
 -----------------
 
-* Status overview (TL;DR)
+* Status overview
 * Tractor / pack context
 * Source-address (SA) map observed in these captures
 * PGN decode notes (BMS, SA = 0xF3)
@@ -28,7 +26,7 @@ Table of contents
 * Confidence summary
 
 
-Status overview (TL;DR)
+Status overview
 -----------------------
 
 This is the rolled-up state. See the Confidence summary at the bottom
@@ -838,16 +836,13 @@ FF21CA — "Motor telemetry (RPM, throttle, drive state, ctrl temp)"
         * data[7] — SOLVED. Range gear (high nibble) + F/N/R lever
           (low nibble). No further investigation needed.
 
-DM1 (FECA) — empty throughout the existing corpus
-    Payload `00 00 00 00 00 00 FF FF` in every recorded capture.
-    Originally interpreted as "MC is advertising no faults via the
-    standard J1939 channel even though codes appear on the dash" —
-    that interpretation was wrong: there were no MC dashboard codes
-    during any of these captures. DM1 IS the MC fault channel; it
-    just happened to be empty because nothing was wrong. Confirmed
-    2026-05-13 via injection — see the "Motor-controller error
-    codes — SOLVED" section. Encoding: bytes 0/1 = J1939 lamp/flash
-    bytes; SPN field (bytes 2-4) = the displayed MC code number.
+DM1 (FECA) — MC fault channel
+    Payload `00 00 00 00 00 00 FF FF` (empty) in every recorded
+    capture, because none of those captures had an active MC fault.
+    Confirmed 2026-05-13 via injection — see the "Motor-controller
+    error codes — SOLVED" section. Encoding: bytes 0/1 = J1939
+    lamp/flash bytes; SPN field (bytes 2-4) = the displayed MC code
+    number.
 
 
 PGN decode notes (vehicle controller, SA = 0xD0)
