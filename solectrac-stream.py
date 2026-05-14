@@ -272,9 +272,13 @@ LIMIT_CURRENT_LSB_A = 0.01     # F107 bytes 0-1 / 2-3 BE, 0.01 A/bit
 # render as >100% rather than silently saturating.
 THROTTLE_DEAD_LOW = 3          # idle resting offset (subtracted from raw)
 THROTTLE_PCT_PER_BIT = 0.4     # J1939 SPN 91 convention: raw 250 = 100%
-# Pack ratings from the vendor BMS GUI (NOTES.txt): 300 Ah at 72.0 V
-# nominal -> 21.6 kWh nominal energy. Used for the "% of pack" display
-# only; not used for any decoding.
+# Pack ratings: the vendor BMS GUI reports 300 Ah at 72.0 V nominal
+# (21.6 kWh). The FT 25G service manual battery section nameplates the
+# pack at 350 Ah / 73 V / 25.5 kWh (20S4P NMC modules, cell
+# SEPNI-8688190P-17.5AH-5P). The GUI value is likely a derated/usable
+# capacity; we keep the GUI numbers here for back-compat with prior
+# SOC->Wh calculations. Used for the "% of pack" display only; not
+# used for any decoding.
 PACK_CAPACITY_AH = 300.0
 PACK_NOMINAL_V = 72.0
 PACK_CAPACITY_WH = PACK_CAPACITY_AH * PACK_NOMINAL_V    # 21,600 Wh
