@@ -1587,11 +1587,13 @@ def render_vc(state: State, now: float) -> Panel:
 
 
 def render_faults(state: State, now: float) -> Panel:
-    """Display BMS fault info from F108 plus DM1 (motor-ECU Active
-    DTCs) from PGN FECA. Byte 7 of F108 has a decoded bit-to-code
-    mapping (vendor BMS error-code table); other bytes are shown as
-    raw values when nonzero so undecoded fault data is at least
-    visible. DM1 is summarised in a compact section underneath.
+    """Display BMS fault info from F108 plus MC fault info from DM1
+    (PGN FECA, SA 0xCA). The two subsystems use different fault
+    transports: BMS broadcasts F108 as a continuous bitmap (byte 7
+    decoded against the vendor BMS error-code table; other bytes
+    shown raw when nonzero), while the MC speaks standard J1939 DM1
+    where the SPN value equals the dashboard-displayed MC code
+    (e.g. SPN 47 -> "MC47" = HPD/Sequencing Fault).
     """
     bytes_seen = any(c.value is not None for c in state.fault_bytes)
     faults = active_bms_faults(state) if bytes_seen else []
@@ -1711,12 +1713,20 @@ def _render_dm1(state: State, now: float):
         oc_v = int(oc.value or 0)
         cm_v = int(cm.value or 0)
         fmi_name = DM1_FMI_NAMES.get(fmi_v, "?")
+        # SPN value = the MC error code shown on the dashboard. Confirmed
+        # 2026-05-13 via DM1 injection: SPN 12/47/99 rendered as
+        # "MC12"/"MC47"/"MC99". The cluster prepends "MC" because the
+        # DM1 source address is 0xCA.
         t.add_row(
-            Text("DM1 DTC", style="bold red"),
+            Text(f"MC{spn_v}", style="bold red"),
+            Text(describe_mc_code(spn_v), style="bold red"),
+        )
+        t.add_row(
+            Text("DM1 DTC", style="dim red"),
             Text(
                 f"SPN={spn_v}  FMI={fmi_v} ({fmi_name})  "
                 f"OC={oc_v}  CM={cm_v}",
-                style="bold red",
+                style="dim red",
             ),
         )
 

@@ -21,8 +21,9 @@ Table of contents
 * Vendor BMS error code table (operator manual)
 * Dashboard error codes — F108 carries the displayed BMS bitmap
 * Vendor MC error code table (operator manual)
-* Motor-controller error codes — methodology to decode (open)
+* Motor-controller error codes — SOLVED 2026-05-13 (DM1 SPN encoding)
 * Vendor BMS GUI screenshot — provenance and ground-truth values
+* Dashboard / instrument cluster hardware
 * Open questions / future work
 * Confidence summary
 
@@ -72,9 +73,23 @@ Open (UNKNOWN):
     * SOH / alarm-word host PGN.
     * KL15 / wake-up status bit location.
     * F104 byte-level decode (temp min/max summary).
-    * Motor-controller error-code channel (DM1 stays empty even with
-      codes on the dashboard).
     * Whether a separate drivetrain bus carries inverter / PTO telemetry.
+
+Solved 2026-05-13:
+    * Motor-controller error-code channel — codes ride standard
+      J1939 DM1 (FECA from SA 0xCA); the SPN value equals the
+      dashboard-displayed MC code (12..99 per the operator manual).
+      The cluster prepends "MC" based on the source address. DM1
+      was empty in every prior capture simply because no MC faults
+      had occurred organically — not because the codes lived
+      elsewhere. Confirmed via live CAN injection (util/mc_inject.py)
+      with SPN 12, 47, and 99 → dashboard showed MC12, MC47, MC99.
+      A populated DM1 from SA 0xF3 (BMS) was ignored by the
+      cluster, confirming the cluster has subsystem-specific
+      decoders rather than a unified DM1 path: MC uses DM1, BMS
+      uses the proprietary F108 bitmap. Latch quirk: the cluster
+      holds DTCs until key cycle; an absence of DM1 does not
+      unlatch them as standard J1939 would prescribe.
 
 
 Tractor / pack context
@@ -141,11 +156,13 @@ Source-address (SA) map observed in these captures
 |      |                                          | FF21CA frame is *suppressed*   |
 |      |                                          | entirely while charging        |
 |      |                                          | (contactors open for traction).|
-|      |                                          | DM1 stays empty (no active     |
-|      |                                          | SPN/FMI codes) even while the  |
-|      |                                          | dashboard shows numeric error  |
-|      |                                          | codes — see "Dashboard error   |
-|      |                                          | codes" below.                  |
+|      |                                          | DM1 IS the MC fault channel:   |
+|      |                                          | SPN value = displayed code     |
+|      |                                          | (e.g. SPN 47 -> "MC47"); empty |
+|      |                                          | in captures because no MC      |
+|      |                                          | faults occurred. Confirmed     |
+|      |                                          | 2026-05-13 via injection — see |
+|      |                                          | the MC error-codes section.    |
 | 0x12 | Sender of FF21 proprietary B traffic     | Function unknown; constant     |
 |      |                                          | payload `01 00 00 00 00 00 00  |
 |      |                                          | 00`. Distinct from FF21 from   |
@@ -821,11 +838,16 @@ FF21CA — "Motor telemetry (RPM, throttle, drive state, ctrl temp)"
         * data[7] — SOLVED. Range gear (high nibble) + F/N/R lever
           (low nibble). No further investigation needed.
 
-DM1 (FECA) — empty throughout
-    Payload `00 00 00 00 00 00 FF FF` in every capture. The motor
-    controller is advertising "no active diagnostic trouble codes"
-    via the SAE J1939 standard channel even when the dashboard is
-    showing numeric error codes. See "Dashboard error codes" below.
+DM1 (FECA) — empty throughout the existing corpus
+    Payload `00 00 00 00 00 00 FF FF` in every recorded capture.
+    Originally interpreted as "MC is advertising no faults via the
+    standard J1939 channel even though codes appear on the dash" —
+    that interpretation was wrong: there were no MC dashboard codes
+    during any of these captures. DM1 IS the MC fault channel; it
+    just happened to be empty because nothing was wrong. Confirmed
+    2026-05-13 via injection — see the "Motor-controller error
+    codes — SOLVED" section. Encoding: bytes 0/1 = J1939 lamp/flash
+    bytes; SPN field (bytes 2-4) = the displayed MC code number.
 
 
 PGN decode notes (vehicle controller, SA = 0xD0)
@@ -985,13 +1007,52 @@ dashboard surfaces both subsystems through the same numeric channel.
 See the methodology section below for how to verify that.
 
 
-Motor-controller error codes — methodology to decode (open)
------------------------------------------------------------
+Motor-controller error codes — SOLVED 2026-05-13
+------------------------------------------------
 
-We do not yet have a fault-mode capture for the motor controller (SA 0xCA).
-DM1 (FECA) is empty in every existing capture — same situation we had
-for the BMS before F108 was decoded — so the standard J1939 trouble-code
-channel is not the source. Methodology by analogy with the BMS work:
+**Resolution: MC error codes ride standard J1939 DM1 (PGN FECA from SA
+0xCA). The SPN field value equals the dashboard-displayed MC code; the
+cluster prepends "MC" based on source address.**
+
+Confirmed via live CAN injection (`util/mc_inject.py`) at slcan @ 250 kbaud,
+ID 0x18FECACA, with single-DTC payloads:
+
+  SPN 12 (0x0C) -> dashboard "MC12" (Controller Over Current)
+  SPN 47 (0x2F) -> dashboard "MC47" (HPD/Sequencing Fault)
+  SPN 99 (0x63) -> dashboard "MC99" (Parameter Mismatch)
+
+A populated DM1 from SA 0xF3 (BMS) was ignored by the cluster, proving
+the cluster has subsystem-specific decoders rather than a unified DM1
+path:
+  - MC (SA 0xCA): J1939 DM1, SPN = displayed number.
+  - BMS (SA 0xF3): proprietary F108 bitmap (continuous broadcast).
+
+**Latch quirk:** the cluster latches DM1 DTCs on receipt and does NOT
+unlatch when DM1 returns to empty. Standard J1939 says DTCs go
+"previously active" after 3 s of frame absence; this cluster keeps them
+on screen until a key cycle. When iterating on injection tests, key-
+cycle between probes so you can tell whether a new code came from the
+new injection or from a stale latch.
+
+**Why empty in every capture:** every prior asc/*.asc capture was taken
+under nominal operation — no MC faults ever occurred. DM1 was the right
+channel all along; we just never saw it populated. (Same situation that
+hid F108 byte 7 before the operator deliberately produced BMS faults.)
+
+**FF21CA bytes 2 and 7 are NOT fault fields.** Injecting non-zero
+values into FF21CA byte 7 flashed dashboard lamps but never produced a
+numeric code. Byte 7 is read by the cluster, likely for lamp / status
+flags (analogous to DM1 byte 0's MIL/RSL/AWL/PSL layout), but does not
+carry the code number. Bit-layout for FF21CA byte 7 (and possibly byte
+2) is a worthwhile future probe.
+
+Code numbering ranges remain non-overlapping: MC = 12..99 (per manual),
+BMS = 100..146 (per manual). A dashboard "code 47" is unambiguously MC;
+"code 124" is unambiguously BMS.
+
+------------------------------------------------------------
+Historical methodology notes (kept for context):
+------------------------------------------------------------
 
 What's already on the bus from SA 0xCA:
 * FECA (DM1)  — empty (`00 00 00 00 00 00 FF FF`).
@@ -1145,6 +1206,151 @@ Decoder errata exposed by the screenshot:
   that we now read both bytes instead of just the low one.
 
 
+Dashboard / instrument cluster hardware
+---------------------------------------
+
+The tractor's dashboard display has been physically identified, opening
+the door to a direct CAN tap at the cluster (in addition to the OBD-style
+diagnostic port we have been capturing from).
+
+Unit identification
+^^^^^^^^^^^^^^^^^^^
+
+* Manufacturer: COBO S.p.A. (Leno, Brescia, Italy) — Italian Tier-1
+  supplier of instrument clusters for off-highway machinery; 3B6 is
+  the same group.
+* Product family: "ECO MATRIX VT3" instrument cluster (also marketed
+  under the COBO "Unideck" sub-brand).
+* COBO hardware part number (internal label): 2050394, platform
+  "ECO HW UNICO VT3", SW rev 102, manufactured 2022.
+* Solectrac OEM part number (external label): 2167780 REV.04, dated
+  2021-08-23, 12V.
+* Display: 128 x 64 dot-matrix LCD with 2 analog cross-coil gauges
+  and 21 LED warning lights; 230 x 120 mm housing.
+* Supply: 12 V (matches tractor's accessory bus, not pack voltage).
+* Protocols supported by the platform: CAN J1939 and ISOBUS / ISO11783.
+  Only one CAN line is present on the connector (the cluster itself
+  is not a multi-bus device).
+
+Connector
+^^^^^^^^^
+
+* Header on the cluster: Tyco AMP 36-way header assembly (4 cols x 9
+  rows; 36 cavities total).
+* Mating connector (harness side): Tyco / TE **1-0640526-0**.
+* Terminals: Tyco / TE **0-0641294-1**.
+* Observed population on this Solectrac unit: 15 of 36 cavities
+  populated. Layout (`x` = pin, `o` = empty, viewed from the harness
+  mating face, oriented as the connector sits in the dashboard):
+
+      col→  1 2 3 4
+      row 1 . x x x
+      row 2 . x x x
+      row 3 . x . x
+      row 4 . x . .
+      row 5 x x . x
+      row 6 . . x .
+      row 7 . . . .
+      row 8 . . . .
+      row 9 . . x x
+
+  Solectrac uses a subset of the available I/O. The bottom-row pair
+  (row 9, cols 3-4) is almost certainly CAN L / CAN H (J35 / J36 in
+  the table below); rows 7-8 being empty is consistent with the
+  cluster's discrete-input bank not being fully utilised.
+
+Pinout (J1–J36, per the COBO ECO MATRIX VT3 datasheet)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The J-number is the cluster's logical pin index from the datasheet. The
+physical cavity-to-J mapping on the Tyco 1-0640526-0 housing is not
+covered in the COBO datasheet — it lives in the TE connector datasheet
+and still needs to be pulled. Once mapped, the populated-cavity layout
+above can be translated to a function-by-function wire list.
+
+    J1   RELE'    Out 1 high-side, 150 mA max (relay drive)
+    J2   IDBL     Positive digital input
+    J3   30       + Battery (constant 12 V)                  ★
+    J4   15       + Key (ignition / KL15)                    ★
+    J5   FR1      Frequency input, 33 kΩ pull-up, max 1500 Hz
+                  (speed-sender style)
+    J6   ID9      Positive digital input
+    J7   ID10     Positive digital input
+    J8   31       GND                                        ★
+    J9   ID3      Negative digital input
+    J10  ID1      Negative digital input
+    J11  ID5      Negative digital input
+    J12  ID20     Positive digital input
+    J13  ID2      Negative digital input
+    J14  ID8      Positive digital input
+    J15  AN2      Analog resistive input, 90 Ω pull-up (sender)
+    J16  AN1      Analog resistive input, 90 Ω pull-up (sender)
+    J17  ID12     Positive digital input
+    J18  ID13     Negative digital input
+    J19  P/BR     Positive digital input (likely "Park Brake")
+    J20  ID17     Positive digital input
+    J21  ID6      Positive digital input
+    J22  ID21     Negative digital input
+    J23  ID18     Negative digital input
+    J24  ID16     Positive digital input
+    J25  PB/L     Positive digital input (likely "Park Brake Light")
+    J26  ID15     Negative digital input
+    J27  ID19     Negative digital input
+    J28  ID14     Negative digital input
+    J29  ID11     Negative digital input
+    J30  ID7      Positive digital input
+    J31  ID4      Negative digital input
+    J32  BUZZER   Out 2 low-side, 150 mA max (audible alert)
+    J33  D+       D+ alternator excite, neg. digital input with
+                  170 mA excitation resistor (battery warning lamp)
+    J34  CS       CAN shield                                 ★
+    J35  CL       CAN L                                      ★
+    J36  CH       CAN H                                      ★
+
+★ = minimum pins required for a powered cluster on CAN: J3, J4, J8,
+J35, J36 (five pins). Everything else is discretes / analog senders /
+indicator outputs that Solectrac may or may not have wired.
+
+Bus speed / termination notes
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* The ECO MATRIX VT3 supports 125 / 250 / 500 kbaud and **does not
+  contain an internal 120 Ω termination resistor**. The cluster is
+  therefore a mid-bus node electrically — termination has to be
+  provided elsewhere on the harness.
+* J1939 default is 250 kbaud, which is what our captures use, so this
+  is consistent.
+
+Implications for the reverse-engineering work
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* Once the TE 1-0640526-0 cavity numbering is in hand, a non-destructive
+  diagnostic harness can be built (T-tap on J35/J36) without unplugging
+  the cluster — useful for live-on-the-tractor captures while the
+  display is still functional.
+* The dashboard error codes seen in the F108 work (124, 140, 142..146)
+  are rendered by *this* cluster from CAN frames it consumes. Knowing
+  the cluster firmware version (SW rev 102) is potentially useful if
+  COBO has revision notes for the code-rendering logic.
+* The cluster is the same hardware platform COBO sells to many OEMs;
+  the pinout and protocol are generic, but the symbol layout and
+  warning-light assignments (L1..L21 in the datasheet) are
+  Solectrac-specific firmware.
+
+Sources
+^^^^^^^
+
+* COBO ECO MATRIX VT3 datasheet (PDF, 8 pp, includes full J1..J36
+  pinout, connector part numbers, electrical specs):
+  https://www.si-parts.com/cataloghi_cobo/display-quadri-bordo/ECO_MATRIX_VT3.pdf
+* COBO product page for the ECO MATRIX (12V panel):
+  https://www.si-parts.com/en/instruments-clusters/13181-eco-matrix-faresin-12v-panel.html
+* COBO Group corporate page:
+  https://www.cobogroup.net/
+* TE Connectivity 1-0640526-0 housing and 0-0641294-1 terminal:
+  datasheets to be added once pulled from TE.com.
+
+
 Open questions / future work
 ----------------------------
 
@@ -1195,10 +1401,11 @@ Still open
   starting SOC down to a lower known SOC would lock in the slope
   and tell us whether the field is truly linear or just locally
   linear near full charge.
-* Motor-controller error-code channel. DM1 (FECA from SA 0xCA) stays
-  empty even when the dashboard surfaces MC codes. See the
-  "Motor-controller error codes — methodology to decode" section
-  for the planned capture-pair experiment.
+* (Resolved 2026-05-13) Motor-controller error-code channel. DM1
+  (FECA from SA 0xCA) IS the MC fault channel — SPN value equals
+  the dashboard-displayed code. DM1 was empty in every capture
+  only because no MC faults had occurred. See the "Motor-controller
+  error codes — SOLVED" section for confirmation details.
 * Mower / PTO engagement signature. The real-world capture
   (real-world-on-driving-mowing-off.asc) was the first to exercise a
   sustained mowing run under traction load — no new CAN IDs appeared
