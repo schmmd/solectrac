@@ -252,8 +252,8 @@ Decoder assumptions (verify against the BMS spec before trusting numerically):
                      for ground truth. Idle resting offset ~3 (sensor noise
                      floor with foot off pedal); below raw ~14 the motor
                      controller's internal dead-low keeps RPM near 0
-                     (matches the Kelly TPS_dead_low concept from the
-                     hydraulic pump doc). The previously documented "max
+                     (a TPS_dead_low band is a generic Curtis/Kelly
+                     traction-controller idiom). The previously documented "max
                      0x34" was a sample-size artifact and the "0..0x69 cap"
                      was a neutral-mode artifact; neither was a true scale
                      boundary.
@@ -372,9 +372,13 @@ TEMP_OFFSET_C = 40
 NUM_CELLS = 20
 NUM_TEMPS = 7
 
-# Pack ratings from the vendor BMS GUI (see NOTES.txt): 300 Ah at 72.0 V
-# nominal -> 21.6 kWh nominal energy. Used by stream.py for the SOC->Wh
-# remaining estimate; not used for any decoding here.
+# Pack ratings: the vendor BMS GUI reports 300 Ah at 72.0 V nominal
+# (21.6 kWh). The FT 25G service manual battery section nameplates the
+# pack at 350 Ah / 73 V / 25.5 kWh (20S4P NMC modules, cell
+# SEPNI-8688190P-17.5AH-5P). The GUI value is likely a derated/usable
+# capacity; we keep the GUI numbers here for back-compat with prior
+# SOC->Wh calculations. The kWh display is a derived heuristic, not a
+# decoded CAN signal -- not used for any decoding.
 PACK_CAPACITY_AH = 300.0
 PACK_NOMINAL_V = 72.0
 PACK_CAPACITY_WH = PACK_CAPACITY_AH * PACK_NOMINAL_V    # 21,600 Wh

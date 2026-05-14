@@ -3,7 +3,8 @@
 Reverse-engineered protocol and hardware documentation for a Solectrac
 electric tractor (~70 V class). All decode information is derived from
 captured CAN traffic, vendor manual tables, the COBO cluster datasheet,
-the vendor BMS GUI screenshot, and live injection tests on the tractor.
+the "BMS Update" document, the Solectrac Parts Catalog (e25), and live
+injection tests on the tractor.
 
 Confidence markers used throughout:
 
@@ -31,27 +32,69 @@ Confidence markers used throughout:
 
 ## Vehicle and pack
 
+The tractor is a **Solectrac 25G** (non-HST variant).
+
 "Pack" refers to the tractor's traction battery — the high-voltage
 lithium-ion battery that powers the motor, as distinct from the 12 V
 accessory battery that runs the cluster and lights.
 
-| Property                  | Value                                       | Source       |
-|---------------------------|---------------------------------------------|--------------|
-| Pack chemistry            | NMC ("NiCoMn" per vendor GUI)               | Vendor GUI   |
-| Cells in series           | 20                                          | Vendor GUI + CAN |
-| Cells in parallel         | ~20 (300 Ah / ~15 Ah cell)                  | Vendor GUI   |
-| Temperature probes        | 7 (rest of F155.. channels are padding)     | Vendor GUI   |
-| Nominal pack voltage      | 72.0 V                                      | Vendor GUI   |
-| Rated capacity            | 300 Ah                                      | Vendor GUI   |
-| Rated discharge           | 300 A                                       | Vendor GUI   |
-| Rated charge (DC / AC)    | 78 A / 39 A                                 | Vendor GUI   |
-| Bus baud                  | 250 kbaud (J1939 default)                   | Confirmed    |
-| Cluster supply            | 12 V (accessory, not pack)                  | Hardware     |
+| Property                  | Service manual              | Vendor BMS GUI       |
+|---------------------------|-----------------------------|----------------------|
+| Pack chemistry            | NMC                         | "NiCoMn"             |
+| Cell P/N                  | `SEPNI-8688190P-17.5AH-5P`  | —                    |
+| Cells in series           | 20 (one per module)         | 20                   |
+| Cells in parallel         | 4 modules × 5P1S = 20P      | "~20 cells in parallel" |
+| Series × parallel         | **20S4P at module level**   | "20 series"          |
+| Temperature probes        | not stated                  | 7 active (rest of F155.. channels are padding) |
+| Nominal pack voltage      | **73.0 V**                  | 72.0 V               |
+| Voltage operating range   | 60–84 V                     | —                    |
+| Rated capacity            | **350 Ah**                  | 300 Ah               |
+| Rated energy              | 25.5 kWh @ 23 ± 2 °C        | —                    |
+| Rated discharge           | —                           | 300 A                |
+| Rated charge (DC / AC)    | —                           | 78 A / 39 A          |
+| Pack vendor               | "Escorts Solution"          | (BMS GUI footer "ESCORTS-INTERNAL") |
+| Main HV fuse              | 350 A                       | —                    |
+| Bus baud                  | 250 kbaud (J1939 default)   | Confirmed (capture)  |
+| Cluster supply            | 12 V (accessory, not pack)  | Hardware             |
 
-The BMS module appears to be a third-party unit also used by Escorts
-Kubota — the vendor GUI screenshot is footer-marked
-"ESCORTS-INTERNAL". A vendor protocol document would close out most
-remaining TENTATIVE items at once.
+The 73 V / 350 Ah service-manual nameplate and the 72 V / 300 Ah BMS
+GUI readout disagree by ~17 % on capacity. The GUI may reflect a
+derated/usable capacity (top + bottom buffer excluded), or the unit
+shipped with different nameplate parameters than the spec table —
+either is plausible. The scripts' Wh display in `solectrac-analyze.py`
+and `solectrac-stream.py` is calibrated against the GUI-reported
+SOC, so it continues to use the 72 V × 300 Ah = 21.6 kWh basis for
+back-compatibility with prior captures; the manual values are
+documented here for nameplate accuracy.
+
+Escorts Kubota is the corporate parent of Farmtrac; the BMS-GUI
+"ESCORTS-INTERNAL" footer matches the manual's "Escorts Solution"
+pack-vendor attribution. The service manual's BMS troubleshooting
+section delegates all live-data inspection to a host-side application
+called **UDAAN** (referenced repeatedly: "Connect UDAAN and check the
+minimum cell voltage", etc.). UDAAN is the most promising single lead
+for obtaining a real BMS payload spec / DBC-equivalent; the service
+manual itself contains no byte-level payload tables for the BMS
+broadcast frames.
+
+**BMS field connector** is part number **`RT061412SNHEC03`** (12-pin
+circular). Per the manual's DTC 125 troubleshooting (page 30 of the
+battery section), main vehicle CAN exits on **pins D and E** — a 60 Ω
+resistance test across D↔E (two 120 Ω terminators in parallel)
+confirms a healthy bus. Pins A/B/C are 12 V power rails: **B is GND**,
+A and C are switched/unswitched +12 V (DTCs 140/142/143/144 all
+prescribe "12 V between A↔B and C↔B" as the integrity check). The
+remaining field-connector pins F/G/H/J/K/L are unassigned in
+troubleshooting steps and are the most likely physical home of the
+**second (debug) CAN pair** — see "Second 2-pin CAN port" under the
+CAN topology section.
+
+Schematic 5.7 uses BMS-internal terminal letters that do **not** map
+1:1 to the field connector — it shows main CAN on pins H/J
+(`CAN_H3`/`CAN_L3`) and a second pair on F/G (`CANDE-H`/`CANDE-L`)
+labelled "TO BMS DEBUG CONNECTOR PIN-1/PIN-2". The schematic's H/J
+and the field connector's D/E refer to the same physical bus; the
+two pin-naming conventions are independent.
 
 100 % SOC reference set (5 captures at full charge):
 
@@ -70,63 +113,122 @@ response observed.
 ## CAN bus topology
 
 Single shared CAN bus at 250 kbaud. The diagnostic port we capture from
-is on the same bus as the ECUs that run the tractor (BMS, motor
-controller, charger, cluster, etc.) — it is not a separate diagnostic
-segment.
+is on the same bus as the ECUs that run the tractor — it is not a
+separate diagnostic segment.
 
-Nodes (per Solectrac topology diagram):
+Per **schematic 5.10** in the FT 25G service manual, the bus has
+**exactly four** CAN nodes, with terminators at the two physical ends
+of the linear bus:
 
-    1. MOTOR CONTROLLER     — diagram-drawn 120 Ω terminator
-    2. BMS
-    3. CHARGER
-    4. E-HYDRAULIC          — drawn on the diagram; not confirmed on the bus
-                              (no CAN traffic attributed to it, and PTO/hitch
-                              activity produces no diagnostic-bus signature —
-                              see conflict note below)
-    5. DB9 CONNECTOR        — labelled "DB9" on the diagram. Captures in
-                              this repo were taken through an OBD-II port on
-                              the tractor; whether that port and the diagram's
-                              "DB9" are the same physical connector (mislabel
-                              on the diagram), or distinct connectors that
-                              both land on this bus, is not confirmed
-    6. CLUSTER              — diagram-drawn external 120 Ω terminator
-                              (cluster has no internal terminator)
+    1. MOTOR CONTROLLER (SA 0xCA) — Curtis controller, pins 23/35;
+                                    120 Ω terminator at this end
+                                    (per parts catalog, model is Curtis
+                                    1238E; nameplate not verified in
+                                    this corpus)
+    2. BMS (SA 0xF3)              — pins H/J of the BMS internal terminals,
+                                    field-connector pins D/E
+    3. CHARGER (SA 0xE5)          — on-board AC charger; pins 1/2.
+                                    Also speaks CAN to the BMS — DTC 124
+                                    is "Fast Charger CAN connection fault"
+    4. CLUSTER                    — COBO ECO MATRIX VT3 instrument
+                                    cluster, pins 35/36; 120 Ω terminator
+                                    at this end
+
+The **OBD-II diagnostic connector** is a passive tap on the same bus —
+not an extra node. Per schematic 5.8, it follows standard OBD-II
+HS-CAN pinout: pin 4 ground, pin 5 chassis ground, **pin 6 CAN_H**
+(yellow 0.75 mm²), **pin 14 CAN_L** (green 0.75 mm²), pin 16 +12 V
+battery. The older Solectrac topology diagram's "DB9" connector label
+is a mislabel — it's the OBD-II port.
 
 ```
-   [120 Ω]─┬────────┬────────┬────────┬────────┬────────┬─[120 Ω]
-           │        │        │        │        │        │
-        ┌──┴──┐  ┌──┴──┐  ┌──┴──┐  ┌──┴──┐  ┌──┴──┐  ┌──┴──┐
-        │ MC  │  │ BMS │  │ CHG │  │ E-H │  │ OBD │  │ CLU │
-        │0xCA │  │0xF3 │  │0xE5 │  │  ?  │  │ tap │  │     │
-        └─────┘  └─────┘  └─────┘  └─────┘  └─────┘  └─────┘
+   [120 Ω]─┬────────┬────────┬────────┬────────┬─[120 Ω]
+           │        │        │        │        │
+        ┌──┴──┐  ┌──┴──┐  ┌──┴──┐  ┌──┴──┐  ┌──┴──┐
+        │ MC  │  │ BMS │  │ CHG │  │ OBD │  │ CLU │
+        │0xCA │  │0xF3 │  │0xE5 │  │ tap │  │     │
+        └─────┘  └─────┘  └─────┘  └─────┘  └─────┘
 ```
 
-- E-H = E-Hydraulic node (drawn on the diagram, not yet seen on the bus).
-- OBD = OBD-II capture port (the diagram labels this "DB9"; see note above).
-- `[120 Ω]` = terminator drawn on the topology diagram.
-- The node order along the bus is as the diagram draws it; the actual
-  electrical order on the wire hasn't been verified.
+- `[120 Ω]` = terminator drawn on schematic 5.10 (MC and Cluster).
+- OBD = OBD-II capture port (passive tap, no SA).
+- Node order on the schematic is as drawn; physical electrical order
+  on the wire is not verified.
 
-Bus is **over-terminated**: 30 Ω measured across J35/J36 at the cluster
-(key off, all nodes connected) versus the textbook 60 Ω. Four 120 Ω
-resistors in parallel — two beyond what the topology diagram draws.
-Drivers tolerate it and captures are clean, but unplugging any one node
-shifts the measured resistance and can help identify which modules carry
-internal terminators.
+Cable spec from the schematic: twisted pair, 33 ± 2 twists per metre.
 
-Cable spec from the diagram: twisted pair, 33 ± 2 twists per metre.
+### What is NOT on this bus
 
-Whether the E-HYDRAULIC node actually emits traffic on this bus is
-unresolved. PTO/hitch operation in `hydraulics-off-on-lift-pto.asc`
-produced no new CAN IDs and no decodable byte signal, which conflicts
-with the diagram. Three possibilities:
+**The E-Hydraulic Controller has no CAN pins.** Schematic 5.11 in the
+service manual shows it driven by a discrete control interface:
+LOW/HIGH speed-selection switch, hydraulic-motor on/off switch,
+throttle wiper potentiometer (10 kΩ), Hall/encoder, key-switch wire
+from the main E-Controller (`KS01A`), and three-phase U/V/W out to a
+BLDC pump motor. It is not a CAN-speaking ECU on this vehicle.
 
-1. Diagram is generic/aspirational; as-built wiring differs.
-2. E-Hydraulic is on the bus but mute during hitch/PTO.
-3. The un-tapped 2-pin connector is the actual hydraulic bus.
+The parts catalog identifies the e-hydraulic as a **Kelly KLS7212M /
+KLS7218** controller, which is a CAN-capable family. Either the
+Kelly's CAN port is physically present but not wired, or the catalog
+identification is for a different controller variant. Either way, the
+CAN-decode-from-the-Kelly-protocol-PDF plan is not applicable on this
+vehicle.
 
-Don't trust the schematic over capture data until verified by physical
-trace.
+The rear 3-point hitch, lift, PTO, power steering, and remote
+hydraulics are all mechanical-hydraulic with no electrical interface
+(per the manual's Hydraulic System chapter, pp 295-319 — a fully
+mechanical Escorts design with draft + position levers, rocker
+top-link spring, mechanical position-feedback cam, manual auxiliary
+spool, and no solenoids/sensors/transducers anywhere).
+
+### Bus termination
+
+Bus measures **30 Ω** across J35/J36 at the cluster (key off, all
+nodes connected) versus the textbook **60 Ω** for two 120 Ω
+terminators in parallel — four 120 Ω resistors in parallel, two
+beyond what the schematic draws. Drivers tolerate it and captures are
+clean. The extra terminators are almost certainly inside the BMS and
+the Charger (both ECUs commonly ship with internal termination);
+unplug-and-measure with each node removed would localize them
+precisely.
+
+### Second 2-pin CAN port
+
+A separate 2-pin connector on the tractor remains un-tapped. The
+leading hypothesis is that it carries the **BMS debug CAN** pair shown
+on schematic 5.7 as `CANDE-H` / `CANDE-L`, explicitly labelled "TO
+BMS DEBUG CONNECTOR PIN-1 / PIN-2". The BMS thus exposes two CAN
+pairs: the main vehicle bus (above) and this debug pair. If tapped,
+expect BMS-internal diagnostic chatter — likely the same protocol that
+the host-side **UDAAN** tool consumes. This is no longer believed to
+be a hydraulic bus.
+
+### Identified components (from Parts Catalog e25)
+
+The Solectrac parts catalog names the major electrical assemblies. This
+turns several previously-anonymous "drive ECU" / "hydraulic node"
+references into specific parts with public datasheets and fault-code
+references.
+
+| Catalog table | Part                                                    | Role                              |
+|---------------|---------------------------------------------------------|-----------------------------------|
+| Table 60      | Curtis controller (1238E per catalog; nameplate not verified) | Traction inverter (SA 0xCA); service manual confirms "Curtis controller, 200 A" without giving the model number |
+| Table 60      | Albright SW200 main contactor                           | HV pack ↔ inverter contactor; service manual §4.2.3 names the SW200 explicitly |
+| Table 60      | Hydraulic contactor (discrete; separate from main SW200)| HV pack ↔ hydraulic pump motor    |
+| Table 60      | 350 A battery cut-off fuse                              | HV pack main fuse (service manual §4.3.5; catalog shows 355 A — same component, rounding) |
+| Table 46      | Kelly KLS7212M / KLS7218 hydraulic motor controller     | E-Hydraulic node, **not on the CAN bus** — schematic 5.11 shows the e-hydraulic controller's interface is entirely discrete (speed switch, on/off, throttle pot, Hall encoder). Either the Kelly's CAN port is unwired or the catalog refers to a different controller variant |
+| Table 65      | 500 W DC-DC converter (72 V → 12 V)                     | Accessory rail supply             |
+| Table 65      | 12 V 20 Ah accessory battery                            | Accessory rail backup / cluster   |
+| Table 65      | OPC (Operator Presence Control) timer module — "UNIT ENGINE SHUT OFF CONTROLLER TIMER (SEAT AND PARK OPC)" | Seat-switch + park-brake gating. Not shown as a CAN node on schematic 5.10 — see SA 0xD0 discussion |
+| Table 65      | Motor encoder pigtail                                   | Curtis speed/position feedback. 2-channel A/B quadrature, no Z pulse (service manual motor section); PPR is not documented |
+| Table 67      | "FARMTRAC" key ignition lock                            | Confirms Farmtrac (Escorts Kubota) chassis lineage — matches BMS GUI "ESCORTS-INTERNAL" footer and service manual "Escorts Solution" pack attribution |
+| Table 61      | 72 V 300 Ah traction battery box                        | Matches vendor-GUI pack spec; service manual nameplates the pack at 73 V / 350 Ah / 25.5 kWh — see Vehicle and pack section for the discrepancy |
+
+The discrete hydraulic contactor and the no-CAN finding from
+schematic 5.11 jointly explain why hydraulic activity produces no
+signature on this bus: the hydraulic subsystem is gated on/off by a
+coil energized from the main E-Controller's key-switch wire, and the
+e-hydraulic controller that drives the BLDC pump motor has no CAN
+interface at all.
 
 
 ## Source-address map
@@ -263,7 +365,7 @@ LSB and below-90 % linearity want a deeper-discharge capture.
 **SOH candidate (data[5])** TENTATIVE. data[5] is 0xFA = 250 across
 every capture (42 captures, all BMS frames swept by
 `util/soh_byte_sweep.py`). 250 raw × 0.4 %/bit decodes to 100 %, which
-matches the SOH reading on the vendor BMS GUI screenshot. SOH on a
+matches the SOH reading in the "BMS Update" document. SOH on a
 healthy low-cycle-count NMC pack should be effectively constant at
 100 % across short captures, so "looks like a fixed config field" and
 "is the real SOH at 100 %" produce identical evidence in this corpus.
@@ -387,12 +489,19 @@ Codes 100..127 (bytes 0..5) and 140..145 (byte 7) are merged and
 deduplicated by the decoder.
 
 
-## Motor controller (SA 0xCA)
+## Motor controller (Curtis 1238E, SA 0xCA)
+
+The motor controller is a **Curtis 1238E** AC induction motor
+controller (parts catalog Table 60, Ref 4). The MC error code table
+reproduced below (codes 12, 22, 36, 41–46, 47, 49, 87–89, 99 ...)
+matches the public Curtis 1238 fault-code list one-for-one, so the
+Curtis 1238 manual is the authoritative reference for any FF21CA
+byte questions not yet resolved here.
 
 The motor controller emits two frames on this bus: FF21CA (motor
 telemetry) and FECA (DM1, fault codes). FF21CA is suppressed entirely
 while charging — the controller goes silent when traction contactors
-are open.
+(Albright SW200) are open.
 
 ### FF21CA — Motor telemetry — CONFIRMED (RPM, throttle, temp, state)
 
@@ -574,6 +683,35 @@ change but haven't been decoded.
 SA 0xF4 also acts as a vehicle-side requester (sends 1806E5F4 →
 charger 0xE5). Whether 0xF4 is a separate physical module or a logical
 address inside another ECU's firmware is open.
+
+The parts catalog (Table 65, Ref 10) names a separate **OPC (Operator
+Presence Control) timer module** — "UNIT ENGINE SHUT OFF CONTROLLER
+TIMER (SEAT AND PARK OPC)" — gating shutdown on the seat switch and
+park brake. The F100D0 heartbeat's 0x00 → 0x0C wake-up transition is
+consistent with an OPC-style module asserting "operator present, park
+brake released" once those preconditions are met.
+
+**Tension with service manual schematic 5.10.** That schematic shows
+the main CAN bus carrying exactly four nodes (MC, BMS, Charger,
+Cluster) with no OPC module drawn. If 0xD0 (and/or 0xF4) frames are
+real, three possibilities:
+
+1. The schematic omits the OPC module — it is a fifth physical CAN
+   node not drawn but present on the harness.
+2. 0xD0 / 0xF4 are *logical* source addresses emitted by one of the
+   four documented nodes (cluster is the natural candidate — it
+   aggregates accessory state).
+3. The frames are bridged from the BMS debug CAN by the BMS firmware.
+
+Service manual schematic **5.9 (Seat OPC)** wires the OPC entirely
+through discrete signals (CSS, DIS, CT, charge-drive interlock relay,
+seat switch, PTO bypass, park-brake switch) — no CAN H/L on the OPC
+connector. That favors option (2) or (3) over (1): the OPC module
+documented in the schematic is wired discretely, not on CAN. The
+parts-catalog OPC-timer-module identification may be a different
+component, or may itself be a misidentification. The SA 0xD0 home is
+therefore unresolved and warrants a fresh look at the captures with
+the 4-node bus constraint in mind.
 
 
 ## Error code system
@@ -853,40 +991,52 @@ Code 51 is listed out of numeric order in the manual.
 - **Full running-mode enumeration.** Vendor GUI implies at least
   Calibrating, Charging, Discharging, Fault, Sleep beyond the
   init/standby/ready states observed.
-- **Second CAN bus.** A 2-pin connector on the tractor remains
-  un-tapped. The most plausible role is a hydraulic bus —
-  `hydraulics-off-on-lift-pto.asc` showed no diagnostic-bus signature
-  during hitch/PTO operation. The Solectrac topology diagram draws an
-  E-HYDRAULIC node on the *main* bus, but the empirical capture
-  evidence conflicts; do not trust the schematic over the data.
-- **Mower / PTO engagement signature.** The
-  `real-world-on-driving-mowing-off.asc` capture (a sustained mowing
-  run) produced no new CAN IDs and no decodable byte signal correlated
-  with mower engagement. CONFIRMED-NEGATIVE for this diagnostic bus —
-  PTO/mower control is most likely hard-wired or on the un-tapped
-  second segment.
+- **Second 2-pin CAN port — most likely BMS debug.** Schematic 5.7
+  shows the BMS exposing two CAN pairs: the main bus (CAN_H3/CAN_L3
+  on internal pins H/J, field-connector pins D/E) and a debug pair
+  (`CANDE-H`/`CANDE-L` on internal pins F/G) labeled "TO BMS DEBUG
+  CONNECTOR PIN-1/PIN-2". Confirmation = tap the 2-pin connector and
+  see if traffic resembles BMS-internal diagnostic chatter. The
+  previously-suspected "Kelly KLS hydraulic CAN" interpretation is
+  ruled out by schematic 5.11, which shows the e-hydraulic controller
+  has no CAN pins at all.
+- **UDAAN tool.** The service manual delegates all BMS live-data
+  inspection to a host-side application called UDAAN ("Connect UDAAN
+  and check the minimum cell voltage", etc.). UDAAN almost certainly
+  contains a DBC-equivalent payload spec for the BMS frames. Obtaining
+  it via a Solectrac/Farmtrac dealer would close out the F100/F102/
+  F107/F113..F117/F108 byte-decoding work in one stroke. Likely
+  proprietary to Escorts, distributed via the dealer channel.
 - **FF21CA byte 1, 4, 6 semantics.** data[1] and data[6] are
   constant-zero fault-bitmap candidates; data[4] is a three-state
   field changing near startup calibration.
 - **SA 0x12 role.** Emits a constant FF21 payload
   `01 00 00 00 00 00 00 00`. Distinct from FF21CA from 0xCA despite
   sharing a PGN.
-- **SA 0xF4 home.** Acts as a vehicle-side requester (1806E5F4 →
-  charger 0xE5). Could be a logical address inside the MC or VC
-  firmware rather than a separate physical module.
+- **SA 0xD0 and 0xF4 physical home.** Schematic 5.10 only documents
+  four CAN nodes (MC, BMS, Charger, Cluster). The OPC module shown on
+  schematic 5.9 is wired entirely discretely (no CAN). So either the
+  schematic omits one or more physical nodes, or 0xD0 / 0xF4 are
+  logical SAs emitted by one of the four documented ECUs (cluster is
+  the natural candidate). Worth re-examining the captures with the
+  4-node constraint as the prior.
 - **Extra terminators.** Bus measures 30 Ω instead of the
-  diagram-predicted 60 Ω — two additional 120 Ω terminators on the
-  bus that the diagram does not show. Unplug-and-measure across
-  J35/J36 with each node removed would localize them; most likely BMS,
-  Charger, or E-Hydraulic.
+  schematic-predicted 60 Ω — two additional 120 Ω terminators that
+  schematic 5.10 doesn't show. Unplug-and-measure with each node
+  removed would localize them; most likely BMS and Charger (both
+  commonly ship with internal termination).
 - **True throttle full-scale.** FF21CA data[0] = 0xCC = 204 observed
   in forward under real load; J1939 SPN 91 convention is raw 250 =
   100 % but not yet ground-truth. A "pedal mashed hard in F under
   load" capture would settle it.
-- **Vendor protocol document.** The vendor GUI's "ESCORTS-INTERNAL"
-  classification narrows the BMS OEM candidate list. Locating an
-  upstream protocol PDF would close out most remaining TENTATIVE
-  items at once.
+- **Motor encoder PPR and motor → wheel gear ratio.** Neither is
+  documented in the service manual's motor section. PPR is needed to
+  convert encoder pulses (if they ever surface) to RPM; gear ratio is
+  needed to convert motor RPM to ground speed. The cluster does not
+  display ground speed — only motor RPM — so this is the standing gap
+  for any "vehicle speed in km/h" derivation. Likely findable in the
+  Transmission chapter (pp 240+) or via a Curtis 1313 programmer
+  read of the controller's parameter file.
 
 
 ## Sources
@@ -897,10 +1047,54 @@ Code 51 is listed out of numeric order in the manual.
   https://www.si-parts.com/en/instruments-clusters/13181-eco-matrix-faresin-12v-panel.html
 - COBO Group corporate page: https://www.cobogroup.net/
 - COBO USA distribution: https://www.cobointernational.com/
-- Vendor BMS GUI screenshot ("300Ah Battery - Excel", footer
-  "Classification | ESCORTS-INTERNAL"; firmware 2.1.8 / 3401e6a;
-  snapshot 2022/3/23 14:19:06 UTC+08).
-- Solectrac harness wiring diagram (user-supplied; has the three
-  labelling errata documented above).
-- Solectrac CAN topology diagram (user-supplied 2026-05-13).
-- Operator manual — BMS and MC error code tables (reproduced above).
+- "BMS Update" document:
+  https://docs.thebackyard.engineer/solectrac/troubleshooting-guides/documentation
+- Solectrac master schematic set (harness wiring + CAN topology
+  diagrams; harness sheet has the three labelling errata documented
+  above): https://solectracsupport.com/support/manuals
+- **FT 25G service manual** (319 pages, dated 2023-07-13) — the
+  primary electrical/CAN authority for this vehicle:
+  https://solectracsupport.com/FT_25G_Service_manual-10-08-2023.pdf
+  Key section anchors:
+  - §**Cluster & Dashboard Switches** (p7) — cluster indicators, mode
+    switches, RPM caps per S/N/F (S<2000, N<2500, F<2800, R<2240).
+  - §**Battery** (p20) — pack nameplate (73 V / 350 Ah / 20S4P / 25.5
+    kWh NMC, cell `SEPNI-8688190P-17.5AH-5P`); BMS connector
+    `RT061412SNHEC03` 12-pin; per-DTC troubleshooting (CAN on field
+    pins D/E confirmed via 60 Ω test in DTC 125, page 30).
+  - §**Motor** (p60) — 15 kW AC induction, 90 Nm, 2800 RPM, 200 A
+    controller, "KEC" vendor hint, 2-channel A/B quadrature encoder
+    (no Z pulse, PPR not stated).
+  - §**E-Box** (p73) — Curtis controller named explicitly, Albright
+    SW200 main contactor, FT25G vs FT25G HST connector differences.
+  - §**Schematics** (p168) — internal index 5.1..5.16. **5.10 CAN
+    Connection** is the authoritative bus topology (4 nodes); **5.11
+    E-Hydraulic Controller** proves the e-hydraulic has zero CAN
+    pins; **5.7 BMS** shows the `CANDE-H/L` debug pair; **5.8
+    Diagnostic Connector** confirms standard OBD-II HS-CAN pinout
+    (pin 6 CAN_H, pin 14 CAN_L).
+  - §**Error Code** (p187) — Motor Controller fault table (J1939 SPN
+    + Curtis-internal short code 12..99) and BMS fault table (codes
+    100..146, all shared Message ID `0x18F108F3` = priority 6, PGN
+    F108, SA 0xF3).
+  - §**Hydraulic System** (p295) — confirms lift / 3-point / remotes
+    are fully mechanical with zero electrical interface.
+- **UDAAN** — Escorts host-side BMS diagnostic application
+  referenced throughout the service manual's battery section.
+  Strongest known lead for a real BMS payload spec / DBC. Likely only
+  available via the Farmtrac/Solectrac dealer channel.
+- Solectrac Parts Catalog (e25):
+  https://docs.thebackyard.engineer/solectrac/troubleshooting-guides/documentation
+  — source for the component identifications in the "Identified
+  components" subsection (Curtis 1238E MC, Kelly KLS7212M/KLS7218
+  hydraulic controller, Albright SW200 main contactor, 500 W DC-DC
+  converter, OPC timer module, 72 V 300 Ah pack box, "FARMTRAC" key
+  ignition). Note: the Kelly identification predates the FT 25G
+  service manual; schematic 5.11 shows the e-hydraulic controller has
+  no CAN pins regardless of which controller it actually is.
+- Curtis 1238 controller manual — public fault-code-list reference
+  for the MC short codes reproduced above.
+- Kelly KLS7218MC / KLS7218NC CAN protocol:
+  `docs/COMPAGE DOCUMENT KLS7218MC & KLS718NC FORMAT.pdf` — kept for
+  reference, but the e-hydraulic controller on this vehicle is not
+  wired to a CAN bus, so the Kelly protocol is not applicable here.
