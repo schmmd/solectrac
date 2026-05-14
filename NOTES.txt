@@ -1395,15 +1395,109 @@ Bus speed / termination notes
 * J1939 default is 250 kbaud, which is what our captures use, so this
   is consistent.
 * Bus-resistance reality (vs. textbook CAN): 30 Ω instead of 60 Ω —
-  see "Empirical verification" above.
+  see "Empirical verification" above and "Wider CAN bus topology"
+  below.
+
+Wider CAN bus topology (per Solectrac topology diagram)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A Solectrac-supplied topology diagram (obtained 2026-05-13) draws six
+nodes on a single shared CAN bus, with two explicit 120 Ω terminators.
+This significantly broadens what we know about the bus beyond the
+SA-map view in earlier sections.
+
+Nodes shown on the diagram:
+
+    1. MOTOR CONTROLLER     — terminator drawn at this end of the bus
+    2. BMS
+    3. CHARGER
+    4. E-HYDRAULIC          — *new* node, not in our SA map yet
+    5. DB9 CONNECTOR        — the diagnostic port we have been
+                              capturing from (asc/*.asc come from
+                              this tap). It is therefore on the
+                              *same* bus as everything else, not a
+                              separate diagnostic bus.
+    6. CLUSTER              — terminator drawn at this end of the bus
+                              (per the diagram; the COBO datasheet
+                              confirms it is *not* inside the cluster,
+                              so this is an external resistor wired
+                              into the harness near the cluster)
+
+Termination discrepancy:
+
+* Diagram predicts: 2 terminators × 120 Ω parallel = 60 Ω.
+* Bench measurement (2026-05-13): 30 Ω.
+* Conclusion: **there are 2 additional 120 Ω terminators on the bus
+  that the diagram does not show.** They almost certainly live inside
+  module(s) that came from third-party suppliers with terminators
+  enabled by default (a common integration oversight). Most likely
+  candidates: BMS, Charger, E-Hydraulic.
+* Bus drivers tolerate 30 Ω at 250 kbaud and captures are clean, but
+  removing any one node may step the bus closer to textbook (40 Ω
+  with three terminators left, 60 Ω with two).
+
+Implications for the SA map:
+
+* The diagram has no explicit "Vehicle Controller" box, yet captures
+  show SA 0xD0 broadcasting the F100D0 VC-heartbeat (0x00 → 0x0C at
+  wake-up) and SA 0xF4 acting as a vehicle-side requester
+  (1806E5F4 → charger 0xE5).
+* Working hypothesis: **E-HYDRAULIC = SA 0xD0** (the electro-
+  hydraulic controller doubling as the vehicle-level supervisor is
+  a common small-tractor arrangement). SA 0xF4's home is still
+  open — could be a logical address inside the MC or VC firmware
+  rather than a separate physical module.
+* Test: unplug the E-Hydraulic module and re-capture. If F100D0
+  traffic disappears, the hypothesis is confirmed.
+
+Implications for the "second CAN bus" question:
+
+* Surface reading of this diagram: hydraulic is on the *main* bus
+  (the E-Hydraulic node is wired to the same harness as MC, BMS,
+  Charger, Cluster). At first glance this contradicts the prior
+  hypothesis that the un-tapped second 2-pin connector is a hydraulic
+  bus.
+* **But** the schematic conflicts with empirical capture evidence:
+  in hydraulics-off-on-lift-pto.asc, operating the hitch/PTO produced
+  no new CAN IDs and no discrete byte signal on the diagnostic bus.
+  If E-Hydraulic were really on the diagnostic bus, hitch/PTO activity
+  should have shown up somewhere.
+* Three scenarios reconcile the conflict:
+    a. The schematic is aspirational/generic for the platform and the
+       as-built tractor wires E-Hydraulic differently.
+    b. E-Hydraulic is on the diagnostic bus but stays mute during
+       hitch/PTO operation (no CAN frames are emitted; control is
+       internal/discrete).
+    c. The 2-pin un-tapped connector is the actual hydraulic bus, and
+       the diagram simplifies/omits it.
+* Verdict: **do not trust the schematic over the capture data** until
+  a physical trace from the E-Hydraulic module to the bus is verified.
+  The hydraulic-bus-on-second-connector hypothesis remains viable.
+
+Follow-up tests to identify which nodes hold the extra terminators
+(unplug-and-measure procedure across J35/J36, key OFF, cluster
+plugged in for each step):
+
+    Step                          Expected delta if that node terminates
+    ----                          --------------------------------------
+    All nodes connected (baseline)  30 Ω
+    Unplug cluster                  no change (cluster has no terminator)
+    Unplug MC                       30 Ω → 40 Ω (lose 1 terminator)
+    Unplug Charger                  30 Ω → 40 Ω if charger terminates
+    Unplug BMS                      30 Ω → 40 Ω if BMS terminates
+    Unplug E-Hydraulic              30 Ω → 40 Ω if E-Hyd terminates
+
+Cable physical spec (from the same diagram):
+
+* CAN wires should be twisted pair, 33 ± 2 twists per metre.
 
 Implications for the reverse-engineering work
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-* Once the TE 1-0640526-0 cavity numbering is in hand, a non-destructive
-  diagnostic harness can be built (T-tap on J35/J36) without unplugging
-  the cluster — useful for live-on-the-tractor captures while the
-  display is still functional.
+* Cavity-to-J mapping is now fully resolved — a non-destructive
+  diagnostic harness can be built (T-tap on J35/J36 = row 9 cols 3-4)
+  without unplugging the cluster, for live-on-the-tractor captures
+  while the display stays functional.
 * The dashboard error codes seen in the F108 work (124, 140, 142..146)
   are rendered by *this* cluster from CAN frames it consumes. Knowing
   the cluster firmware version (SW rev 102) is potentially useful if
@@ -1411,7 +1505,10 @@ Implications for the reverse-engineering work
 * The cluster is the same hardware platform COBO sells to many OEMs;
   the pinout and protocol are generic, but the symbol layout and
   warning-light assignments (L1..L21 in the datasheet) are
-  Solectrac-specific firmware.
+  Solectrac-specific firmware loaded via COBO's VT3 WYSIWYG tool. A
+  generic ECO MATRIX VT3 unit sourced from another OEM (e.g. the
+  Faresin 12V panel offered by si-parts.com) would need to be
+  reflashed before it would behave correctly on the Solectrac harness.
 
 Sources
 ^^^^^^^
@@ -1419,12 +1516,18 @@ Sources
 * COBO ECO MATRIX VT3 datasheet (PDF, 8 pp, includes full J1..J36
   pinout, connector part numbers, electrical specs):
   https://www.si-parts.com/cataloghi_cobo/display-quadri-bordo/ECO_MATRIX_VT3.pdf
-* COBO product page for the ECO MATRIX (12V panel):
+* COBO product page for the ECO MATRIX (12V panel, Faresin variant):
   https://www.si-parts.com/en/instruments-clusters/13181-eco-matrix-faresin-12v-panel.html
-* COBO Group corporate page:
+* COBO Group corporate page (Leno, Brescia, Italy):
   https://www.cobogroup.net/
+* COBO USA distribution arm (potentially useful for sourcing):
+  https://www.cobointernational.com/
 * TE Connectivity 1-0640526-0 housing and 0-0641294-1 terminal:
   datasheets to be added once pulled from TE.com.
+* Solectrac harness wiring diagram for this cluster: source not
+  reproduced in this repo; captured as the user-supplied "CLUSTER"
+  schematic image during the 2026-05-13 RE session. Has the three
+  labelling errata documented above.
 
 
 Open questions / future work
