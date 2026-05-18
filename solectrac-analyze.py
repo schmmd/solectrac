@@ -117,7 +117,7 @@ Signal names use a `domain.name` (or `domain.NN.name`) convention:
     motor.motor_temp_c         FF21CA byte 5 (only emitted when nonzero)
     dash.alive                 FF2112 byte 0 (0=booting, 1=alive; 10 Hz heartbeat from SA 0x12)
     pack.soc_raw               F100F3 byte 4 (raw)
-    pack.soc_pct               F100F3 byte 4 -> percent (b4 * 0.385 + 3.8)
+    pack.soc_pct               F100F3 byte 4 -> percent (b4 * 0.4 - 0.8)
     dm1.lamp.byte0/1           FECA bytes 0/1 raw (lamp & flash status, when nonzero)
     dm1.lamp.NAME_state        FECA byte 0 per-lamp 2-bit state (NAME in
                                {malfunction, red_stop, amber_warning, protect})
@@ -644,14 +644,11 @@ def decode_file(path: Path, scenario: str, rows: list, frames: list,
                     # cross-capture comparison: byte 4 is constant within
                     # short captures (e.g. 250 across 489 frames in
                     # accellerate-decelerate.asc despite voltage moving
-                    # 100 mV); saturates at 250 in soc-100-idle.asc; spans
-                    # 224..250 in charging-120V-90ish-to-100.asc whose
-                    # filename indicates a 90%->100% charge. Linear fit
-                    # through (224, 90%) and (250, 100%) gives the slope
-                    # and offset below; dynamic range is small so the
-                    # slope is loose, and the field is marked tentative
-                    # until a deeper-discharge capture confirms it.
-                    soc_pct = round(data[4] * 0.385 + 3.8, 1)
+                    # 100 mV); saturates at 250 in soc-100-idle.asc.
+                    # Calibrated against two direct screen readings:
+                    # raw=202 at screen 80%, raw=227 at screen 90%.
+                    # Linear fit: slope = 10/25 = 0.4, intercept = -0.8.
+                    soc_pct = round(data[4] * 0.4 - 0.8, 1)
                     emissions.append(("pack.soc_raw", data[4], ""))
                     emissions.append(("pack.soc_pct", soc_pct, "%"))
                     sc["f100"] += 1
@@ -1204,10 +1201,10 @@ DECODERS = [
     ("pack.soc_raw", "F100", "F3", "4", "u8 (raw)",
      "", "tentative",
      "BMS-published SoC raw byte; saturates at 250 in soc-100-idle.asc"),
-    ("pack.soc_pct", "F100", "F3", "4", "u8 * 0.385 + 3.8",
-     "%", "tentative",
-     "linear fit through (224, 90%) and (250, 100%) from "
-     "charging-120V-90ish-to-100.asc; slope loose pending deeper-discharge data"),
+    ("pack.soc_pct", "F100", "F3", "4", "u8 * 0.4 - 0.8",
+     "%", "verified",
+     "calibrated from two direct screen readings: raw=202 at 80%, raw=227 at 90%; "
+     "slope=0.4 intercept=-0.8; raw saturates at 250 (=99.2%) in soc-100-idle.asc"),
     ("bms.state.byte0", "F106", "F3", "0", "u8 (raw)",
      "", "verified",
      "BMS top-level mode bitfield; only six values observed across 36,955 "

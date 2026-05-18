@@ -343,7 +343,7 @@ SOC_REST_CURRENT_A = 2.0
 # slope over the most recent SOC_ETA_WINDOW_S when SOC is rising in that
 # window, and fall back to the slope across all retained history when
 # the window lands entirely inside a plateau (the BMS publishes SOC in
-# 0.385%/count steps that can hold for >1000 s in CV taper). Until the
+# 0.4%/count steps that can hold for >1000 s in CV taper). Until the
 # deque has seen SOC_ETA_STABLE_TRANSITIONS distinct values, the ETA is
 # tagged "(rough)" because a one- or two-transition slope can be off by
 # ~100%. Linear extrapolation is also optimistic near 100% SOC.
@@ -634,11 +634,10 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
                         state.energy_wh_charged += -avg_neg * dt / 3600.0
                 state.last_energy_ts = now
                 state.last_energy_p = power
-            # byte 4 = BMS-published State-of-Charge. Linear fit through
-            # (224, 90%) and (250, 100%) from charging-120V-90ish-to-100.asc;
-            # saturates at 250 in soc-100-idle.asc. Slope is loose pending
-            # a deeper-discharge capture.
-            state.bms_soc_pct.update(data[4] * 0.385 + 3.8, now)
+            # byte 4 = BMS-published State-of-Charge. Calibrated from two
+            # direct screen readings: raw=202 at 80%, raw=227 at 90%;
+            # slope=0.4 intercept=-0.8. Saturates at 250 in soc-100-idle.asc.
+            state.bms_soc_pct.update(data[4] * 0.4 - 0.8, now)
             # Sliding window of SOC samples for the time-to-full ETA.
             state.soc_history.append((now, state.bms_soc_pct.value))
             cutoff = now - SOC_ETA_HISTORY_S
