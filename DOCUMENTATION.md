@@ -39,50 +39,87 @@ lithium-ion battery that powers the motor, as distinct from the
 The accessory rail is fed by a **500 W 72 V → 12 V DC-DC converter**
 off the pack (parts catalog Table 65).
 
-| Property                  | Service manual              | Vendor BMS GUI       |
-|---------------------------|-----------------------------|----------------------|
-| Pack chemistry            | NMC                         | "NiCoMn"             |
-| Cell P/N                  | `SEPNI-8688190P-17.5AH-5P`  | —                    |
-| Cells in series           | 20 (one per module)         | 20                   |
-| Cells in parallel         | 4 modules × 5P1S = 20P      | "~20 cells in parallel" |
-| Series × parallel         | **20S4P at module level**   | "20 series"          |
-| Temperature probes        | not stated                  | 7 active (rest of F155.. channels are padding) |
-| Nominal pack voltage      | **73.0 V**                  | 72.0 V               |
-| Voltage operating range   | 60–84 V                     | —                    |
-| Rated capacity            | **350 Ah**                  | 300 Ah               |
-| Rated energy              | 25.5 kWh @ 23 ± 2 °C        | —                    |
-| Rated discharge           | —                           | 300 A                |
-| Rated charge (DC / AC)    | —                           | 78 A / 39 A          |
-| Pack vendor               | "Escorts Solution"          | (BMS GUI footer "ESCORTS-INTERNAL") |
-| Main HV fuse              | 350 A                       | —                    |
-| Bus baud                  | 250 kbaud (J1939 default)   | —                    |
-| Cluster supply            | 12 V (accessory, not pack)  | Hardware             |
+| Property                  | Brochure                              | Operator manual (CET)                              | Service manual              | BMS GUI                 | Observed |
+|---------------------------|---------------------------------------|----------------------------------------------------|-----------------------------|-------------------------|----------|
+| Bus baud                  | —                                     | —                                                  | 250 kbaud (J1939 default)   | —                       | —        |
+| Cell P/N                  | —                                     | —                                                  | `SEPNI-8688190P-17.5AH-5P`  | —                       | `SEPNI8688190P-15Ah` (battery faceplate) |
+| Cells in parallel         | —                                     | —                                                  | 4 modules × 5P1S = 20P      | "~20 cells in parallel" | —        |
+| Cells in series           | —                                     | —                                                  | 20 (one per module)         | 20                      | —        |
+| Charging temp range       | 0–40 °C                               | —                                                  | —                           | —                       | —        |
+| Charging time             | 5.5 hr (Lvl 2, 220 VAC, 20→80%)<br>11 hr (Lvl 1, 110 VAC) | 8 hr (0→100%, on-board charger) | —                       | —                       | —        |
+| Charging-target voltage   | 83 V                                  | 82 VDC (§9.1)                                      | —                           | —                       | —        |
+| Cluster supply            | —                                     | 12 V / 20 Ah aux battery                           | 12 V (accessory, not pack)  | Hardware                | —        |
+| Cycle life                | 2500 cycles @ 25 °C                   | 2500 cycles @ 25 °C                                | —                           | —                       | —        |
+| Main HV fuse              | —                                     | —                                                  | 350 A                       | —                       | —        |
+| Manufacture date          | —                                     | —                                                  | —                           | —                       | 2021-12-02 (battery faceplate) |
+| Nominal pack voltage      | 72 V                                  | 72 V (§1.2 plate, §9.1)                            | **73.0 V**                  | 72.0 V                  | 72 V (battery faceplate) |
+| Operating temp range      | −20 to 55 °C                          | —                                                  | —                           | —                       | —        |
+| Pack chemistry            | Li NMC                                | NMC (Li-ion)                                       | NMC                         | "NiCoMn"                | —        |
+| Pack model number         | —                                     | `EV-008-72V300Ah-01` (§1.2 plate)                  | —                           | —                       | `EV-008-72V300Ah-02` (battery faceplate) |
+| Pack serial number        | —                                     | —                                                  | —                           | —                       | NO.079 / QR `031PE0021Y020ABC20100079` (battery faceplate) |
+| Pack vendor               | —                                     | Soundon New Energy Technology Co., Ltd. (§1.2 plate) | "Escorts Solution"        | "ESCORTS-INTERNAL"      | Soundon New Energy Technology Co., Ltd. (engraved) + Escorts (sticker) (battery faceplate) |
+| Pack weight               | —                                     | 175 ± 15 kg (§1.2 plate)                           | —                           | —                       | 175 ± 15 kg (battery faceplate) |
+| Rated capacity            | 350 Ah                                | 300 Ah (270 Ah opt., §9.1; 300 Ah on §1.2 plate)   | **350 Ah**                  | 300 Ah                  | 300 Ah (battery faceplate) |
+| Rated charge (DC / AC)    | —                                     | charger out 3.3 kW @ 220 V; in AC 85–265 V, 50/60 Hz, IP67 | —                   | 78 A / 39 A             | —        |
+| Rated energy              | —                                     | 21.6 kWh (§1.2 plate)                              | 25.5 kWh @ 23 ± 2 °C        | —                       | 21.6 kWh (battery faceplate) |
+| Temperature probes        | —                                     | —                                                  | not stated                  | 7 active                | —        |
+| Voltage operating range   | —                                     | 60–84 V (§1.2 plate)                               | 60–84 V                     | —                       | 60–84 V (battery faceplate) |
 
-The 73 V / 350 Ah service-manual nameplate and the 72 V / 300 Ah BMS
-GUI readout disagree by ~17 % on capacity. The BMS GUI may reflect a
-derated/usable capacity (top + bottom buffer excluded), or the unit
-shipped with different nameplate parameters than the spec table —
-either is plausible. The scripts' Wh display in `solectrac-analyze.py`
-and `solectrac-stream.py` is calibrated against the GUI-reported
-SOC, so it continues to use the 72 V × 300 Ah = 21.6 kWh basis for
-back-compatibility with prior captures; the manual values are
-documented here for nameplate accuracy.
+Five sources supply pack specs: the Solectrac **brochure**
+(`docs/Solectrac-e25G-Brochure-230818.pdf`); the **operator manual**
+(CET, `docs/CET Operator Manual.pdf`, especially §1.2 nameplate photo
+and §9.1 specification table); the FT 25G **service manual** battery
+section; the **BMS GUI** as relayed second-hand; and the **battery
+faceplate** observed directly on this tractor.
 
-Escorts Kubota is the corporate parent of Farmtrac; the BMS-GUI
-"ESCORTS-INTERNAL" footer matches the manual's "Escorts Solution" pack-vendor
-attribution. The service manual's BMS troubleshooting section delegates all
-live-data inspection to a host-side application called **UDAAN** (referenced
-repeatedly: "Connect UDAAN and check the minimum cell voltage", etc.). UDAAN
-has been identified as the **UDAN iBMS Upper Utility** from **Anhui UDAN
-Technology Co., Ltd.** — a Chinese BMS vendor. The Solectrac/Farmtrac pack is
-rebadged UDAN hardware. The tool is publicly downloadable Windows software (CAN
-@ 250 kbit/s, supports cheap CANalyst-II / PCAN / USBCAN dongles).  The service
-manual itself contains no byte-level payload tables for the BMS broadcast
-frames, but UDAN's tool has a `Comm. Message` recording feature that captures
-the raw CAN exchange alongside a labeled Excel export of every System Overview
-UI field — running both simultaneously produces a time-aligned raw-CAN +
-labeled-field log, i.e. an empirical DBC.  See the open-questions section for
-the practical decode path.
+**The 300 Ah vs 350 Ah split is a two-SKU situation, not a single-pack
+disagreement.** The service manual cell P/N is
+`SEPNI-8688190P-17.5AH-5P` (17.5 Ah cells); the as-installed pack's
+nameplate sticker is `SEPNI8688190P-15Ah` (15 Ah cells). Same cell
+family (SEPNI 86 × 88 × 190 mm prismatic NMC), different capacity
+grade. Plugged into the 20-series × 4-module × 5-parallel topology:
+
+- 17.5 Ah cells → 4 × 5 × 17.5 = **350 Ah pack, 25.5 kWh @ 73 V** —
+  service-manual and brochure-quoted SKU.
+- 15 Ah cells → 4 × 5 × 15 = **300 Ah pack, 21.6 kWh @ 72 V** —
+  this tractor's installed SKU. The operator manual's example
+  faceplate (§1.2) and the BMS GUI both describe the same SKU.
+
+The `solectrac-analyze.py` / `solectrac-stream.py` Wh display uses
+72 V × 300 Ah = 21.6 kWh, which matches the faceplate exactly.
+
+**Pack vendor is Soundon; UDAN is the BMS firmware/tool vendor, not
+the pack maker.** The battery faceplate is laser-etched **Soundon New
+Energy Technology Co., Ltd.** (Chinese NMC pack manufacturer; the
+`docs/BMS Update Error and Data Extraction - MS Soundon Battery.pdf`
+file in this repo is from them). An Escorts-branded white sticker
+rides on top: Escorts Kubota Limited (Farmtrac's parent in India,
+Solectrac's US distribution brand) buys the pack from Soundon, applies
+its own QR-coded serial ("Escorts 72V300Ah NO.079"), and ships it into
+Farmtrac/Solectrac tractors. The BMS-GUI "ESCORTS-INTERNAL" footer and
+the service manual's "Escorts Solution" pack-vendor attribution both
+reflect the Escorts integrator label, not the upstream pack
+manufacturer. Whether the BMS PCB itself is Soundon-built, UDAN-built,
+or third-party is not resolved by the available documents.
+
+The service manual's BMS troubleshooting section delegates all
+live-data inspection to a host-side application called **UDAAN**
+(referenced repeatedly: "Connect UDAAN and check the minimum cell
+voltage", etc.). UDAAN has been identified as the **UDAN iBMS Upper
+Utility** from **Anhui UDAN Technology Co., Ltd.** — a Chinese BMS
+firmware/diagnostic-tool vendor. The tool is publicly downloadable
+Windows software (CAN @ 250 kbit/s, supports cheap CANalyst-II / PCAN
+/ USBCAN dongles). The service manual itself contains no byte-level
+payload tables for the BMS broadcast frames, but UDAN's tool has a
+`Comm. Message` recording feature that captures the raw CAN exchange
+alongside a labeled Excel export of every System Overview UI field —
+running both simultaneously produces a time-aligned raw-CAN +
+labeled-field log, i.e. an empirical DBC. See the open-questions
+section for the practical decode path.
+
+This tractor's pack carries manufacture date **2021-12-02** and
+Escorts serial **NO.079** — useful as a calendar-age anchor for SOH
+and capacity-fade discussions.
 
 **BMS field connector** is part number **`RT061412SNHEC03`** (12-pin
 circular). Per the manual's DTC 125 troubleshooting (page 30 of the
@@ -1113,8 +1150,9 @@ Code 51 is listed out of numeric order in the manual.
   e-hydraulic controller has no CAN pins at all.
 - **UDAAN tool — identified, downloadable; one practical blocker.**
   UDAAN is the **UDAN iBMS Upper Utility** from Anhui UDAN Technology
-  Co., Ltd. (Chinese BMS vendor); the Solectrac pack is rebadged UDAN
-  hardware. Windows software, CAN @ 250 kbit/s (matches our bus),
+  Co., Ltd. (Chinese BMS firmware/tool vendor; the physical pack is
+  Soundon, see "Vehicle and pack" above). Windows software,
+  CAN @ 250 kbit/s (matches our bus),
   supports cheap CANalyst-II / PCAN / USBCAN dongles. V3.1 manual is
   in `docs/UDAN_iBMS_Upper_Utility_v3.1_manual.pdf`. Download portal:
   `https://www.ievcloud.com/burner_en.html`. Practical decode path:
@@ -1218,8 +1256,9 @@ Code 51 is listed out of numeric order in the manual.
     both tire options, the source for the "Range → ground speed"
     section above.
 - **UDAAN = UDAN iBMS Upper Utility** from Anhui UDAN Technology
-  Co., Ltd. — the Chinese BMS vendor whose hardware is rebadged into
-  the Solectrac/Farmtrac pack. Public download:
+  Co., Ltd. — Chinese BMS firmware/diagnostic-tool vendor. (The
+  physical pack on this tractor is manufactured by Soundon New
+  Energy Technology Co., Ltd.; see "Vehicle and pack".) Public download:
   `https://www.ievcloud.com/burner_en.html`. Corporate site:
   `https://www.udantech.com/en/`. V3.1 user manual (35 pages, dated
   2023-10-07) is in this repo at
