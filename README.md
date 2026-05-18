@@ -112,50 +112,6 @@ stale BMS).
 
 Requires `python-can` and `rich` (`pip install -r requirements.txt`).
 
-## J1939 ID reference
-
-Each 29-bit J1939 identifier breaks down as:
-
-| Bits   | Field               | Notes                                                                 |
-|--------|---------------------|-----------------------------------------------------------------------|
-| 28..26 | Priority (P)        | 0 = highest, 7 = lowest. Priority 6 is typical for periodic broadcasts.|
-| 25     | Reserved (R) / EDP  | Always 0 in classic J1939.                                            |
-| 24     | Data Page (DP)      | Selects between page 0 (default) and page 1.                          |
-| 23..16 | PDU Format (PF)     | PF < 0xF0 → PDU1 (destination-specific). PF ≥ 0xF0 → PDU2 (broadcast).|
-| 15..8  | PDU Specific (PS)   | Destination Address (DA) for PDU1, or Group Extension (GE) for PDU2.  |
-| 7..0   | Source Address (SA) | The transmitter's J1939 address.                                      |
-
-The Parameter Group Number (PGN) is reconstructed as:
-
-* PDU1: `PGN = (DP << 16) | (PF << 8)` (DA is **not** part of the PGN).
-* PDU2: `PGN = (DP << 16) | (PF << 8) | PS`.
-
-`decode_can_id()` in `solectrac-analyze.py` performs this for every unique
-ID it sees, populating `ids.csv`.
-
-## Adding a decoder
-
-1. Add any new PGN / source-address constants near the top of
-   `solectrac-analyze.py`. Existing ones include `PGN_F100`, `PGN_F102`,
-   `PGN_FF50`, `PGN_FF21`, the `PGN_CELL_FIRST..PGN_CELL_LAST` window, the
-   `PGN_TEMP_FIRST..PGN_TEMP_LAST` window, and source addresses `SRC_BMS`,
-   `SRC_CHARGER`, `SRC_VEHICLE`, `SRC_MOTOR`.
-2. Add a branch inside `decode_file()` that recognizes the frame and
-   appends one or more `(signal, value, unit)` tuples to `emissions`. The
-   surrounding loop commits a `frames.csv` row and the matching
-   `signals.csv` rows together with a shared `frame_index`.
-3. Add a row per new signal name to the `DECODERS` catalog so the formula
-   and confidence land in `decoders.csv`.
-4. Optionally add a human-readable name for the PGN to `PGN_NAMES` so it
-   surfaces in `ids.csv`.
-5. To surface the new signal in the stdout summary, add a
-   `values_for(rows, scenario, "your.signal")` block to `summarize()`.
-
-All numerical scalings (mV/bit, A/bit, V/bit, °C offset) are defined as
-named constants so they can be revised in one place once a definitive spec
-becomes available. Scalings not yet confirmed against vendor documentation
-are commented as "tentative" in the source.
-
 ## Disclaimer
 
 This is a personal reverse-engineering exercise based on observed CAN

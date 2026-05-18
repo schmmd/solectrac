@@ -18,7 +18,7 @@ Outputs (written into OUTDIR, default: current working directory):
                   b0, b1, b2, b3, b4, b5, b6, b7
     decoders.csv  per-signal decode rule catalog:
                   signal, pgn, source, bytes, formula, unit, confidence, notes
-    ids.csv       one row per unique CAN ID seen, with J1939 decode
+    can_ids.csv   one row per unique CAN ID seen, with J1939 decode
     stdout        per-scenario summary
 
 `frame_index` joins signals.csv -> frames.csv so any decoded value can be
@@ -492,7 +492,7 @@ def decode_can_id(can_id: int, is_extended: bool) -> dict:
     """Decode a CAN ID (11- or 29-bit) into J1939 fields."""
     if not is_extended:
         return {
-            "id": f"{can_id:03X}",
+            "can_id": f"{can_id:03X}",
             "ext": False,
             "priority": "",
             "r": "",
@@ -514,7 +514,7 @@ def decode_can_id(can_id: int, is_extended: bool) -> dict:
     pdu2 = pf >= 0xF0
     pgn = (dp << 16) | (pf << 8) | (ps if pdu2 else 0)
     return {
-        "id": f"{can_id:08X}",
+        "can_id": f"{can_id:08X}",
         "ext": True,
         "priority": priority,
         "r": r,
@@ -1392,8 +1392,8 @@ DECODERS = [
      "the last clear (saturates at 126; 127 = not available)"),
 ]
 
-# ids.csv has its own writer because it's per-ID metadata, not timeseries.
-IDS_SCHEMA = ["id", "ext", "count", "priority", "R", "DP",
+# can_ids.csv has its own writer because it's per-ID metadata, not timeseries.
+IDS_SCHEMA = ["can_id", "ext", "count", "priority", "R", "DP",
               "PF", "PS", "SA", "PGN", "PDU", "PS_role", "name"]
 
 
@@ -1425,20 +1425,20 @@ def write_decoders(out_dir: Path):
 
 
 def write_ids(id_counts: dict, out_dir: Path):
-    """Emit the per-unique-ID J1939 decode table to ids.csv."""
-    path = out_dir / "ids.csv"
+    """Emit the per-unique-ID J1939 decode table to can_ids.csv."""
+    path = out_dir / "can_ids.csv"
     decoded = []
     for (can_id, is_ext), n in id_counts.items():
         d = decode_can_id(can_id, is_ext)
         decoded.append((d, n))
     # Sort: 29-bit before 11-bit, then by numeric ID value.
-    decoded.sort(key=lambda dn: (not dn[0]["ext"], int(dn[0]["id"], 16)))
+    decoded.sort(key=lambda dn: (not dn[0]["ext"], int(dn[0]["can_id"], 16)))
 
     with path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(IDS_SCHEMA)
         for d, n in decoded:
-            w.writerow([d["id"], d["ext"], n, d["priority"], d["r"], d["dp"],
+            w.writerow([d["can_id"], d["ext"], n, d["priority"], d["r"], d["dp"],
                         d["pf"], d["ps"], d["sa"], d["pgn"], d["pdu"],
                         d["ps_role"], d["name"]])
     print(f"wrote {path} ({len(decoded)} unique IDs)")

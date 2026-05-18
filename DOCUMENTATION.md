@@ -18,12 +18,13 @@ Confidence markers used throughout:
 
 - [Vehicle and pack](#vehicle-and-pack)
 - [CAN bus topology](#can-bus-topology)
-- [Source-address map](#source-address-map)
-- [BMS (SA 0xF3)](#bms-sa-0xf3)
-- [Motor controller (SA 0xCA)](#motor-controller-sa-0xca)
-- [Charger (SA 0xE5)](#charger-sa-0xe5)
-- [Vehicle controller (SA 0xD0)](#vehicle-controller-sa-0xd0)
-- [Instrument cluster hardware](#instrument-cluster-hardware)
+- [J1939 Decodings](#j1939-decodings)
+  - [Source-address map](#source-address-map)
+  - [BMS (SA 0xF3)](#bms-sa-0xf3)
+  - [Motor controller (SA 0xCA)](#motor-controller-sa-0xca)
+  - [Charger (SA 0xE5)](#charger-sa-0xe5)
+  - [Vehicle controller (SA 0xD0)](#vehicle-controller-sa-0xd0)
+  - [Instrument cluster hardware](#instrument-cluster-hardware)
 - [Vendor error code tables](#vendor-error-code-tables)
 - [Open questions](#open-questions)
 
@@ -244,7 +245,41 @@ connector is its physical termination at the harness end (no second
 terminator until a tool is plugged in). All consistent with the
 schematic 5.7 `CANDE-H`/`CANDE-L` debug-pair interpretation.
 
-## Source-address map
+## J1939 decodings
+
+Almost all of the traffic monitored on the Solectrac is
+[J1939](https://www.csselectronics.com/pages/j1939-explained-simple-intro-tutorial),
+a standardized language for heavy duty vehicles on top of the CAN protocol.
+Each 29-bit J1939 identifier breaks down as:
+
+| Bits   | Field               | Notes                                                                 |
+|--------|---------------------|-----------------------------------------------------------------------|
+| 28..26 | Priority (P)        | 0 = highest, 7 = lowest. Priority 6 is typical for periodic broadcasts.|
+| 25     | Reserved (R) / EDP  | Always 0 in classic J1939.                                            |
+| 24     | Data Page (DP)      | Selects between page 0 (default) and page 1.                          |
+| 23..16 | PDU Format (PF)     | PF < 0xF0 → PDU1 (destination-specific). PF ≥ 0xF0 → PDU2 (broadcast).|
+| 15..8  | PDU Specific (PS)   | Destination Address (DA) for PDU1, or Group Extension (GE) for PDU2.  |
+| 7..0   | Source Address (SA) | The transmitter's J1939 address.                                      |
+
+From this identifier, the Parameter Group Number (PGN) is reconstructed
+according to the following logic so that broadcasts can use the address space
+as additional data storage:
+
+```
+  if (PF < 0xF0) {
+      // PDU1: PS is DA, not in PGN                                                                                                
+      PGN = (DP << 16) | (PF << 8);                                                                                                
+      DA  = PS;                                                                                                                    
+  } else {                                                                                                                         
+      // PDU2: PS is GE, part of PGN                                                                                               
+      PGN = (DP << 16) | (PF << 8) | PS;
+  }    
+```
+
+In data J1939 data collected for the Solectrac, > 99% (all except the 1806E5F4
+request from the vehicle-controller 0xF4 to the on-board charger 0xE5).
+
+### Source-address map
 
 Every J1939 frame's 29-bit CAN ID ends in an 8-bit source address (SA)
 identifying which node on the bus sent it. The table below pairs each
@@ -260,15 +295,15 @@ elsewhere in this document.
 | 0xD0 | Vehicle controller / dashboard accy.  | Periodic F100D0 heartbeat; byte-0 0x00 → 0x0C at wake-up     |
 | 0xCA | Motor controller / drive ECU          | DM1 (FECA) + FF21 motor telemetry (~85 Hz); silent while charging |
 | 0x12 | Unknown                               | Constant FF21 payload `01 00 00 00 00 00 00 00`              |
-| 0x41 | Address-claim type frame              | Few frames; not analyzed                                     |
+| 0x041 (11-bit) | Ignition event marker (non-J1939) | Standard CAN 2.0A, not J1939. Constant payload `20 12 01 00 00 00 01 11`. Observed exactly twice per full ignition cycle (one frame at key-on, one at key-off); absent from captures that don't span a power transition. Source ECU unconfirmed. |
 
 
-## BMS (SA 0xF3)
+### BMS (SA 0xF3)
 
 All scalings derived empirically. Byte numbering is 1-based with
 explicit `data[N]` (0-based) annotations where helpful.
 
-### F113..F13C — Per-cell voltages — CONFIRMED
+#### F113..F13C — Per-cell voltages — CONFIRMED
 
 8 bytes = 4 × big-endian uint16, millivolts.
 
@@ -280,7 +315,7 @@ explicit `data[N]` (0-based) annotations where helpful.
 
 Cells read ~3.6–3.7 V at ~40 % SOC, ~4.16 V/cell at 100 %.
 
-### F155..F15E — Module temperatures — CONFIRMED
+#### F155..F15E — Module temperatures — CONFIRMED
 
 8 bytes = 8 × uint8 with J1939 +40 °C offset (raw 53 = 13 °C).
 
@@ -292,7 +327,7 @@ Cells read ~3.6–3.7 V at ~40 % SOC, ~4.16 V/cell at 100 %.
 Only the first 7 channels are populated on this pack; the rest are
 0xFF (not present).
 
-### F102F3 — Cell min/max summary — CONFIRMED (max/min/spread)
+#### F102F3 — Cell min/max summary — CONFIRMED (max/min/spread)
 
 | Byte    | Meaning                                            |
 |---------|----------------------------------------------------|
@@ -319,7 +354,7 @@ correctly identifies the right cell.
 Smallest spread observed across all captures: 3 mV (124 frames in
 `recorded-data/charging.csv`).
 
-### F100F3 — Pack status — CONFIRMED (voltage, current); TENTATIVE (SOC)
+#### F100F3 — Pack status — CONFIRMED (voltage, current); TENTATIVE (SOC)
 
 | Byte | data[]  | Meaning                                                     |
 |------|---------|-------------------------------------------------------------|
@@ -390,12 +425,12 @@ needs a capture where SOH demonstrably differs from 100 % (older
 firmware, older/degraded pack, or an injected spoof watched on the
 vendor GUI).
 
-### F104F3 — Pack temperature min/max summary
+#### F104F3 — Pack temperature min/max summary
 
 Pack-wide hottest/coldest module-temperature summary, analogous to
 F102. Byte-level decode UNKNOWN.
 
-### F106F3 — BMS state — TENTATIVE
+#### F106F3 — BMS state — TENTATIVE
 
 Periodic frame; byte 0 carries a state-machine vocabulary:
 
@@ -413,7 +448,7 @@ Observed full payloads:
 Vendor GUI implies more states exist (Calibrating, Charging,
 Discharging, Fault, Sleep); not observed in captured data.
 
-### F107F3 — BMS limits — TENTATIVE
+#### F107F3 — BMS limits — TENTATIVE
 
 Layout matches the standard J1939 limits-frame template:
 
@@ -429,7 +464,7 @@ Layout matches the standard J1939 limits-frame template:
 needs a charge capture from low SOC where meaningful charge-current
 limits are published.
 
-### F108F3 — BMS active fault bitmap — CONFIRMED via injection
+#### F108F3 — BMS active fault bitmap — CONFIRMED via injection
 
 Active BMS fault flags. All bytes 0x00 in healthy idle (verified
 against `asc/bms-error-codes/idle-no-bms.asc`).
@@ -455,7 +490,7 @@ code being asserted — SAE J1939 "2-bit status" convention (00 = off,
 01/10/11 = on at varying severity, dashboard renders any non-00 pair
 as the code on).
 
-#### F108 byte 7 mapping
+##### F108 byte 7 mapping
 
 | Bit | Mask | Code | Meaning                                       |
 |-----|------|------|-----------------------------------------------|
@@ -479,7 +514,7 @@ Notable:
 - Bits 1 and 2 might still carry internal flags that don't surface as
   numeric codes.
 
-#### F108 cross-validation against pre-injection captures
+##### F108 cross-validation against pre-injection captures
 
 `bms-fullcharge-102-109-140.asc` — operator-confirmed cycling 102, 109, 140:
 
@@ -503,7 +538,7 @@ clearing the bit clears the dash. This is the opposite of the MC's
 DM1 channel, which latches DTCs until a key cycle (see FECA section).
 
 
-## Motor controller (Curtis 1238E, SA 0xCA)
+### Motor controller (Curtis 1238E, SA 0xCA)
 
 The motor controller is a **Curtis 1238E** AC induction motor
 controller (parts catalog Table 60, Ref 4). The MC error code table
@@ -517,7 +552,7 @@ telemetry) and FECA (DM1, fault codes). FF21CA is suppressed entirely
 while charging — the controller goes silent when traction contactors
 (Albright SW200) are open.
 
-### FF21CA — Motor telemetry — CONFIRMED (RPM, throttle, temp, state)
+#### FF21CA — Motor telemetry — CONFIRMED (RPM, throttle, temp, state)
 
 Broadcast at ~85 Hz. Full 29-bit ID is `0x0CFF21CA` (priority 3, not
 the default 6 — higher priority than BMS broadcasts, consistent with a
@@ -620,7 +655,7 @@ FF21CA data[3..4], read range from data[7] high nibble, multiply by
 the per-range coefficient above.
 
 
-### FECA (DM1) — MC fault channel — CONFIRMED via injection
+#### FECA (DM1) — MC fault channel — CONFIRMED via injection
 
 Standard J1939 DM1 broadcast from SA 0xCA. Empty payload in all
 recorded captures (`00 00 00 00 00 00 FF FF`) because no MC faults
@@ -678,9 +713,9 @@ To measure PPR, probe pins 2 and 3 while spinning at a known RPM —
 see open questions.
 
 
-## Charger (SA 0xE5)
+### Charger (SA 0xE5)
 
-### FF50E5 — Charger telemetry — CONFIRMED (V, A, status)
+#### FF50E5 — Charger telemetry — CONFIRMED (V, A, status)
 
 Proprietary B frame from the on-board charger.
 
@@ -726,9 +761,9 @@ elsewhere (current best candidate: F108F3 byte 7 maintenance codes
 asserting when plug is inserted at 100 % SOC).
 
 
-## Vehicle controller (SA 0xD0)
+### Vehicle controller (SA 0xD0)
 
-### F100D0 — VC heartbeat — CONFIRMED (byte 0 OPC state)
+#### F100D0 — VC heartbeat — CONFIRMED (byte 0 OPC state)
 
 Same PGN as the BMS pack-status frame, disambiguated by source
 address. Broadcast at ~40 Hz.
