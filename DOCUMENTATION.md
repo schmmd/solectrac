@@ -44,25 +44,24 @@ off the pack (parts catalog Table 65).
 | Bus baud                  | —                                     | —                                                  | 250 kbaud (J1939 default)   | —                       | —        |
 | Cell P/N                  | —                                     | —                                                  | `SEPNI-8688190P-17.5AH-5P`  | —                       | `SEPNI8688190P-15Ah` (battery faceplate) |
 | Cells in parallel         | —                                     | —                                                  | 4 modules × 5P1S = 20P      | "~20 cells in parallel" | —        |
-| Cells in series           | —                                     | —                                                  | 20 (one per module)         | 20                      | —        |
 | Charging temp range       | 0–40 °C                               | —                                                  | —                           | —                       | —        |
 | Charging time             | 5.5 hr (Lvl 2, 220 VAC, 20→80%); 11 hr (Lvl 1, 110 VAC) | 8 hr (0→100%, on-board charger)  | —                           | —                       | —        |
 | Charging-target voltage   | 83 V                                  | 82 VDC (§9.1)                                      | —                           | —                       | —        |
-| Cluster supply            | —                                     | 12 V / 20 Ah aux battery                           | 12 V (accessory, not pack)  | Hardware                | —        |
+| Cluster supply            | —                                     | 12 V / 20 Ah aux battery                           | 12 V (accessory, not pack)  | —                       | —        |
 | Cycle life                | 2500 cycles @ 25 °C                   | 2500 cycles @ 25 °C                                | —                           | —                       | —        |
 | Main HV fuse              | —                                     | —                                                  | 350 A                       | —                       | —        |
 | Manufacture date          | —                                     | —                                                  | —                           | —                       | 2021-12-02 (battery faceplate) |
 | Nominal pack voltage      | 72 V                                  | 72 V (§1.2 plate, §9.1)                            | **73.0 V**                  | 72.0 V                  | 72 V (battery faceplate) |
 | Operating temp range      | −20 to 55 °C                          | —                                                  | —                           | —                       | —        |
-| Pack chemistry            | Li NMC                                | NMC (Li-ion)                                       | NMC                         | "NiCoMn"                | —        |
+| Pack chemistry            | Li NMC                                | NMC (Li-ion)                                       | NMC                         | NiCoMn                  | —        |
 | Pack model number         | —                                     | `EV-008-72V300Ah-01` (§1.2 plate)                  | —                           | —                       | `EV-008-72V300Ah-02` (battery faceplate) |
-| Pack serial number        | —                                     | —                                                  | —                           | —                       | NO.079 / QR `031PE0021Y020ABC20100079` (battery faceplate) |
+| Pack serial number        | —                                     | —                                                  | —                           | —                       | NO.079 / QR `031PE0021Y020ABC20100079` (sticker) (battery faceplate) |
 | Pack vendor               | —                                     | Soundon New Energy Technology Co., Ltd. (§1.2 plate) | "Escorts Solution"        | "ESCORTS-INTERNAL"      | Soundon New Energy Technology Co., Ltd. (engraved) + Escorts (sticker) (battery faceplate) |
 | Pack weight               | —                                     | 175 ± 15 kg (§1.2 plate)                           | —                           | —                       | 175 ± 15 kg (battery faceplate) |
 | Rated capacity            | 350 Ah                                | 300 Ah (270 Ah opt., §9.1; 300 Ah on §1.2 plate)   | **350 Ah**                  | 300 Ah                  | 300 Ah (battery faceplate) |
 | Rated charge (DC / AC)    | —                                     | charger out 3.3 kW @ 220 V; in AC 85–265 V, 50/60 Hz, IP67 | —                   | 78 A / 39 A             | —        |
 | Rated energy              | —                                     | 21.6 kWh (§1.2 plate)                              | 25.5 kWh @ 23 ± 2 °C        | —                       | 21.6 kWh (battery faceplate) |
-| Temperature probes        | —                                     | —                                                  | not stated                  | 7 active                | —        |
+| Temperature probes        | —                                     | —                                                  | -                           | 7 active                | 7 active (CAN captures) |
 | Voltage operating range   | —                                     | 60–84 V (§1.2 plate)                               | 60–84 V                     | —                       | 60–84 V (battery faceplate) |
 
 Five sources supply pack specs: the Solectrac **brochure**
