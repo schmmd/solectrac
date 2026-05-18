@@ -1116,10 +1116,10 @@ Code 51 is listed out of numeric order in the manual.
   CET operator manual, parts catalog, Curtis 1238 manual). The encoder
   connector pinout is now known — signal on pins 2 & 3, supply on
   pins 1 & 4 (see "Speed encoder connector" in the MC section) — so
-  tapping the pigtail is straightforward. Most likely findable by
-  reading the controller's parameter file with a Curtis 1313
-  programmer, or by spinning the motor at a known RPM and counting
-  pulses on pins 2 and 3. **Motor → wheel ground-speed conversion is
+  tapping the pigtail is straightforward. The Curtis parameter name
+  for PPR is **"Encoder Steps"** (from the code-88 DTC description);
+  readable directly with a Curtis 1313 programmer. Alternatively,
+  spin the motor at a known RPM and count pulses on pins 2 and 3. **Motor → wheel ground-speed conversion is
   resolved** via the operator manual's travel-speed table — see
   "Range → ground speed" in the MC section.
 
