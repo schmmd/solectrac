@@ -504,8 +504,7 @@ as the code on).
 Notable:
 
 - Code 146 ("Maintenance mode status") is listed in the manual but is **not**
-  encoded in F108
-  anywhere.
+  encoded in F108 anywhere.
 - Bit 6 genuinely re-asserts code 144 (re-verified with single-bit
   injection). Likely a severity-pair the dashboard renders
   identically.
@@ -545,7 +544,9 @@ real-time inverter feed).
 
 **Motor RPM.** Little-endian uint16 with bias 0x0C80 (=3200).  RPM is
 **magnitude only** — values below 0x0C80 are not emitted even in reverse.
-Reverse is signaled separately by data[7].
+Reverse is signaled separately by data[7]. Physical source is the
+2-channel A/B quadrature encoder on the motor shaft — see "Motor
+speed encoder" below for the MC-side pinout.
 
 **Throttle pedal position (data[0]).** Consistent with J1939 SPN 91
 (Accel Pedal Position 1) at 0.4 %/bit with raw 250 = 100 %:
@@ -646,7 +647,7 @@ non-zero values into FF21CA byte 7 flashed dashboard lamps but never
 produced a numeric code.
 
 
-### Speed encoder connector
+#### Motor speed encoder
 
 The motor's 2-channel A/B quadrature encoder (no Z pulse, PPR not
 yet measured) connects to the MC via a 4-pin IC pigtail. Pin
@@ -1047,18 +1048,11 @@ Code 51 is listed out of numeric order in the manual.
 - **Full running-mode enumeration.** Vendor GUI implies at least
   Calibrating, Charging, Discharging, Fault, Sleep beyond the
   init/standby/ready states observed.
-- **Second 2-pin CAN port — most likely BMS debug.** Schematic 5.7
-  shows the BMS exposing two CAN pairs: the main bus (CAN_H3/CAN_L3
-  on internal pins H/J, field-connector pins D/E) and a debug pair
-  (`CANDE-H`/`CANDE-L` on internal pins F/G) labeled "TO BMS DEBUG
-  CONNECTOR PIN-1/PIN-2". 120 Ω across the 2-pin pair (key-off,
-  nothing plugged in) electrically confirms it is a separate,
-  single-terminated bus — see the "Second 2-pin CAN port" section.
-  What remains open is *what protocol* runs on it; confirmation =
-  tap the connector and see if traffic resembles BMS-internal
-  diagnostic chatter. The previously-suspected "Kelly KLS hydraulic
-  CAN" interpretation is ruled out by schematic 5.11, which shows the
-  e-hydraulic controller has no CAN pins at all.
+- **Second 2-pin CAN port — traffic content unknown.** Identified as
+  the BMS debug pair via schematic 5.7 + 120 Ω measurement (see the
+  "Second 2-pin CAN port" section in CAN bus topology). What's on the
+  wire hasn't been captured — confirmation = tap the connector and
+  see if it resembles BMS-internal diagnostic chatter.
 - **UDAAN tool — identified, downloadable; one practical blocker.**
   UDAAN is the **UDAN iBMS Upper Utility** from Anhui UDAN Technology
   Co., Ltd. (Chinese BMS firmware/tool vendor; the physical pack is
@@ -1085,8 +1079,6 @@ Code 51 is listed out of numeric order in the manual.
 - **SA 0x12 role.** Emits a constant FF21 payload
   `01 00 00 00 00 00 00 00`. Distinct from FF21CA from 0xCA despite
   sharing a PGN.
-- **OPC timer duration — CONFIRMED 7 s** per service manual §Tractor
-  Controls SOP; VC heartbeat section updated.
 - **SA 0xD0 and 0xF4 physical home.** Schematic 5.10 only documents
   four CAN nodes (MC, BMS, Charger, Cluster). The OPC module shown on
   schematic 5.9 is wired entirely discretely (no CAN). So either the
@@ -1101,13 +1093,11 @@ Code 51 is listed out of numeric order in the manual.
 - **Motor encoder PPR.** Not documented in any manual (service manual,
   CET operator manual, parts catalog, Curtis 1238 manual). The encoder
   connector pinout is now known — signal on pins 2 & 3, supply on
-  pins 1 & 4 (see "Speed encoder connector" in the MC section) — so
+  pins 1 & 4 (see "Motor speed encoder" in the MC section) — so
   tapping the pigtail is straightforward. The Curtis parameter name
   for PPR is **"Encoder Steps"** (from the code-88 DTC description);
   readable directly with a Curtis 1313 programmer. Alternatively,
-  spin the motor at a known RPM and count pulses on pins 2 and 3. **Motor → wheel ground-speed conversion is
-  resolved** via the operator manual's travel-speed table — see
-  "Range → ground speed" in the MC section.
+  spin the motor at a known RPM and count pulses on pins 2 and 3.
 
 
 ## Sources
