@@ -209,12 +209,17 @@ The parts catalog identifies the e-hydraulic as a **Kelly KLS7212M /
 KLS7218** controller, which is a CAN-capable family. However, no CAN
 data has been found that is related to the hydraulic system.
 
-The rear 3-point hitch, lift, PTO, power steering, and remote
-hydraulics are all mechanical-hydraulic with no electrical interface
-(per the manual's Hydraulic System chapter, pp 295-319 — a fully
-mechanical Escorts design with draft + position levers, rocker
-top-link spring, mechanical position-feedback cam, manual auxiliary
-spool, and no solenoids/sensors/transducers anywhere).
+The rear 3-point hitch, lift, power steering, and remote hydraulics
+are fully mechanical-hydraulic with no electrical interface (per the
+manual's Hydraulic System chapter, pp 295-319 — a fully mechanical
+Escorts design with draft + position levers, rocker top-link spring,
+mechanical position-feedback cam, manual auxiliary spool, and no
+solenoids/sensors/transducers anywhere). The PTO shaft speed is
+purely mechanical, but PTO **engagement** uses a **wet clutch**
+controlled by a dashboard switch (service manual §1.4, switch C:
+"PTO Wet Clutch"); the wet clutch requires hydraulic pressure from
+the e-hydraulic pump to engage and oil flow for cooling, which is
+why the pump must be on for PTO operation.
 
 ### Bus termination
 
@@ -537,8 +542,8 @@ real-time inverter feed).
 | 1    | data[0]       | Throttle pedal position, raw (0..0xCC observed; SPN 91 candidate) |
 | 2    | data[1]       | 0x00 constant — fault-bitmap candidate (UNKNOWN)                  |
 | 3..4 | data[2..3] LE | **Motor RPM**: rpm = (le16) − 0x0C80                       |
-| 5    | data[4]       | Three-state field 0x28 / 0x3B / 0x3C — startup-calibration related (UNKNOWN) |
-| 6    | data[5]       | **Controller temperature**: °C = raw − 40                         |
+| 5    | data[4]       | **Controller temperature**: °C = raw − 40 (TENTATIVE)             |
+| 6    | data[5]       | **Motor temperature**: °C = raw − 40 (TENTATIVE)                  |
 | 7    | data[6]       | 0x00 constant — fault-bitmap candidate (UNKNOWN)                  |
 | 8    | data[7]       | **Packed transmission state** (high nibble = range, low = F/N/R)  |
 
@@ -561,8 +566,10 @@ resting offset ~3 (sensor noise); below raw ~14 the controller's dead
 band keeps RPM near 0. True 250-bit full-scale is a J1939-convention
 guess pending a "pedal mashed hard in F under load" capture.
 
-**Controller temperature (data[5]).** u8 with the J1939 +40 °C offset
-(53 → 13 °C). Near ambient across all captures.
+**Controller and motor temperatures (data[4], data[5]) — TENTATIVE.** Both u8 with
+the J1939 −40 °C offset. Raw 0 = not present (suppressed). data[4] is
+the Curtis 1238E controller (inverter electronics) and data[5] is the
+traction motor housing.
 
 **Packed transmission state (data[7]).**
 
