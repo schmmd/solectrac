@@ -24,8 +24,12 @@
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-const char* WIFI_SSID = "WIFI_SSID_PLACEHOLDER";
-const char* WIFI_PASS = "WIFI_PASS_PLACEHOLDER";
+#ifndef WIFI_SSID
+#error "Set WIFI_SSID env var before building"
+#endif
+#ifndef WIFI_PASS
+#error "Set WIFI_PASS env var before building"
+#endif
 
 #define CAN_TX_PIN GPIO_NUM_5
 #define CAN_RX_PIN GPIO_NUM_4
