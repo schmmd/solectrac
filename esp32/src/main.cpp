@@ -17,6 +17,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
 #include "driver/twai.h"
@@ -616,14 +617,56 @@ setInterval(refresh, 1000);
 </body></html>)");
 }
 
+// ── SLCAN ─────────────────────────────────────────────────────────────────────
+// Presents the CAN bus as an SLCAN device over USB CDC serial.
+// python-can: interface='slcan', channel='/dev/cu.usbmodem...'
+
+static char   slcan_buf[32];
+static uint8_t slcan_len = 0;
+static bool   slcan_open = false;
+
+void slcanSendFrame(const twai_message_t& msg) {
+    if (!slcan_open) return;
+    char line[32];
+    int n = snprintf(line, sizeof(line), "T%08" PRIX32 "%u",
+                     msg.identifier, msg.data_length_code);
+    for (int i = 0; i < msg.data_length_code; i++)
+        n += snprintf(line + n, sizeof(line) - n, "%02X", msg.data[i]);
+    line[n++] = '\r';
+    Serial.write((uint8_t*)line, n);
+}
+
+void slcanHandleCommand(const char* cmd) {
+    switch (cmd[0]) {
+        case 'O': slcan_open = true;  Serial.write('\r'); break;
+        case 'C': slcan_open = false; Serial.write('\r'); break;
+        case 'S': Serial.write('\r'); break;   // speed — fixed at 250k
+        case 'V': Serial.print("V1013\r"); break;
+        case 'N': Serial.print("NA000\r"); break;
+        case 'F': Serial.print("F00\r");   break;
+        default:  Serial.write('\r'); break;
+    }
+}
+
+void slcanPoll() {
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\r' || c == '\n') {
+            if (slcan_len > 0) {
+                slcan_buf[slcan_len] = '\0';
+                slcanHandleCommand(slcan_buf);
+                slcan_len = 0;
+            }
+        } else if (slcan_len < sizeof(slcan_buf) - 1) {
+            slcan_buf[slcan_len++] = c;
+        }
+    }
+}
+
 // ── Setup & loop ──────────────────────────────────────────────────────────────
 
 void setup() {
     Serial.begin(115200);
-    // Wait up to 3 s for the USB CDC host to connect before printing anything.
-    // Skip the wait if no host appears (e.g. battery-only power).
-    uint32_t t0 = millis();
-    while (!Serial && (millis() - t0) < 3000) delay(10);
 
     for (int i = 0; i < NUM_CELLS; i++) g_cell_v[i] = NAN;
     for (int i = 0; i < NUM_TEMPS; i++) g_temp_c[i] = NAN;
@@ -634,39 +677,30 @@ void setup() {
     twai_timing_config_t  tim_cfg = TWAI_TIMING_CONFIG_250KBITS();
     twai_filter_config_t  flt_cfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
     esp_err_t err = twai_driver_install(&can_cfg, &tim_cfg, &flt_cfg);
-    if (err != ESP_OK) {
-        Serial.printf("TWAI install failed: %s — running without CAN\n",
-                      esp_err_to_name(err));
-    } else {
+    if (err == ESP_OK) {
         err = twai_start();
-        if (err != ESP_OK)
-            Serial.printf("TWAI start failed: %s\n", esp_err_to_name(err));
-        else {
-            g_can_initialized = true;
-            Serial.println("TWAI (CAN) started at 250 kbit/s");
-        }
+        if (err == ESP_OK) g_can_initialized = true;
     }
 
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.print("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-    Serial.println();
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+    while (WiFi.status() != WL_CONNECTED) delay(500);
+
+    MDNS.begin("solectrac");
 
     server.on("/",     handleRoot);
     server.on("/data", handleData);
     server.begin();
-    Serial.println("HTTP server started — GET /data for JSON");
+    MDNS.addService("http", "tcp", 80);
 }
 
 void loop() {
-    // Drain all pending CAN frames before handling any HTTP request so the
-    // data is as fresh as possible when the response is built.
     twai_message_t msg;
     while (twai_receive(&msg, 0) == ESP_OK) {
-        if (msg.extd)   // J1939 uses 29-bit extended IDs
+        if (msg.extd) {
             decodeCAN(msg.identifier, msg.data, msg.data_length_code);
+            slcanSendFrame(msg);
+        }
     }
+    slcanPoll();
     server.handleClient();
 }
