@@ -222,6 +222,57 @@ float       g_session_wh_charged = 0.0f;
 
 WebServer server(80);
 
+// ── LED status indicator ──────────────────────────────────────────────────────
+// Built-in WS2812 RGB LED on ESP32-S3-DevKitC-1 (RGB_BUILTIN, GPIO 48).
+//   Red blink     — CAN driver failed to initialize
+//   Amber blink   — Wi-Fi not connected
+//   Dim white     — Alive, no CAN frames received recently
+//   Green blink   — CAN frames arriving (toggles on bus activity)
+
+#define LED_BLINK_MS  50    // half-period for blink states
+#define LED_ACTIVE_MS 200   // frame age below which bus is "active"
+
+static uint32_t g_led_last_toggle = 0;
+static bool     g_led_on = false;
+
+static inline void ledWrite(uint8_t r, uint8_t g, uint8_t b) {
+#ifdef RGB_BUILTIN
+  #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    rgbLedWrite(RGB_BUILTIN, r, g, b);
+  #else
+    neopixelWrite(RGB_BUILTIN, r, g, b);
+  #endif
+#endif
+}
+
+void updateLed() {
+    uint32_t now = millis();
+    bool toggle = (now - g_led_last_toggle) >= LED_BLINK_MS;
+
+    if (!g_can_initialized) {
+        if (toggle) { g_led_last_toggle = now; g_led_on = !g_led_on; }
+        ledWrite(g_led_on ? 32 : 0, 0, 0);
+        return;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        if (toggle) { g_led_last_toggle = now; g_led_on = !g_led_on; }
+        ledWrite(g_led_on ? 24 : 0, g_led_on ? 12 : 0, 0);
+        return;
+    }
+    bool active = (g_frames_rx > 0) && (now - g_last_frame_ms < LED_ACTIVE_MS);
+    if (!active) {
+        ledWrite(4, 4, 4);
+        g_led_on = false;
+        g_led_last_toggle = now;
+        return;
+    }
+    if (toggle) {
+        g_led_last_toggle = now;
+        g_led_on = !g_led_on;
+    }
+    ledWrite(0, g_led_on ? 32 : 0, 0);
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 static inline uint16_t be16(uint8_t hi, uint8_t lo) {
@@ -945,6 +996,8 @@ void slcanPoll() {
 void setup() {
     Serial.begin(115200);
 
+    ledWrite(4, 4, 4);   // dim white the moment firmware starts running
+
     for (int i = 0; i < NUM_CELLS; i++) g_cell_v[i] = NAN;
     for (int i = 0; i < NUM_TEMPS; i++) g_temp_c[i] = NAN;
 
@@ -964,7 +1017,10 @@ void setup() {
     }
 
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    while (WiFi.status() != WL_CONNECTED) delay(500);
+    while (WiFi.status() != WL_CONNECTED) {
+        updateLed();
+        delay(50);
+    }
 
     MDNS.begin("solectrac");
 
@@ -984,4 +1040,5 @@ void loop() {
     }
     slcanPoll();
     server.handleClient();
+    updateLed();
 }
