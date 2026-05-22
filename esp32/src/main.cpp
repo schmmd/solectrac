@@ -223,25 +223,31 @@ float       g_session_wh_charged = 0.0f;
 WebServer server(80);
 
 // ── LED status indicator ──────────────────────────────────────────────────────
-// Built-in WS2812 RGB LED on ESP32-S3-DevKitC-1 (RGB_BUILTIN, GPIO 48).
+// Adafruit ESP32-S3 Reverse TFT Feather has a NeoPixel on GPIO 33 whose power
+// rail is gated by GPIO 21 — both must be driven before any colour is visible.
 //   Red blink     — CAN driver failed to initialize
 //   Amber blink   — Wi-Fi not connected
 //   Dim white     — Alive, no CAN frames received recently
 //   Green blink   — CAN frames arriving (toggles on bus activity)
 
-#define LED_BLINK_MS  50    // half-period for blink states
-#define LED_ACTIVE_MS 200   // frame age below which bus is "active"
+#define LED_PIN          GPIO_NUM_33
+#define LED_POWER_PIN    GPIO_NUM_21
+#define LED_BLINK_MS     50
+#define LED_ACTIVE_MS    200
 
 static uint32_t g_led_last_toggle = 0;
 static bool     g_led_on = false;
 
+static inline void ledInit() {
+    pinMode(LED_POWER_PIN, OUTPUT);
+    digitalWrite(LED_POWER_PIN, HIGH);   // enable NeoPixel power rail
+}
+
 static inline void ledWrite(uint8_t r, uint8_t g, uint8_t b) {
-#ifdef RGB_BUILTIN
-  #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-    rgbLedWrite(RGB_BUILTIN, r, g, b);
-  #else
-    neopixelWrite(RGB_BUILTIN, r, g, b);
-  #endif
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    rgbLedWrite(LED_PIN, r, g, b);
+#else
+    neopixelWrite(LED_PIN, r, g, b);
 #endif
 }
 
@@ -996,6 +1002,7 @@ void slcanPoll() {
 void setup() {
     Serial.begin(115200);
 
+    ledInit();
     ledWrite(4, 4, 4);   // dim white the moment firmware starts running
 
     for (int i = 0; i < NUM_CELLS; i++) g_cell_v[i] = NAN;
