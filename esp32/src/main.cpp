@@ -949,9 +949,13 @@ void setup() {
     for (int i = 0; i < NUM_CELLS; i++) g_cell_v[i] = NAN;
     for (int i = 0; i < NUM_TEMPS; i++) g_temp_c[i] = NAN;
 
-    // CAN at 250 kbit/s (J1939 standard)
+    // CAN at 250 kbit/s (J1939 standard). Default rx_queue_len is 5, which
+    // overflows when server.handleClient() blocks the loop building JSON.
+    // 128 gives ~0.5 s of buffer at full bus utilisation.
     twai_general_config_t can_cfg = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
+    can_cfg.rx_queue_len = 128;
+    can_cfg.tx_queue_len = 32;
     twai_timing_config_t  tim_cfg = TWAI_TIMING_CONFIG_250KBITS();
     twai_filter_config_t  flt_cfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
     esp_err_t err = twai_driver_install(&can_cfg, &tim_cfg, &flt_cfg);
