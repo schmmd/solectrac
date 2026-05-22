@@ -1822,8 +1822,13 @@ def open_source(args):
     """Return either a python-can Bus (live) or LogReader (replay)."""
     if args.replay:
         return can.LogReader(args.replay), "replay"
-    return can.Bus(interface=args.interface, channel=args.channel,
-                   bitrate=args.bitrate), "live"
+    kwargs = dict(interface=args.interface, channel=args.channel,
+                  bitrate=args.bitrate)
+    if args.host:
+        kwargs["host"] = args.host
+    if args.port:
+        kwargs["port"] = args.port
+    return can.Bus(**kwargs), "live"
 
 
 # --- main -------------------------------------------------------------------
@@ -1840,6 +1845,10 @@ def main() -> int:
                    help="bus channel for live capture (e.g. can0)")
     p.add_argument("--bitrate", type=int, default=250000,
                    help="bus bitrate for live capture (default 250000)")
+    p.add_argument("--host",
+                   help="remote host for network interfaces (e.g. socketcand)")
+    p.add_argument("--port", type=int,
+                   help="remote port for network interfaces (e.g. socketcand)")
     p.add_argument("--raw-log",
                    help="write a python-can log of all received frames")
     p.add_argument("--mains-v", type=float, default=120.0,
