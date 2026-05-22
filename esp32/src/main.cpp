@@ -215,8 +215,8 @@ uint32_t    g_last_frame_ms  = 0;   // millis() at last received frame
 bool        g_can_initialized = false;
 
 // Session energy tracking (integrated power since boot)
-uint32_t    g_session_start_ms  = 0;   // set on first F100 frame
 uint32_t    g_session_last_ms   = 0;
+uint32_t    g_session_active_ms = 0;   // sum of valid dt's — excludes bus-silent gaps
 float       g_session_wh_drawn  = 0.0f;
 float       g_session_wh_charged = 0.0f;
 
@@ -294,10 +294,11 @@ void decodeCAN(uint32_t can_id, const uint8_t* raw, uint8_t len) {
 
             // Integrate power into session energy counters
             uint32_t now = millis();
-            if (g_session_start_ms == 0) g_session_start_ms = now;
             if (g_session_last_ms != 0) {
-                float dt_s = (now - g_session_last_ms) / 1000.0f;
-                if (dt_s > 0 && dt_s < 5.0f) {   // sanity: skip large gaps
+                uint32_t dt_ms = now - g_session_last_ms;
+                float dt_s = dt_ms / 1000.0f;
+                if (dt_s > 0 && dt_s < 5.0f) {   // sanity: skip bus-silent gaps
+                    g_session_active_ms += dt_ms;
                     // power_w: positive = charging, negative = discharging
                     float wh = g_pack.power_w * dt_s / 3600.0f;
                     if (wh > 0) g_session_wh_charged += wh;
@@ -485,19 +486,21 @@ String buildJson() {
     addFloat(pack, "power_w",      g_pack.power_w,   1);
     if (g_pack.soc_raw)            pack["soc_raw"]  = g_pack.soc_raw;
     addFloat(pack, "soc_pct",      g_pack.soc_pct,   1);
-    if (g_pack.cell_max_mv >= 0)   pack["cell_max_mv"]   = g_pack.cell_max_mv;
-    if (g_pack.cell_min_mv >= 0)   pack["cell_min_mv"]   = g_pack.cell_min_mv;
-    if (g_pack.cell_spread_mv >= 0)pack["cell_spread_mv"]= g_pack.cell_spread_mv;
-    if (g_pack.cell_max_n)         pack["cell_max_n"]    = g_pack.cell_max_n;
-    if (g_pack.cell_min_n)         pack["cell_min_n"]    = g_pack.cell_min_n;
-    if (g_pack.cell_spread_mv_reported >= 0)
-        pack["cell_spread_mv_reported"] = g_pack.cell_spread_mv_reported;
     addFloat(pack, "v_estimate",   g_pack.v_estimate, 3);
-    if (g_pack.temp_max_c != INT8_MIN) pack["temp_max_c"]    = g_pack.temp_max_c;
-    if (g_pack.temp_min_c != INT8_MIN) pack["temp_min_c"]    = g_pack.temp_min_c;
-    if (g_pack.temp_max_n)         pack["temp_max_n"]    = g_pack.temp_max_n;
-    if (g_pack.temp_min_n)         pack["temp_min_n"]    = g_pack.temp_min_n;
-    if (g_pack.temp_spread_c >= 0) pack["temp_spread_c"] = g_pack.temp_spread_c;
+    auto cells_obj = pack["cells"].to<JsonObject>();
+    if (g_pack.cell_max_mv >= 0)   cells_obj["max_mv"]    = g_pack.cell_max_mv;
+    if (g_pack.cell_min_mv >= 0)   cells_obj["min_mv"]    = g_pack.cell_min_mv;
+    if (g_pack.cell_spread_mv >= 0)cells_obj["spread_mv"] = g_pack.cell_spread_mv;
+    if (g_pack.cell_max_n)         cells_obj["max_n"]     = g_pack.cell_max_n;
+    if (g_pack.cell_min_n)         cells_obj["min_n"]     = g_pack.cell_min_n;
+    if (g_pack.cell_spread_mv_reported >= 0)
+        cells_obj["spread_mv_reported"] = g_pack.cell_spread_mv_reported;
+    auto temp = cells_obj["temp_summary"].to<JsonObject>();
+    if (g_pack.temp_max_c != INT8_MIN) temp["max_c"]    = g_pack.temp_max_c;
+    if (g_pack.temp_min_c != INT8_MIN) temp["min_c"]    = g_pack.temp_min_c;
+    if (g_pack.temp_max_n)             temp["max_n"]    = g_pack.temp_max_n;
+    if (g_pack.temp_min_n)             temp["min_n"]    = g_pack.temp_min_n;
+    if (g_pack.temp_spread_c >= 0)     temp["spread_c"] = g_pack.temp_spread_c;
 
     // Session energy summary
     auto sess = doc["session"].to<JsonObject>();
@@ -506,14 +509,14 @@ String buildJson() {
     sess["wh_net"]     = roundf((g_session_wh_drawn - g_session_wh_charged) * 10.0f) / 10.0f;
     sess["wh_capacity"] = PACK_CAPACITY_WH;
 
-    // Session-average net power (positive = net discharge, negative = net charge)
+    // Session-average net power (positive = net discharge, negative = net charge).
+    // Uses *active* time (sum of valid dt's), so bus-silent gaps don't dilute it.
     float avg_power_w = NAN;
-    if (g_session_start_ms != 0) {
-        float session_hours = (millis() - g_session_start_ms) / 3600000.0f;
-        if (session_hours > 0.01f) {                      // ≥ ~36 s of data
-            avg_power_w = (g_session_wh_drawn - g_session_wh_charged) / session_hours;
-            sess["avg_power_w"] = roundf(avg_power_w * 10.0f) / 10.0f;
-        }
+    float active_hours = g_session_active_ms / 3600000.0f;
+    if (active_hours > 0.01f) {                            // ≥ ~36 s of data
+        avg_power_w = (g_session_wh_drawn - g_session_wh_charged) / active_hours;
+        sess["avg_power_w"] = roundf(avg_power_w * 10.0f) / 10.0f;
+        sess["active_s"]    = g_session_active_ms / 1000;
     }
 
     if (!isnan(g_pack.soc_pct)) {
@@ -531,17 +534,15 @@ String buildJson() {
         }
     }
 
-    // Individual cells (20 slots; null if not yet received)
-    auto cells = doc["cells"].to<JsonArray>();
+    // Per-cell arrays (20 voltages, 7 temperatures; null if not yet received)
+    auto cells = cells_obj["voltages"].to<JsonArray>();
     for (int i = 0; i < NUM_CELLS; i++) {
         if (!isnan(g_cell_v[i]))
             cells.add(roundf(g_cell_v[i] * 1000.0f) / 1000.0f);
         else
             cells.add(nullptr);
     }
-
-    // Module temperatures (7 slots; null if not yet received)
-    auto temps = doc["temps"].to<JsonArray>();
+    auto temps = cells_obj["temp_readings"].to<JsonArray>();
     for (int i = 0; i < NUM_TEMPS; i++) {
         if (!isnan(g_temp_c[i]))
             temps.add((int)g_temp_c[i]);
@@ -573,17 +574,18 @@ String buildJson() {
         lim["byte5"] = g_bms_limit.byte5;
     }
 
-    // BMS faults
+    // Combined fault codes (BMS + Motor Controller)
+    auto faults = doc["faults"].to<JsonObject>();
+    auto bms_codes = faults["bms"].to<JsonArray>();
     if (g_bms_faults.any_fault) {
-        auto flt = doc["bms"]["faults"].to<JsonObject>();
-        auto raw_bytes = flt["bytes"].to<JsonArray>();
-        for (int i = 0; i < 8; i++) raw_bytes.add(g_bms_faults.bytes[i]);
-        auto codes = flt["active_codes"].to<JsonArray>();
         for (int code = 100; code <= 145; code++) {
             if (g_bms_faults.active_codes_mask & (1ULL << (code - 100)))
-                codes.add(code);
+                bms_codes.add(code);
         }
     }
+    auto mc_codes = faults["mc"].to<JsonArray>();
+    if (g_dm1.valid && g_dm1.dtc_spn != 0)
+        mc_codes.add(g_dm1.dtc_spn);
 
     // Motor
     if (g_motor.valid) {
@@ -641,7 +643,7 @@ String buildJson() {
     if (g_dash_alive != 0xFF)
         doc["dash"]["alive"] = g_dash_alive;
 
-    // DM1
+    // DM1 (raw FMI/OC/CM and lamp bytes — fault code is also in faults.mc)
     if (g_dm1.valid) {
         auto dm1 = doc["dm1"].to<JsonObject>();
         dm1["lamp_byte0"] = g_dm1.lamp_byte0;
@@ -740,6 +742,44 @@ h3{font-size:.68em;text-transform:uppercase;letter-spacing:.1em;color:#757575;ma
 const f=(v,d=1)=>v==null?'–':v.toFixed(d);
 const fi=v=>v==null?'–':(v>=0?'+':'')+v.toFixed(1);
 function kv(k,v){return'<div class="kv"><span class="k">'+k+'</span><span>'+v+'</span></div>';}
+var MC_FAULTS={
+  12:'Controller Over Current',13:'Current Sensor Fault',
+  15:'Controller Severe Undertemp',16:'Controller Severe Overtemp',
+  17:'Severe B+ Undervoltage',18:'Severe B+ Overvoltage',
+  22:'Controller Over Temp Cutback',23:'B+ Undervoltage Cutback',
+  24:'B+ Overvoltage Cutback',25:'+5V Supply Failure',
+  26:'Motor Temp Hot Cutback',29:'Motor Temp Sensor Fault',
+  31:'Coil1 Driver Open/Short / Main Open/Short',
+  32:'Coil2 Driver Open/Short / EM Brake Open/Short',
+  36:'Encoder Fault / Sin/Cos Sensor Fault',37:'Motor Open',
+  38:'Main Contactor Welded',39:'Main Contactor Did Not Close',
+  41:'Throttle Wiper High',42:'Throttle Wiper Low',
+  43:'Pot2 Wiper High',44:'Pot2 Wiper Low',
+  45:'Pot Low Over Current',47:'HPD/Sequencing Fault',
+  49:'Parameter Change Fault / PDO Timeout',
+  71:'Stall Detected / Vehicle lock without applying hand brake',
+  83:'Driver Supply',87:'Motor Characterization Fault',
+  89:'Encoder Pulse Count Fault / Motor Type Fault',
+  92:'EM Brake failed to set',99:'Parameter Mismatch'
+};
+var BMS_FAULTS={
+  100:'SOC too high',101:'SOC too low',
+  102:'Total voltage too high',103:'Total voltage too low',
+  104:'Charge current fault',105:'Discharge current fault',
+  106:'Battery temp too low',107:'Battery temp too high',
+  108:'Battery under voltage',109:'Battery over voltage',
+  110:'Battery temp unbalance',111:'Battery voltage unbalance',
+  112:'Battery does not match',113:'Output pole temp too high',
+  116:'Memory parameters fault',117:'Data memory fault',
+  118:'Cell voltage detection fault',119:'Temperature detection fault',
+  120:'Current detection fault',121:'Internal total voltage detection fault',
+  122:'External total voltage detection fault',123:'Insulation monitoring fault',
+  124:'Clock fault',125:'Internal CAN comm fault',
+  126:'Serious insulation fault',127:'Slight insulation fault',
+  140:'System fault level',142:'BMS fault — maintenance',
+  143:'Battery fault — maintenance',144:'Battery system fault — maintenance',
+  145:'Needs full charge/discharge cycle',146:'Maintenance mode status'
+};
 function fwh(wh){
   if(wh==null)return'–';
   if(Math.abs(wh)>=1000)return(wh/1000).toFixed(2)+' kWh';
@@ -753,14 +793,17 @@ function feta(s){
 }
 function update(d){
   const p=d.pack||{},m=d.motor||{},can=d.can||{};
+  const pc=p.cells||{},pt=pc.temp_summary||{};
   const bst=(d.bms&&d.bms.state)||{};
-  const flt=d.bms&&d.bms.faults,chg=d.charger||{},cmd=d.chgr_cmd||{};
+  const fts=d.faults||{},chg=d.charger||{},cmd=d.chgr_cmd||{};
   const s=d.session||{};
   const al=[];
-  if(flt&&flt.active_codes&&flt.active_codes.length)
-    al.push('BMS Fault codes: '+flt.active_codes.join(', '));
-  if(d.dm1&&d.dm1.dtc_spn)
-    al.push('Motor DTC — SPN '+d.dm1.dtc_spn+' FMI '+d.dm1.dtc_fmi+' (oc='+d.dm1.dtc_oc+')');
+  (fts.bms||[]).forEach(function(c){
+    al.push('BMS '+c+(BMS_FAULTS[c]?' ('+BMS_FAULTS[c]+')':''));
+  });
+  (fts.mc||[]).forEach(function(c){
+    al.push('MC '+c+(MC_FAULTS[c]?' ('+MC_FAULTS[c]+')':''));
+  });
   document.getElementById('al').innerHTML=al.map(function(a){return'<div class="alert">⚠ '+a+'</div>';}).join('');
   const soc=p.soc_pct,scls=soc==null?'':soc<20?'bad':soc<40?'warn':'ok';
   const cur=p.current_a,pwr=p.power_w;
@@ -807,11 +850,11 @@ function update(d){
     }).join('');
   document.getElementById('mid').innerHTML=
     '<div class="card"><h3>Cell</h3>'+
-    kv('Max',(p.cell_max_mv!=null?(p.cell_max_mv/1000).toFixed(3):'–')+' V (#'+(p.cell_max_n||'?')+')')+
-    kv('Min',(p.cell_min_mv!=null?(p.cell_min_mv/1000).toFixed(3):'–')+' V (#'+(p.cell_min_n||'?')+')')+
-    kv('Spread',p.cell_spread_mv!=null?(p.cell_spread_mv+' mV'+(p.cell_max_mv&&p.cell_min_mv?' ('+(p.cell_spread_mv/((p.cell_max_mv+p.cell_min_mv)/2)*100).toFixed(2)+'%)':'')):'–')+
-    kv('Temp max',p.temp_max_c!=null?p.temp_max_c+'°C':'–')+
-    kv('Temp min',p.temp_min_c!=null?p.temp_min_c+'°C':'–')+
+    kv('Max',(pc.max_mv!=null?(pc.max_mv/1000).toFixed(3):'–')+' V (#'+(pc.max_n||'?')+')')+
+    kv('Min',(pc.min_mv!=null?(pc.min_mv/1000).toFixed(3):'–')+' V (#'+(pc.min_n||'?')+')')+
+    kv('Spread',pc.spread_mv!=null?(pc.spread_mv+' mV'+(pc.max_mv&&pc.min_mv?' ('+(pc.spread_mv/((pc.max_mv+pc.min_mv)/2)*100).toFixed(2)+'%)':'')):'–')+
+    kv('Temp max',pt.max_c!=null?pt.max_c+'°C':'–')+
+    kv('Temp min',pt.min_c!=null?pt.min_c+'°C':'–')+
     '</div>'+
     '<div class="card"><h3>Motor</h3>'+
     kv('RPM',m.rpm_magnitude!=null?m.rpm_magnitude:'–')+
