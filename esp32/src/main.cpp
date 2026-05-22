@@ -11,8 +11,8 @@
  *   your wiring.
  *
  * Endpoints:
- *   GET /       — browser-friendly auto-refreshing page
- *   GET /data   — raw JSON
+ *   GET /       — mobile-friendly dashboard (auto-refreshing)
+ *   GET /json   — raw JSON
  */
 
 #include <Arduino.h>
@@ -31,8 +31,8 @@
 #error "Set WIFI_PASS env var before building"
 #endif
 
-#define CAN_TX_PIN GPIO_NUM_5
-#define CAN_RX_PIN GPIO_NUM_4
+#define CAN_TX_PIN GPIO_NUM_8
+#define CAN_RX_PIN GPIO_NUM_14
 
 // ── J1939 source addresses ────────────────────────────────────────────────────
 
@@ -72,6 +72,7 @@
 #define RPM_BIAS                0x0C80   // raw u16 value at 0 RPM
 #define LIMIT_CURRENT_LSB_A     0.01f    // A per bit for F107 limits
 #define CHARGER_I_LSB_A         0.1f     // A per bit for charger current
+#define PACK_CAPACITY_WH        25000.0f // nominal usable pack energy (Solectrac e25 spec)
 
 // ── BMS fault code tables ─────────────────────────────────────────────────────
 // Bytes 0–6: each element maps one bit (LSB first) to a vendor fault code.
@@ -126,11 +127,11 @@ struct BmsStateFlags {
     bool charging        : 1;
     bool charger_present : 1;
     bool drive_mode      : 1;
-    bool contactors      : 1;
+    bool awake           : 1;
     bool valid           : 1;
     BmsStateFlags() : output_enable(false), main_contactor(false),
         operating(false), standby(false), charging(false),
-        charger_present(false), drive_mode(false), contactors(false),
+        charger_present(false), drive_mode(false), awake(false),
         valid(false) {}
 };
 
@@ -213,6 +214,12 @@ uint32_t    g_frames_decoded = 0;   // frames matching a known PGN/source
 uint32_t    g_last_frame_ms  = 0;   // millis() at last received frame
 bool        g_can_initialized = false;
 
+// Session energy tracking (integrated power since boot)
+uint32_t    g_session_start_ms  = 0;   // set on first F100 frame
+uint32_t    g_session_last_ms   = 0;
+float       g_session_wh_drawn  = 0.0f;
+float       g_session_wh_charged = 0.0f;
+
 WebServer server(80);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -275,7 +282,8 @@ void decodeCAN(uint32_t can_id, const uint8_t* raw, uint8_t len) {
         } else if (pgn == PGN_F100) {
             if (allZero(d)) return;
             uint16_t raw_cur = be16(d[2], d[3]);
-            float amps  = ((int32_t)raw_cur - PACK_CURRENT_BIAS_RAW) * PACK_CURRENT_LSB_A;
+            // Sign convention: positive = charging, negative = discharging.
+            float amps  = -((int32_t)raw_cur - PACK_CURRENT_BIAS_RAW) * PACK_CURRENT_LSB_A;
             float volts = d[1] * PACK_VOLTAGE_LSB_V + PACK_VOLTAGE_OFFSET_V;
             g_pack.voltage_v   = volts;
             g_pack.current_raw = raw_cur;
@@ -283,6 +291,20 @@ void decodeCAN(uint32_t can_id, const uint8_t* raw, uint8_t len) {
             g_pack.power_w     = volts * amps;
             g_pack.soc_raw     = d[4];
             g_pack.soc_pct     = d[4] * 0.4f - 0.8f;
+
+            // Integrate power into session energy counters
+            uint32_t now = millis();
+            if (g_session_start_ms == 0) g_session_start_ms = now;
+            if (g_session_last_ms != 0) {
+                float dt_s = (now - g_session_last_ms) / 1000.0f;
+                if (dt_s > 0 && dt_s < 5.0f) {   // sanity: skip large gaps
+                    // power_w: positive = charging, negative = discharging
+                    float wh = g_pack.power_w * dt_s / 3600.0f;
+                    if (wh > 0) g_session_wh_charged += wh;
+                    else        g_session_wh_drawn   += -wh;
+                }
+            }
+            g_session_last_ms = now;
 
         } else if (pgn == PGN_F102) {
             if (allZero(d)) return;
@@ -316,7 +338,7 @@ void decodeCAN(uint32_t can_id, const uint8_t* raw, uint8_t len) {
             g_bms_state.charging       = (d[1] & 0x08) != 0;
             g_bms_state.charger_present= (d[1] & 0x04) != 0;
             g_bms_state.drive_mode     = (d[1] & 0x20) != 0;
-            g_bms_state.contactors     = (d[1] & 0x40) != 0;
+            g_bms_state.awake          = (d[1] & 0x40) != 0;
             g_bms_state.valid          = true;
 
         } else if (pgn == PGN_F107) {
@@ -477,6 +499,38 @@ String buildJson() {
     if (g_pack.temp_min_n)         pack["temp_min_n"]    = g_pack.temp_min_n;
     if (g_pack.temp_spread_c >= 0) pack["temp_spread_c"] = g_pack.temp_spread_c;
 
+    // Session energy summary
+    auto sess = doc["session"].to<JsonObject>();
+    sess["wh_drawn"]   = roundf(g_session_wh_drawn   * 10.0f) / 10.0f;
+    sess["wh_charged"] = roundf(g_session_wh_charged * 10.0f) / 10.0f;
+    sess["wh_net"]     = roundf((g_session_wh_drawn - g_session_wh_charged) * 10.0f) / 10.0f;
+    sess["wh_capacity"] = PACK_CAPACITY_WH;
+
+    // Session-average net power (positive = net discharge, negative = net charge)
+    float avg_power_w = NAN;
+    if (g_session_start_ms != 0) {
+        float session_hours = (millis() - g_session_start_ms) / 3600000.0f;
+        if (session_hours > 0.01f) {                      // ≥ ~36 s of data
+            avg_power_w = (g_session_wh_drawn - g_session_wh_charged) / session_hours;
+            sess["avg_power_w"] = roundf(avg_power_w * 10.0f) / 10.0f;
+        }
+    }
+
+    if (!isnan(g_pack.soc_pct)) {
+        float remaining = g_pack.soc_pct * PACK_CAPACITY_WH / 100.0f;
+        sess["wh_remaining"] = roundf(remaining * 10.0f) / 10.0f;
+        // ETAs use session-average power so they don't jump with instantaneous load
+        if (!isnan(avg_power_w)) {
+            if (avg_power_w > 50.0f) {
+                sess["eta_to_zero_s"] = (uint32_t)(remaining / avg_power_w * 3600.0f);
+            } else if (avg_power_w < -50.0f) {
+                float headroom = PACK_CAPACITY_WH - remaining;
+                if (headroom > 0)
+                    sess["eta_to_full_s"] = (uint32_t)(headroom / -avg_power_w * 3600.0f);
+            }
+        }
+    }
+
     // Individual cells (20 slots; null if not yet received)
     auto cells = doc["cells"].to<JsonArray>();
     for (int i = 0; i < NUM_CELLS; i++) {
@@ -507,7 +561,7 @@ String buildJson() {
         st["charging"]       = g_bms_state.charging       ? 1 : 0;
         st["charger_present"]= g_bms_state.charger_present? 1 : 0;
         st["drive_mode"]     = g_bms_state.drive_mode     ? 1 : 0;
-        st["contactors"]     = g_bms_state.contactors     ? 1 : 0;
+        st["awake"]          = g_bms_state.awake          ? 1 : 0;
     }
 
     // BMS current limits
@@ -595,30 +649,141 @@ String buildJson() {
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
-void handleData() {
+void handleJson() {
     server.send(200, "application/json", buildJson());
 }
 
 void handleRoot() {
-    server.send(200, "text/html", R"(<!DOCTYPE html>
-<html><head><title>Solectrac</title>
+    server.send(200, "text/html", R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Solectrac</title>
 <style>
-  body { background:#111; color:#0f0; font-family:monospace; padding:1em; }
-  pre  { white-space:pre-wrap; font-size:0.9em; }
-</style></head>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;color:#ddd;font-family:system-ui,sans-serif;padding:10px;max-width:600px;margin:0 auto}
+h3{font-size:.68em;text-transform:uppercase;letter-spacing:.1em;color:#555;margin-bottom:8px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:8px}
+@media(max-width:400px){.g4{grid-template-columns:1fr 1fr}}
+.card{background:#1e1e1e;border-radius:10px;padding:12px}
+.big{font-size:1.9em;font-weight:700;line-height:1.1}
+.unit{font-size:.5em;color:#777;font-weight:400}
+.sub{font-size:.72em;color:#555;margin-top:2px}
+.kv{display:flex;justify-content:space-between;align-items:center;font-size:.82em;padding:2px 0}
+.kv .k{color:#555}
+.dir{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px}
+.dirbtn{background:#1e1e1e;border-radius:10px;padding:16px 0;text-align:center;font-size:1.8em;font-weight:700;color:#3a3a3a;letter-spacing:.05em}
+.dirbtn.on{background:#1a3520;color:#6dbf6d}
+.pills{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+.pill{padding:3px 10px;border-radius:20px;font-size:.72em;background:#222;color:#555}
+.pill.on{background:#1a3520;color:#6dbf6d}
+.alert{background:#6f0000;border-radius:8px;padding:10px 12px;margin-bottom:8px;font-size:.9em;font-weight:600}
+#foot{text-align:center;font-size:.65em;color:#444;margin-top:10px;padding-bottom:4px}
+.ok{color:#4caf50}.warn{color:#ff9800}.bad{color:#ef5350}
+</style>
+</head>
 <body>
-<h2>Solectrac CAN Monitor</h2>
-<pre id="d">Loading…</pre>
+<div id="al"></div>
+<div class="g4" id="kpi"></div>
+<div class="card" style="margin-bottom:8px"><h3>Power Summary</h3><div id="psum"></div></div>
+<div class="dir" id="dir"></div>
+<div class="g2" id="mid"></div>
+<div class="pills" id="flags"></div>
+<div class="g2" id="bot"></div>
+<div id="foot">Connecting…</div>
 <script>
-function refresh() {
-  fetch('/data').then(r => r.text()).then(t => {
-    document.getElementById('d').textContent = t;
-  });
+const f=(v,d=1)=>v==null?'–':v.toFixed(d);
+const fi=v=>v==null?'–':(v>=0?'+':'')+v.toFixed(1);
+function kv(k,v){return'<div class="kv"><span class="k">'+k+'</span><span>'+v+'</span></div>';}
+function fwh(wh){
+  if(wh==null)return'–';
+  if(Math.abs(wh)>=1000)return(wh/1000).toFixed(2)+' kWh';
+  return Math.round(wh)+' Wh';
+}
+function feta(s){
+  if(s==null||s<=0)return'–';
+  if(s>360000)return'>100h';
+  var h=Math.floor(s/3600),m=Math.floor((s%3600)/60);
+  return h>0?h+'h '+m+'m':m+'m';
+}
+function update(d){
+  const p=d.pack||{},m=d.motor||{},can=d.can||{};
+  const bst=(d.bms&&d.bms.state)||{};
+  const flt=d.bms&&d.bms.faults,chg=d.charger||{},cmd=d.chgr_cmd||{};
+  const s=d.session||{};
+  const al=[];
+  if(flt&&flt.active_codes&&flt.active_codes.length)
+    al.push('BMS Fault codes: '+flt.active_codes.join(', '));
+  if(d.dm1&&d.dm1.dtc_spn)
+    al.push('Motor DTC — SPN '+d.dm1.dtc_spn+' FMI '+d.dm1.dtc_fmi+' (oc='+d.dm1.dtc_oc+')');
+  document.getElementById('al').innerHTML=al.map(function(a){return'<div class="alert">⚠ '+a+'</div>';}).join('');
+  const soc=p.soc_pct,scls=soc==null?'':soc<20?'bad':soc<40?'warn':'ok';
+  const cur=p.current_a,pwr=p.power_w;
+  const curLbl=cur==null?'':cur<-0.5?'discharge':cur>0.5?'charge':'idle';
+  document.getElementById('kpi').innerHTML=
+    '<div class="card"><h3>SoC</h3><div class="big '+scls+'">'+f(soc,0)+'<span class="unit">%</span></div><div class="sub">'+(s.wh_remaining!=null&&s.wh_capacity?(s.wh_remaining/1000).toFixed(2)+' / '+fwh(s.wh_capacity):'')+'</div></div>'+
+    '<div class="card"><h3>Voltage</h3><div class="big">'+f(p.voltage_v,1)+'<span class="unit">V</span></div><div class="sub">60 – 84 V range</div></div>'+
+    '<div class="card"><h3>Current</h3><div class="big">'+fi(cur)+'<span class="unit">A</span></div><div class="sub">'+curLbl+'</div></div>'+
+    '<div class="card"><h3>Power</h3><div class="big">'+(pwr!=null?(pwr/1000).toFixed(1):'–')+'<span class="unit">kW</span></div><div class="sub">'+(pwr!=null?Math.round(Math.abs(pwr)/150)+'% of 15 kW max':'')+'</div></div>';
+  const netCharging=s.wh_net!=null&&s.wh_net<0;
+  const etaLabel=netCharging?'ETA to 100%':'ETA to 0%';
+  const etaVal=netCharging?s.eta_to_full_s:s.eta_to_zero_s;
+  document.getElementById('psum').innerHTML=
+    kv('Session draw',fwh(s.wh_drawn))+
+    kv('Session charge',fwh(s.wh_charged))+
+    kv('Session net',(s.wh_net!=null&&s.wh_net>0?'+':'')+fwh(s.wh_net))+
+    kv(etaLabel,feta(etaVal));
+  document.getElementById('dir').innerHTML=
+    [['F',1],['N',0],['R',-1]].map(function(x){
+      return'<div class="dirbtn '+(m.direction===x[1]?'on':'')+'">'+x[0]+'</div>';
+    }).join('');
+  document.getElementById('mid').innerHTML=
+    '<div class="card"><h3>Cell</h3>'+
+    kv('Max',(p.cell_max_mv!=null?(p.cell_max_mv/1000).toFixed(3):'–')+' V (#'+(p.cell_max_n||'?')+')')+
+    kv('Min',(p.cell_min_mv!=null?(p.cell_min_mv/1000).toFixed(3):'–')+' V (#'+(p.cell_min_n||'?')+')')+
+    kv('Spread',p.cell_spread_mv!=null?(p.cell_spread_mv+' mV'+(p.cell_max_mv&&p.cell_min_mv?' ('+(p.cell_spread_mv/((p.cell_max_mv+p.cell_min_mv)/2)*100).toFixed(2)+'%)':'')):'–')+
+    kv('Temp max',p.temp_max_c!=null?p.temp_max_c+'°C':'–')+
+    kv('Temp min',p.temp_min_c!=null?p.temp_min_c+'°C':'–')+
+    '</div>'+
+    '<div class="card"><h3>Motor</h3>'+
+    kv('RPM',m.rpm_magnitude!=null?m.rpm_magnitude:'–')+
+    kv('Range','R'+(m.range_gear||'?'))+
+    kv('MC Temp',m.controller_temp_c!=null?m.controller_temp_c+'°C':'–')+
+    kv('Motor Temp',m.motor_temp_c!=null?m.motor_temp_c+'°C':'–')+
+    '</div>';
+  var flagDefs=[
+    ['Awake',bst.awake],['Drive Mode',bst.drive_mode],
+    ['Operating',bst.operating],['Standby',bst.standby],
+    ['Charging',bst.charging],['Charger Present',bst.charger_present],
+    ['Output Enabled',bst.output_enable],['Main Contactor',bst.main_contactor]
+  ];
+  document.getElementById('flags').innerHTML=flagDefs.map(function(x){
+    return'<div class="pill '+(x[1]?'on':'')+'">'+x[0]+'</div>';
+  }).join('');
+  var bot='';
+  if(d.charger){
+    var acSt=chg.line_ok?'<span class="ok">OK</span>':chg.no_line?'<span class="bad">No AC</span>':'–';
+    bot+='<div class="card" style="grid-column:1/-1"><h3>Charger</h3>'+
+      kv('Output V',f(chg.voltage_v))+kv('Output A',f(chg.current_a))+
+      kv('AC line',acSt)+kv('Cmd V / A',f(cmd.voltage_v)+' / '+f(cmd.current_a))+'</div>';
+  }
+  document.getElementById('bot').innerHTML=bot;
+  var age=can.last_frame_age_s;
+  var dot=can.state==='running'?'<span class="ok">●</span>':'<span class="bad">●</span>';
+  document.getElementById('foot').innerHTML=
+    dot+' '+can.state+' · '+(can.frames_rx||0)+' rx · age '+(age!=null?age.toFixed(1)+'s':'–')+' · up '+f(d.uptime/3600,1)+'h';
+}
+function refresh(){
+  fetch('/json').then(function(r){return r.json();}).then(update)
+    .catch(function(){document.getElementById('foot').textContent='Error — retrying…';});
 }
 refresh();
-setInterval(refresh, 1000);
+setInterval(refresh,1000);
 </script>
-</body></html>)");
+</body>
+</html>)HTML");
 }
 
 // ── SLCAN ─────────────────────────────────────────────────────────────────────
@@ -692,7 +857,7 @@ void setup() {
     MDNS.begin("solectrac");
 
     server.on("/",     handleRoot);
-    server.on("/data", handleData);
+    server.on("/json", handleJson);
     server.begin();
     MDNS.addService("http", "tcp", 80);
 }
