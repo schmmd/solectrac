@@ -314,9 +314,6 @@ static bool allZero(const uint8_t* d) {
 // ── CAN decoder ───────────────────────────────────────────────────────────────
 
 void decodeCAN(uint32_t can_id, const uint8_t* raw, uint8_t len) {
-    g_frames_rx++;
-    g_last_frame_ms = millis();
-
     uint8_t d[8] = {};
     memcpy(d, raw, len < 8 ? len : 8);
 
@@ -756,8 +753,14 @@ static bool   slcan_open = false;
 void slcanSendFrame(const twai_message_t& msg) {
     if (!slcan_open) return;
     char line[32];
-    int n = snprintf(line, sizeof(line), "T%08" PRIX32 "%u",
+    int n;
+    if (msg.extd) {
+        n = snprintf(line, sizeof(line), "T%08" PRIX32 "%u",
                      msg.identifier, msg.data_length_code);
+    } else {
+        n = snprintf(line, sizeof(line), "t%03" PRIX32 "%u",
+                     msg.identifier & 0x7FF, msg.data_length_code);
+    }
     for (int i = 0; i < msg.data_length_code; i++)
         n += snprintf(line + n, sizeof(line) - n, "%02X", msg.data[i]);
     line[n++] = '\r';
@@ -927,11 +930,12 @@ void setup() {
 void loop() {
     twai_message_t msg;
     while (twai_receive(&msg, 0) == ESP_OK) {
-        if (msg.extd) {
+        g_frames_rx++;
+        g_last_frame_ms = millis();
+        if (msg.extd)
             decodeCAN(msg.identifier, msg.data, msg.data_length_code);
-            slcanSendFrame(msg);
-            socketcandSendFrame(msg);
-        }
+        slcanSendFrame(msg);
+        socketcandSendFrame(msg);
     }
     slcanPoll();
     socketcandPoll();
