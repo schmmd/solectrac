@@ -1,651 +1,696 @@
-# iBMS PC Utility (v3.1.7) — Reverse Engineering Notes
+# Solectrac BMS Diagnostic Port
 
-## Installer Overview
+Reference for the diagnostic CAN port on the UDAN BMS shipped in the
+Solectrac e25 tractor (India 72V 300Ah variant). Covers wire protocol,
+session lifecycle, and the Data Identifier (DID) map. Reverse-engineering
+provenance and unresolved investigations are in the Appendix.
+
+Confidence markers used throughout: **CONFIRMED**, **TENTATIVE**, **UNKNOWN**.
+
+---
+
+## Pack identity
+
+| Field                              | Value                                 |
+|------------------------------------|---------------------------------------|
+| Variant                            | India 72V 300Ah, original (`印度系列72V300Ah原版`) |
+| UI / firmware project              | `C121.082.001.01`                     |
+| Hardware build string (DID 0xA50F) | `A650_C121.074.001.01_T1.0.2`         |
+| Firmware version (DID 0xF195)      | `3.0.4.4`                             |
+| BMS family                         | UDS-capable (P700 / U600 / X700 class) |
+| MCU (per UDAN symbol table)        | NXP S32K142 / S32K314 (ARM Cortex-M)  |
+| Flash                              | GD25Q64 (SPI NOR, 64 Mbit) + W25N01G (NAND, 1 Gbit) |
+
+The `C121.*` project numbers diverge between UI (`C121.082`) and hardware
+string (`C121.074`); TENTATIVE: firmware-project vs hardware-revision tag.
+
+## Pack structure (CONFIRMED)
+
+- Chemistry: NCM
+- Configuration: 20S × 1 subsystem
+- Rated capacity: 300 Ah; rated current: 500 A
+- Nominal pack voltage: 72 V (≈ 78.5 V at high SOC)
+- Temperature probes: 7 per subsystem
+- HV rails: B+, HV1 (Main+), HV2, HV3 active; HV4 / HV5 not used
+- Contactors: HSS1 (Main+), HSS2–HSS5, LSS1 (only HSS1 closed when idle)
+- "Calibrating" Running mode — TENTATIVE: this BMS's normal idle state,
+  not a special diagnostic mode
+
+---
+
+## Wire protocol
+
+### CAN parameters
+
+| Direction               | 11-bit ID | Notes                                |
+|-------------------------|-----------|--------------------------------------|
+| Tester → BMS (UDS req)  | `0x740`   | Only request ID this BMS responds to |
+| BMS → Tester (UDS resp) | `0x748`   |                                      |
+
+ISO-TP (ISO 15765-2) over CAN, 11-bit standard IDs. Bitrate: not measured
+directly, but the bus is shared with the OBD-II side at 250 kbit/s
+(see `DOCUMENTATION.md`).
+
+### UDS services in use
+
+| SID    | Service                 | Observed use                                  |
+|--------|-------------------------|-----------------------------------------------|
+| `0x10` | DiagnosticSessionControl | Enter extended session (`10 03`) before unlock |
+| `0x22` | ReadDataByIdentifier    | All live-data and identity reads              |
+| `0x27` | SecurityAccess          | Level 1 unlock (`27 01` seed, `27 02` key)    |
+| `0x31` | RoutineControl          | Six `0xF009`–`0xF011` routines, trigger UNKNOWN |
+| `0x34` / `0x36` / `0x37` | RequestDownload / TransferData / TransferExit | Bootstrap 1528 B write to `0x00003A00`, purpose UNKNOWN |
+
+DID notation: `0xXXXX` everywhere. Wire format is the standard UDS form:
+
+```
+Request:  03 22 02 09          PCI=3, SID=22, DID=0x0209
+Response: 05 62 02 09 00 00    PCI=5, SID|0x40=62, DID echoed, data
+```
+
+Responses longer than 7 bytes use ISO-TP first/consecutive framing.
+
+### Session lifecycle
+
+Default session is read-only for live data. Extended session + SecAccess L1
+are required before any write or routine call is honored.
+
+```
+1.  02 10 03                                 → 06 50 03 00 32 00 C8 00    DSC: enter extended session (P2 = 50 ms, P2* = 200 ms)
+2.  02 27 01                                 → 06 67 01 <4-byte seed>     SecAccess L1: request seed
+3.  06 27 02 <4-byte key>                    → 02 67 02                   SecAccess L1: send key
+```
+
+The L1 key algorithm is custom (Go source `uds_udan_key_calculator_YJC.go`
+inside `app/iBMSUpper.exe`). Cryptanalysis on 9 captured pairs has ruled
+out all simple/linear forms — see "SecAccess L1" in the reverse-engineering notes appendix.
+
+### Connection bootstrap
+
+The iBMS PC tool performs a fixed 11-step sequence on every connection
+(elapsed ~0.5 s, before any UI polling starts):
+
+| Step | Request                              | Purpose                                       |
+|------|--------------------------------------|-----------------------------------------------|
+| 1    | `22 A5 00`                           | Discovery probe (1-byte response, `01`)       |
+| 2    | `22 01 06`                           | UNKNOWN (2-byte response)                     |
+| 3    | `22 F1 95`                           | Firmware version (one-shot only)              |
+| 4    | `22 A5 0F`                           | Hardware/build string                         |
+| 5    | `22 28 00`                           | System state snapshot                         |
+| 6    | `10 03`                              | Enter extended session                        |
+| 7    | `27 01` / `27 02`                    | SecAccess L1 unlock                           |
+| 8    | `34 00 24 00 00 3A 00 05 F8`         | RequestDownload: 1528 B to `0x00003A00`       |
+| 9    | `36 01` / `36 02` / `36 03`          | TransferData (3 × ~516 B)                     |
+| 10   | `37`                                 | TransferExit                                  |
+| 11   | `22 A5 03`, `22 A5 05`, `22 A5 0D`   | Additional identity / status reads            |
+
+Steps 8–10 are the open mystery — see "Bootstrap RequestDownload" in the reverse-engineering notes appendix.
+
+---
+
+## Data Identifiers
+
+Organized by data category. UDAN message IDs (`0xNN`) refer to the
+iBMS-internal symbol table that names CSV exports; see "Message-ID symbol
+table" in the iBMS-software-notes appendix.
+
+### Identity (one-shot, or polled in baseline)
+
+| DID    | Type             | Sample value                              | Confidence |
+|--------|------------------|-------------------------------------------|------------|
+| `0xF195` | ASCII string   | `"3.0.4.4"` (FW version)                  | CONFIRMED  |
+| `0xA50F` | ASCII string   | `"A650_C121.074.001.01_T1.0.2"`           | CONFIRMED  |
+| `0xA500` | 1-byte flag    | `0x01` (discovery / liveness)             | TENTATIVE  |
+| `0xA503`, `0xA505`, `0xA50D` | varying (4–19 B) | Identity / status block | UNKNOWN |
+
+### Per-cell live data
+
+| DID    | UDAN tag           | Format                                       | Confidence |
+|--------|--------------------|----------------------------------------------|------------|
+| `0x0101` | `0x08` Voltages  | 20 × BE u16, mV                              | CONFIRMED  |
+| `0x0102` | `0x09` Temperatures | 7 × u8, `°C = raw − 40` (offset TENTATIVE) | CONFIRMED  |
+
+Sample `0x0101` payload (76.8 % SOC, idle):
+`3925 3925 3926 3926 3925 3924 3928 3927 3925 3925 3925 3923 3928 3926 3929 3929 3925 3927 3930 3929` mV.
+
+Sample `0x0102` payload: `41 41 41 41 40 41 41` → ~22 °C across 7 probes.
+
+### Pack-level state — DID `0x2800` (UDAN `0x93`)
+
+12 data bytes. Six BE uint16 fields; three identified by live-UI match:
+
+| Offset | BE u16   | Field                          | Sample          |
+|--------|----------|--------------------------------|-----------------|
+| 0      | `0x0312` | Real SOC × 10                  | 78.6 %          |
+| 2      | `0x03E8` | SOH × 10                       | 100.0 %         |
+| 4      | `0x0311` | HV1 / Pack voltage × 10        | 78.5 V          |
+| 6      | `0xFFED` | TENTATIVE: signed pack current | ≈ −0.2 A (idle) |
+| 8      | small    | UNKNOWN counter / flag         | 5–7             |
+| 10     | varies   | UNKNOWN                        | ~`0x33xx`       |
+
+### Peak data — DID cluster `0x2820`/`0x2828`/`0x2830`/`0x2838` (UDAN `0x06`)
+
+Each DID carries the top-4 extremes for one quantity. The iBMS UI and CSV
+export only the #1 entry per column; the BMS internally tracks four.
+
+| DID      | Tuple format                                                       | Sorted | Quantity                |
+|----------|--------------------------------------------------------------------|--------|-------------------------|
+| `0x2820` | 4 × (u16 BE voltage_mV, u8 subsys_0based, u8 cell_idx_0based)      | DESC   | Top-4 **max** cell V    |
+| `0x2828` | same                                                               | ASC    | Top-4 **min** cell V    |
+| `0x2830` | 4 × (u8 temp_raw, u8 subsys_0based, u8 probe_idx_0based)           | DESC   | Top-4 **max** probe T   |
+| `0x2838` | same                                                               | ASC    | Top-4 **min** probe T   |
+
+Cross-checks against `0x0101`: top-1 entries match the cell-array max
+(3930 mV at cell 18) and min (3923 mV at cell 11) exactly. Subsys byte is
+0-based internally (CSV reports 1-based).
+
+### Counters
+
+#### DID `0x2801` — (Dis)charged time (UDAN `0x95`)
+
+16 data bytes = 4 × BE uint32, all in seconds:
+
+| Offset | Sample      | Field                                                      |
+|--------|-------------|------------------------------------------------------------|
+| 0      | 832,857,443 | TENTATIVE: lifetime counter (ms or epoch-like); ticks 1/s  |
+| 4      | 1,329       | Session uptime; zero at boot, ticks 1/s                    |
+| 8      | 3,873,795   | Accumulated charge time (1076 h)                           |
+| 12     | 576,772     | Accumulated discharge / usage time (160 h)                 |
+
+**Heartbeat byte:** byte 3 of the payload (low byte of the offset-0 u32)
+increments by 1 every ~1 s — this is the byte exported as the `Heartbeat`
+column in the iBMS System-state CSV.
+
+#### DID `0x2810` — (Dis)charged energy (UDAN `0x89`)
+
+20 data bytes:
+
+| Offset | Width | Field                                                |
+|--------|-------|------------------------------------------------------|
+| 0–1    | u16   | Cell count (= 20)                                    |
+| 2–3    | u16   | Cycle count (= 7)                                    |
+| 4–7    | u32   | UNKNOWN (TENTATIVE: avg cell × scale)                |
+| 8–11   | u32   | UNKNOWN (instantaneous quantity)                     |
+| 12–15  | u32   | Accumulated charge capacity × 0.01 Ah                |
+| 16–19  | u32   | Accumulated discharge capacity × 0.01 Ah             |
+
+### Alarms — DID `0x4000` (UDAN `0x87`)
+
+31 data bytes, one severity-level enum per byte:
+
+- `0x00` — No Fault
+- `0x01` / `0x02` / `0x03` — TENTATIVE: Lvl 1 / 2 / 3 Alarm
+- `0xFF` — fault category not implemented on this BMS variant
+
+Constant idle payload (10 sentinels at fixed positions `{11, 12, 21, 24–30}`):
+
+```
+00 00 00 00 00 00 00 00 00 00 00 ff ff 00 00 00 00 00 00 00 00 ff 00 00 ff ff ff ff ff ff ff
+```
+
+The CSV export has ~73 fault columns; only ~21 are wired on this pack.
+Per-byte-to-column mapping needs an active fault to pin down.
+
+### Charging — DID cluster `0x0900` + `0x0901` + `0x0902` (UDAN `0x94`, TENTATIVE)
+
+Three DIDs polled in parallel during the Charge-info / BMS tab. Combined
+35 data bytes covers the 16 non-time CSV columns. Field layout is
+TENTATIVE — every observation so far has the charger disconnected.
+
+| DID      | Data (B) | Sample                                          | Interpretation                                  |
+|----------|----------|-------------------------------------------------|-------------------------------------------------|
+| `0x0900` | 7        | `01 00 01 00 00 00 00`                          | Enum/flag block (Charger conn., S2, Lock state) |
+| `0x0901` | 14       | `33 0c 00 00 33 0c 00 00 00 00 ff ff ff ff`     | Measurements; trailing `FF FF FF FF` = CC Res + CC2 Res sentinels |
+| `0x0902` | 14       | `00 00 00 00 00 00 00 00 00 00 00 00 00 00`     | All-zero in idle; likely fault / state machine  |
+
+### X700 IoT subsystem — DIDs `0xA501`, `0xA502`, `0xA506`, `0xA507`, `0xA50E`
+
+The BMS contains a built-in cellular telemetry subsystem ("X700"). Visible
+in the iBMS UI but unprovisioned on the shipped Solectrac unit. Schema
+exposed (all fields empty in observed unit):
+
+```
+HWID, FWVersion, HWVersion, DeviceName, Host, Port,
+APN UserName, APN Password, MQTT UserName, MQTT Password
+```
+
+UDAN message IDs `0x98` (WiFi info) and `0x9D` (WiFi / DTU) likely cover
+this data; explicit DID-to-field mapping UNKNOWN.
+
+### Calibration tables — `0x30xx` / `0x40xx` (~80 DIDs)
+
+Triggered by the SOC tab "Read" button: one-shot dump of ~80 DIDs in the
+`0x3010`, `0x3030`–`0x3093`, `0x30A0`–`0x30E6`, `0x3140`–`0x3153`,
+`0x4011`/`0x4012`, `0x4019`/`0x401A` ranges (plus `0x0E11`, `0x0E61`).
+Almost all responses are 35 B (32 B data after the `62 XX XX` header).
+
+Populate the iBMS Cap.config / SOC calib.config / HighSoc / LowSoc threshold
+tables. Numerically-paired DIDs (e.g. `0x3030`/`0x3031`) TENTATIVE:
+charge-vs-discharge or high-vs-low of the same parameter.
+
+### `0x28xx` address-space map
+
+The `0x28xx` range is segmented by purpose, not a single state block:
+
+| DID                | Content                                          |
+|--------------------|--------------------------------------------------|
+| `0x2800`           | System state                                     |
+| `0x2801`           | (Dis)charged time                                |
+| `0x2810`           | (Dis)charged energy                              |
+| `0x2820` / `0x2828`| Peak data — max-V / min-V                        |
+| `0x2830` / `0x2838`| Peak data — max-T / min-T                        |
+| `0x2832` / `0x283A`| Empty on this pack — TENTATIVE: subsystem-2 slots |
+| `0x2850`           | UNKNOWN 2-byte block                             |
+| `0x2803`, `0x2804` | Cell-level extremum / index (Cell info tab)      |
+
+### DIDs observed but not yet identified
+
+These are polled by the iBMS but not yet mapped to a known UDAN message:
+
+| Range                                                  | Notes |
+|--------------------------------------------------------|-------|
+| `0x0100`, `0x0103`–`0x0105`                            | `0x0100` is constant config (thresholds); others mostly empty |
+| `0x0200`–`0x020B` (mixed)                              | `0x0202` is a fixed cell-index table; `0x0205` is a probe-channel map |
+| `0x0620`, `0x0621`, `0x0648`                           | Mostly-empty sub-block, UNKNOWN |
+| `0x0641`–`0x0647`                                      | Per-channel 1-byte values (7 total), UNKNOWN |
+| `0x0E00`                                               | HV detection / Hlss state — contains pack-V × 10 twice |
+| `0x0E21`, `0x0F50`, `0x0F60`                           | UNKNOWN small values |
+| `0x0E40`                                               | Shunt state (Hall current sensing) |
+| `0x0E70`–`0x0E72`, `0x0EF0`, `0x0F10`, `0x0F30`        | Signal detection / on-board rails |
+| `0x0EA0`, `0x0EA1`, `0x0ED0`–`0x0ED7`                  | Cell info tab — balancing / open-wire / short flags |
+| `0x0960`, `0x0961`, `0x0905`, `0x0962`                 | UNKNOWN |
+| `0x1600`, `0x1620`                                     | `0x1600` = BMU power-supply rail (~12.75 V); `0x1620` = on-board temps |
+
+---
+
+## Polling patterns
+
+| Phase                         | Frequency | DIDs                                                                  |
+|-------------------------------|-----------|-----------------------------------------------------------------------|
+| Bootstrap (~0.5 s)            | one-shot  | See §"Connection bootstrap" steps 1–11                                |
+| Baseline (continuous)         | ~1 Hz     | ~30 DIDs covering identity + per-cell + pack state + peak data + counters + alarms |
+| Cell info tab (additive)      | ~1 Hz     | `0x0EAx`, `0x0EDx`, `0x2803`/`0x2804`, `0x096x`                       |
+| BMS tab (additive)            | ~1 Hz     | `0x0900`–`0x0902`, `0x0E00`/`0x0E40`/`0x0E7x`/`0x0Exx`/`0x0Fxx`, `0x1600`/`0x1620`, `0xA50x` (X700), `0x064x` |
+| SOC tab Read                  | one-shot  | ~80 calibration DIDs in `0x30xx` / `0x40xx`                           |
+| Late-session routine burst    | ~1 Hz, transient | `31 01 F0 09`–`31 01 F0 11`, plus `0x0905`/`0x0962`/`0x064E`/`0x067x` — trigger UNKNOWN |
+
+The session is kept open by continuous baseline polling; explicit `0x3E`
+TesterPresent is referenced in the iBMS binary's symbol table but not
+observed on the wire during baseline polling.
+
+---
+
+## Writes
+
+Not yet observed on the wire. The iBMS UI exposes Sync / Import / Export /
+Read / Write buttons on the SOC calibration tab; **Write** is gated by
+SecAccess L1 unlock. Specific write services are TENTATIVE pending an
+observed write transaction.
+
+The internal protobuf message types in `app/iBMSUpper.exe`
+(`MosForceControlMessage`, `WorkModeControlMessage`,
+`ChgForceControl`/`Time`, `U600ElecLockForceContrl`, `U600HLSSForceContrl`)
+indicate write/control surfaces are available; see "Protobuf message types"
+in the iBMS-software-notes appendix.
+
+---
+
+# Appendix
+
+## iBMS software notes
+
+Facts about the UDAN iBMS PC Utility itself: what's in the binary, what
+adapters it supports, what its UI looks like, what it does on connect,
+and what file formats it produces. Reference material, not active
+investigation.
+
+### iBMS PC Utility — software provenance
+
+The protocol map above was derived from a Solectrac-specific install of
+the iBMS PC Utility (UDAN's vendor tool) plus traces taken while the tool
+was running.
+
+#### Installer
 
 - File: `docs/iBMSUpper-setup-x86(v3.1.7).exe`
-- Type: Inno Setup installer (PE32, 36 MB)
-- Company: UDAN
-- Product: iBMS PC Utility v3.1.6 (build date 2020-03-14)
+- Type: Inno Setup installer (PE32, 36 MB), Company: UDAN
+- Product: iBMS PC Utility v3.1.6 (build 2020-03-14)
 
-## Installed Files
+#### Application
 
-- `app/iBMSUpper.exe` — main application (28 MB, UPX-compressed, Go binary)
-- `app/kerneldlls/kerneldll.ini` — CAN hardware adapter registry
-- `app/vcredist_x86.exe` / `vcredist_x86_2008.exe` — Visual C++ redistributables
-- `app/mfc80.dll`, `msvcp80.dll`, `msvcr80.dll` — MFC/CRT libraries
+- Language: Go 1.15.15 → Windows PE32, UPX-compressed
+- UI: embedded web app, served on localhost via HTTP
+  - JS bundles `static/js/app.e064497ec6be8a62ce23.js`, `vendor.ee7bb8e9289003d7cac7.js` + 9 numbered chunks
+- Serialization: Protocol Buffers (protobuf) for internal types
+- Connection types (Go iface `Connection`):
+  - `ConnectionCan` — UDS/CanTp transport (Solectrac uses this)
+  - `ConnectionUart` — Modbus over UART-over-CAN (F700 family — see "Sibling BMS family" below)
+  - `ConnectionDemo` — simulation
 
-## CAN Hardware Support (kerneldll.ini)
+#### Embedded Go source paths
 
-The software supports 47 CAN interface adapters, all from ZLG (周立功 Guangzhou Zhiyuan Electronics).
-Notable entries include:
-- USBCAN (multiple variants: USBCAN_E, USBCAN_4E_U, USBCAN_8E_U, USBCAN_CX, USBCAN_GC)
-- CANDTU / CANDTU_MINI / CANDTU_NET / CANDTU_NET_400
-- CANWIFI_TCP / CANWIFI_UDP
-- PCI cards: PCI9810, PCI9820, PCI9840, PCI51XX, PCI50XX, PCIE9221, PCIE9120, PCIE9110, PCIE9140
-- PCAN (Peak CAN) — separate driver (PCANBasic_386.dll, ECanVci32.dll)
-- CAN232 (serial adapter)
-- zpcfd_x86.dll (CANFD support), usbcanfd.dll
+```
+D:/golang/gopath/src/iBMSUpper/uds_read_data.go
+D:/golang/gopath/src/iBMSUpper/uds_read_data_A7.go
+D:/golang/gopath/src/iBMSUpper/uds_read_data_dataflash_gd25q64.go
+D:/golang/gopath/src/iBMSUpper/uds_read_data_dataflash_w25n01g.go
+D:/golang/gopath/src/iBMSUpper/uds_save_data_P7.go
+D:/golang/gopath/src/iBMSUpper/uds_save_data_U6.go
+D:/golang/gopath/src/iBMSUpper/uds_udan_key_calculator_YJC.go
+```
 
-## Application Architecture
+#### Supported CAN adapters (kerneldll.ini)
 
-- **Language**: Go 1.15.15 (compiled to Windows PE32)
-- **UI**: Embedded web application (serves HTML/JS on localhost via HTTP)
-  - Static files embedded in the binary (go-bindata or similar)
-  - JS chunks: `static/js/app.e064497ec6be8a62ce23.js`, `vendor.ee7bb8e9289003d7cac7.js`, plus 9 numbered chunks
-- **Protocol layer**:
-  - **F700 series**: Modbus RTU over UART-over-CAN (source: `uart_over_can.go`).
-    The Modbus client library is `gitlab.udantech.com/wenjun.ye/go-modbus`.
-    CAN framing uses `gitlab.udantech.com/xqp/can.(*RawClient)` — raw CAN frames
-    with up to 8 bytes of UART/Modbus payload per frame. The RawClient connects
-    via TCP to a CAN-over-network adapter (CANDTU, CANWIFI, etc.).
-  - **P700 / U600 / UDS models**: ISO 14229 UDS over CAN via ISO-TP
-    (`gitlab.udantech.com/xqp/can.(*CanTp)`), custom transport called "YJC_UDS"
-- **Serialization**: Protocol Buffers (protobuf) for internal message types
-- **Connection types** (Go interface `Connection`):
-  - `ConnectionCan` — CAN bus (UDS/CanTp, used for UDS-capable models)
-  - `ConnectionUart` — UART-over-CAN with Modbus (used for F700)
-  - `ConnectionDemo` — demo/simulation mode
+47 ZLG (周立功) adapters across USBCAN / CANDTU / CANWIFI / PCI families,
+plus Peak PCAN (separate driver) and CAN232 serial. CANFD support via
+`zpcfd_x86.dll` / `usbcanfd.dll`.
 
-## CAN Protocol — Message Types
+#### Message-ID symbol table
 
-The software uses byte-coded message IDs. Messages observed in symbol/string table:
+The iBMS binary names internal data records by byte ID. These appear in
+CSV export filenames (e.g. `Voltages 0x08.csv`); they are *not* CAN
+arbitration IDs.
 
-| ID     | Name / Description |
-|--------|--------------------|
-| 0x06   | Peak data |
-| 0x08   | Voltages |
-| 0x09   | Temperatures |
-| 0x0A   | Heat and Pole Temperatures |
-| 0x0B   | Heat Pole MOS Temperatures |
-| 0x79   | Balancing state |
-| 0x80   | Device list |
-| 0x81   | Device info |
-| 0x82   | Device list (alt) |
-| 0x83   | System state |
-| 0x84   | DTU info |
-| 0x85   | Charging |
-| 0x86   | Balancing state |
-| 0x87   | Alarm state |
-| 0x88   | (Dis)charged energy |
-| 0x89   | (Dis)charged energy (alt) |
-| 0x91   | List of supported commands |
-| 0x92   | Device info (alt) |
-| 0x93   | System state (alt) |
-| 0x94   | Charging (alt) |
-| 0x95   | (Dis)charged time |
-| 0x96   | DTU info |
-| 0x97   | Enable/disable data |
-| 0x98   | WiFi info |
-| 0x99   | Charging state / ChgState |
-| 0x9A   | Voltages (alt) |
-| 0x9B   | Peak data (alt) |
-| 0x9D   | WiFi / DTU |
-| 0x9F   | System state |
-| 0xB6   | System state |
-| 0xBB   | DTU / "Enter programming session" |
-| 0xBE   | Temperature disabled data |
-| 0xC0   | Host diagnostic data |
+| ID    | Name                            | Mapped to DID(s) |
+|-------|---------------------------------|------------------|
+| 0x06  | Peak data                       | `0x2820`/`0x2828`/`0x2830`/`0x2838` |
+| 0x08  | Voltages                        | `0x0101`         |
+| 0x09  | Temperatures                    | `0x0102`         |
+| 0x0A  | Heat and Pole Temperatures      | not on this pack |
+| 0x0B  | Heat Pole MOS Temperatures      | not on this pack |
+| 0x79  | Balancing state                 | UNKNOWN          |
+| 0x80  | Device list                     | —                |
+| 0x81  | Device info                     | —                |
+| 0x82  | Device list (alt)               | —                |
+| 0x83  | System state                    | alt name for `0x93` |
+| 0x84  | DTU info                        | —                |
+| 0x85  | Charging                        | alt name for `0x94` |
+| 0x86  | Balancing state                 | UNKNOWN          |
+| 0x87  | Alarm state                     | `0x4000`         |
+| 0x88  | (Dis)charged energy             | alt name for `0x89` |
+| 0x89  | (Dis)charged energy (alt)       | `0x2810`         |
+| 0x91  | List of supported commands      | —                |
+| 0x92  | Device info (alt)               | —                |
+| 0x93  | System state (alt)              | `0x2800`         |
+| 0x94  | Charging (alt)                  | `0x0900`+`0x0901`+`0x0902` TENTATIVE |
+| 0x95  | (Dis)charged time               | `0x2801`         |
+| 0x96  | DTU info                        | —                |
+| 0x97  | Enable/disable data             | UNKNOWN          |
+| 0x98  | WiFi info                       | X700 subsystem (UNKNOWN DID) |
+| 0x99  | Charging state / ChgState       | UNKNOWN          |
+| 0x9A  | Voltages (alt)                  | UNKNOWN          |
+| 0x9B  | Peak data (alt)                 | UNKNOWN          |
+| 0x9D  | WiFi / DTU                      | X700 subsystem (UNKNOWN DID) |
+| 0x9F  | System state                    | —                |
+| 0xB6  | System state                    | —                |
+| 0xBB  | DTU / "Enter programming session" | —              |
+| 0xBE  | Temperature disabled data       | —                |
+| 0xC0  | Host diagnostic data            | —                |
 
-## UDS Services Identified
+#### Protobuf message types
 
-The application implements ISO 14229 UDS over CAN (via a custom transport layer called "YJC_UDS"):
+Found in the Go binary:
 
-- **0x10** — Diagnostic Session Control
-  - "Enter default session"
-  - "Enter extended session"
-  - "Enter programming session"  (associated with message 0xBB)
-  - "Diagnostic Session Mode Control Service" (UI label)
-- **0x22** — Read Data By Identifier. A **DID** (Data Identifier) is a 16-bit
-  number naming a specific piece of data inside an ECU; each vendor defines
-  its own map. Wire format over ISO-TP:
+- `ChargeMessage` — charge request V/A, connect state, fault flags
+- `DiagnosisMessage` — alarm count, diagnosis info
+- `ExtremumMessage` — max/min cell V/T, SOC parameters
+- `TotalPackageMessage` — wraps the above + Remote + CloudConfig
+- `MosForceControlMessage` — force MOS index switch state
+- `WorkModeControlMessage` — system lock/unlock, reset
+- `RemoteControlMessage` — control type + cell-balance state envelope
+- `CloudServiceConfigMessage` — cloud config
 
-  ```
-  Request:  03 22 02 09          PCI=3 bytes, SID=22, DID=0x0209
-  Response: 05 62 02 09 00 00    PCI=5 bytes, SID|0x40=62, DID echoed, data
-  ```
+#### Remote / force-control surfaces
 
-  Throughout this document, DIDs are written as `0xXXXX` (or as the request
-  body `22 XX XX`); all UDAN-specific.
-  - Application reads at minimum: 0x0106, 0xA500, 0xA50F, 0xF195
-  - **0xF195** (CONFIRMED): ASCII firmware version. Solectrac response: `"3.0.4.4"`
-  - **0xA50F** (CONFIRMED): ASCII hardware/build string. Solectrac response: `"A650_C121.074.001.01_T1.0.2"`
-  - **0xA500** (TENTATIVE): used as the discovery "is anyone home?" probe. 1-byte response (`01` observed)
-  - **0x0106** (UNKNOWN): 2-byte response (`A0 00` observed); meaning not yet determined
-- **0x27** — Security Access ("Try to unlock to UdsSecurityLevel1")
-  - Custom key calculator: `uds_udan_key_calculator_YJC.go`
-- **0x31** — Routine Control ("Routine control service")
-- **0x3E** — Tester Present ("TesterPresent" string)
-- Read calibration information, read diagnostic information, data transfer services also present
+The Go binary exposes:
 
-Source files embedded in binary:
-- `D:/golang/gopath/src/iBMSUpper/uds_read_data.go`
-- `D:/golang/gopath/src/iBMSUpper/uds_read_data_A7.go`
-- `D:/golang/gopath/src/iBMSUpper/uds_read_data_dataflash_gd25q64.go`
-- `D:/golang/gopath/src/iBMSUpper/uds_read_data_dataflash_w25n01g.go`
-- `D:/golang/gopath/src/iBMSUpper/uds_save_data_P7.go`
-- `D:/golang/gopath/src/iBMSUpper/uds_save_data_U6.go`
-- `D:/golang/gopath/src/iBMSUpper/uds_udan_key_calculator_YJC.go`
+- `F700WriteForceContrl` (F700 only)
+- `P700MOSForceContrl` — force MOS control
+- `U600ElecLockForceContrl` — electric-lock control
+- `U600HLSSForceContrl` — HLSS contactor control
+- `ChgForceControl` / `ChgForceControlTime`
 
-## Test Mode / F700TestModeSwitch
+These imply UDS write or routine services exist on the BMS for
+force-set, but the wire-level mapping is UNKNOWN until an observed write.
 
-The function `F700TestModeSwitch` (Go method `main.(*DeviceData).F700TestModeSwitch`) is the key
-function for entering test/diagnostic mode. Related functions:
+#### Product models listed in the binary
 
-- `F700SwitchRunState` — switches BMS run state (register 0x0E10)
-- `F700SwitchProtocol` — switches communication protocol
-- `F700TestModeSwitch` — **the test mode switch** (also has `-fm` and `.func1` variants)
-- The state change is logged as a JSON diff: `{"Time":..., "OLD":..., "NEW":...}` with key `TestModeSwitch`
+```
+F700 / F702 / F715–F723 / F728–F753 / F780–F788
+E700 / E720 / E721 / E730 / E750–E753
+P700 (parallel BMS), U600, X700
+```
 
-The "BMS request setting mode" string appears in the binary and is likely the UI label for this
-feature. It is distinct from the programming session (0xBB).
+### Sibling BMS family — F700 (Modbus over UART-over-CAN)
 
-### Confirmed Wire Frames
+The iBMS tool also supports an entirely different protocol family used
+by F700-class BMSs: **Modbus RTU framed over UART-over-CAN**, not UDS.
+The Solectrac BMS is *not* F700 — it ignores the F700 probe — but this
+is documented here because the iBMS tool always probes both families on
+connect.
 
-The F700 uses **Modbus RTU over UART-over-CAN** (not UDS). `F700TestModeSwitch` writes
-Modbus holding register **0x0E11** using FC 0x10 (Write Multiple Registers), slave address 0x01.
+- Modbus client lib: `gitlab.udantech.com/wenjun.ye/go-modbus`
+- CAN framing: `gitlab.udantech.com/xqp/can.(*RawClient)`, ≤ 8 B Modbus
+  payload per CAN frame; transports over TCP to a CANDTU / CANWIFI adapter
 
-The complete Modbus RTU frame (11 bytes, including CRC16-Modbus):
+#### F700 test mode (`F700TestModeSwitch`)
 
-| Direction | Modbus RTU bytes (hex) |
-|-----------|------------------------|
-| Test mode ON  | `01 10 0E 11 00 01 02 00 01 8B 11` |
-| Test mode OFF | `01 10 0E 11 00 01 02 00 00 4A D1` |
+Writes Modbus holding register `0x0E11` using FC `0x10` (Write Multiple
+Registers), slave address `0x01`:
 
-Field breakdown: `[slave=01] [FC=10] [reg-hi=0E] [reg-lo=11] [qty-hi=00] [qty-lo=01] [byte-count=02] [data] [CRC-lo] [CRC-hi]`
+| Direction      | Modbus RTU bytes                                  |
+|----------------|---------------------------------------------------|
+| Test mode ON   | `01 10 0E 11 00 01 02 00 01 8B 11`                |
+| Test mode OFF  | `01 10 0E 11 00 01 02 00 00 4A D1`                |
 
-These bytes are split into CAN frames of up to 8 bytes each (UART-over-CAN framing):
-- CAN frame 1 (both ON and OFF): `01 10 0E 11 00 01 02 00`
-- CAN frame 2 (ON):  `01 8B 11`
-- CAN frame 2 (OFF): `00 4A D1`
+Field breakdown: `[slave=01] [FC=10] [reg-hi=0E] [reg-lo=11] [qty-hi=00]
+[qty-lo=01] [byte-count=02] [data-2-bytes] [CRC-lo] [CRC-hi]`
 
-The CAN arbitration ID for these UART-over-CAN frames is **runtime-configured** (set when
-connecting to the adapter); it is not hardcoded in the binary.
+Split into CAN frames of ≤ 8 B each:
 
-Additional registers referenced in the same template block (purpose/variant not confirmed):
-- 0x0EDC — second entry in TestModeSwitch template
-- 0x0E13 — third entry in TestModeSwitch template
+- Frame 1 (both): `01 10 0E 11 00 01 02 00`
+- Frame 2 (ON):   `01 8B 11`
+- Frame 2 (OFF):  `00 4A D1`
 
-## Connection Discovery Handshake
+Related registers in the same template (purpose UNKNOWN): `0x0EDC`,
+`0x0E13`. Related Go functions: `F700SwitchRunState` (reg `0x0E10`),
+`F700SwitchProtocol`. Modbus slave address is configurable via
+`ReinitSlaveAddress`. CAN arbitration ID is runtime-configured (not
+hardcoded).
 
-CONFIRMED: When initiating a connection, the iBMS tool broadcasts probe frames in parallel
-on both supported protocols, sweeping multiple candidate CAN arbitration IDs to discover
-what kind of BMS (and on what ID) is reachable. The cycle repeats every ~2.7 s with no
-back-off if no responses are seen.
+### Connection discovery sweep
 
-### UDS probe (P700/U600/UDS-capable models)
+The iBMS tool does not know in advance which protocol family or which CAN
+ID the BMS uses. On connect, it broadcasts probe frames on both families,
+sweeping multiple candidate IDs, until something responds. The cycle
+repeats every ~2.7 s with no back-off.
 
-Sent on each candidate UDS request arbitration ID:
+#### UDS probe
+
+Sent on each candidate UDS request ID. Observed sweep IDs: `0x740`,
+`0x7D0`, `0x36E`.
 
 | Field        | Value                          |
 |--------------|--------------------------------|
 | Frame bytes  | `03 22 A5 00 00 00 00 00`      |
-| ISO-TP PCI   | `03` (single frame, 3 payload) |
-| UDS SID      | `0x22` ReadDataByIdentifier    |
-| DID          | `0xA500`                       |
+| UDS request  | `0x22` ReadDID, DID `0xA500`   |
 
-CONFIRMED observed request IDs used by the discovery sweep: `0x740`, `0x7D0`, `0x36E`.
-(This partially resolves the previous TODO on UDS arbitration IDs — these are 11-bit
-standard IDs, not 29-bit extended.)
+Solectrac BMS responds only on `0x740`/`0x748`.
 
-DID `0xA500` is one of the four identifiers the iBMS tool is documented to read under
-SID 0x22 (see "UDS Services Identified" above) — TENTATIVE interpretation: it is being
-used here as a generic "is anyone home?" probe whose response identifies the device.
+A separate UDS-shaped frame `01 22 0F 1A 02 08 0F` is also seen on
+`0x34E` each cycle. Purpose UNKNOWN.
 
-A second UDS-shaped frame has been observed on `0x34E` during the same cycle:
-ISO-TP single frame of length 7, payload `01 22 0F 1A 02 08 0F`. Purpose UNKNOWN.
+#### F700 probe
 
-### F700 probe (Modbus RTU over UART-over-CAN)
+Two CAN frames ~100 ms apart on the configured Modbus-over-CAN ID
+(observed: `0x750`):
 
-Sent on the configured UART-over-CAN arbitration ID. CONFIRMED observed ID: `0x750`.
-The probe is two CAN frames sent back-to-back (~100 ms apart):
+| # | Bytes                       | Meaning                                                   |
+|---|-----------------------------|-----------------------------------------------------------|
+| 1 | `AA AA 55 01`               | TENTATIVE: sync/handshake preamble (classic `AA AA 55`)   |
+| 2 | `01 03 0B 36 00 0A 27 E7`   | Modbus FC `0x03` Read Holding Registers from `0x0B36`, qty 10, CRC `0x27E7` |
 
-| Frame | Bytes (hex)                  | Meaning                                                              |
-|-------|------------------------------|----------------------------------------------------------------------|
-| 1     | `AA AA 55 01` (4 bytes)      | TENTATIVE: sync/handshake preamble (`AA AA 55` is a classic preamble) |
-| 2     | `01 03 0B 36 00 0A 27 E7`    | Modbus RTU: slave=0x01, FC=0x03 Read Holding Registers, addr=0x0B36, qty=10, CRC=0x27E7 |
+Solectrac BMS does not respond on `0x750`.
 
-Slave address 0x01 matches the documented default (see "Test Mode" above). The register
-block at `0x0B36`–`0x0B3F` is presumably an identification / device-info block read to
-confirm an F700 is present; exact contents UNKNOWN.
+The probes contain no target addressing — the tool discriminates by
+which ID + framing first gets an answer.
 
-### Behavior summary
+### iBMS UI tab structure
 
-There is no target-specific addressing inside the probe payloads themselves — the tool
-discriminates BMS family purely by which arbitration ID + protocol framing receives a
-response. The same DID-0xA500 read is fired verbatim at every candidate UDS ID.
+The iBMS PC Utility presents five top-level tabs (with sub-navigation
+where present). Pairing tab transitions against trace polling-burst
+boundaries was the primary technique for mapping DIDs to data — see
+"DID-mapping methodology" in the reverse-engineering notes below.
 
-## Solectrac Pack — Observed Parameters
+| Top tab          | Right sub-nav                                                                                                                    | Driving DIDs              |
+|------------------|----------------------------------------------------------------------------------------------------------------------------------|---------------------------|
+| System overview  | —                                                                                                                                | Baseline DIDs only        |
+| Cell info        | —                                                                                                                                | Baseline + `0x0EAx` / `0x0EDx` / `0x2803-4` / `0x096x` |
+| Charge info      | —                                                                                                                                | Baseline + `0x09xx` cluster |
+| BMS              | Hlss state · HV detection · Hall state · Shunt state · Signal detection · On-board volt · On-board temp · BMU info · X700        | Baseline + `0x09xx`/`0x0E*xx`/`0x0F*xx`/`0x16xx`/`0xA50x`/`0x064x` (all polled in parallel) |
+| SOC              | Cap. config · SOC calib. config · HighSoc · LowSoc                                                                               | Baseline + one-shot `0x30xx` / `0x40xx` dump on "Read" |
 
-CONFIRMED. The Solectrac e25 pack identifies as **India series 72V 300Ah, original**
-(UI project header: `C121.082.001.01`, Chinese label `印度系列72V300Ah原版`).
+The SOC tab also exposes Sync / Import / Export / Read / Write buttons.
 
-### Identity
+### Historical CSV exports
 
-| Field                             | Value                                              | Source                  |
-|-----------------------------------|----------------------------------------------------|-------------------------|
-| UI project number                 | `C121.082.001.01`                                  | UI header bar           |
-| Hardware/build string (DID 0xA50F)| `A650_C121.074.001.01_T1.0.2`                      | UDS `22 A5 0F`          |
-| Firmware version (DID 0xF195)     | `3.0.4.4`                                          | UDS `22 F1 95`          |
-| BMS family                        | UDS-capable (P700 / U600 / X700)                   | Responds on 0x740, ignores F700 Modbus probe on 0x750 |
+The iBMS tool offers to pull historical state from the BMS's onboard
+logger and save it as CSVs. Filename pattern: `<timestamp>_<UDAN-name
+0xNN>.csv`. There is also an aggregate Excel file named after the pack
+serial: `<pack-serial>_<timestamp>.xlsx`.
 
-TENTATIVE on the two `C121.*` project numbers: the UI/firmware project
-(`C121.082`) and the hardware string project (`C121.074`) share the `C121`
-UDAN project prefix but differ in suffix; `C121.082` is likely the
-firmware/UI project for this pack variant while `C121.074` is the hardware
-revision identifier.
+The UDAN message ID in the filename is the iBMS-internal record-type
+tag (see "Message-ID symbol table" above), *not* a CAN ID. CSV row
+timestamps come from the BMS RTC, which is not set — don't use these
+timestamps to correlate against trace data.
 
-### Pack structure (CONFIRMED)
+CSV file inventory observed:
 
-- Chemistry: NCM (Nickel Cobalt Manganese)
-- Configuration: **20S × 1 subsystem** (`Cell count = 20`, `Subsys. count = 1`)
-- Rated capacity: 300 Ah
-- Rated current: 500 A
-- Rated voltage: 72 V nominal; ~78.5 V measured at high SOC (20S × ~3.93 V)
-- Temperature probes: 7 per subsystem
-- HV rails: B+, HV1 (Main+), HV2, HV3 active (HV4 / HV5 marked Invalid)
-- Contactors: HSS1 (Main+), HSS2–HSS5, LSS1 (only HSS1 closed during idle observation)
+```
+(Dis)charged energy 0x89.csv      — maps to DID 0x2810
+(Dis)charged time 0x95.csv        — maps to DID 0x2801
+Alarm state 0x87.csv              — maps to DID 0x4000
+Charging 0x94.csv                 — maps to DID 0x0900+0x0901+0x0902 (TENTATIVE)
+Peak data 0x06.csv                — maps to DID cluster 0x2820/0x2828/0x2830/0x2838
+System state 0x93.csv             — maps to DID 0x2800
+Temperatures 0x09.csv             — maps to DID 0x0102
+Voltages 0x08.csv                 — maps to DID 0x0101
+```
 
-### CAN arbitration IDs (CONFIRMED for this pack)
+---
 
-| Direction               | ID    | Notes                                     |
-|-------------------------|-------|-------------------------------------------|
-| Tester → BMS (UDS req)  | 0x740 | Only UDS request ID that responds         |
-| BMS → Tester (UDS resp) | 0x748 | Responses to 0x740 requests               |
+## Reverse-engineering notes
 
-The discovery sweep also probes 0x7D0, 0x36E, 0x34E (UDS) and 0x750 (F700
-Modbus); none receive responses from this BMS.
+Active investigations: methodology, captured data, unresolved findings,
+and open questions. Anything here is subject to change as more captures
+arrive.
 
-### Unlock flow (CONFIRMED for this BMS)
+### DID-mapping methodology
 
-The iBMS tool's session-open sequence on the Solectrac:
+DID-to-data assignments were derived by aligning trace polling-burst
+boundaries against screenshots of the iBMS UI taken at known wall-clock
+times. Procedure:
 
-1. `02 10 03` — DiagnosticSessionControl, extended session
-   → positive response `06 50 03 00 32 00 C8 00` (P2 / P2* timing parameters)
-2. `02 27 01` — SecurityAccess Level 1, request seed
-   → positive response `06 67 01 <4-byte seed>`
-3. `06 27 02 <4-byte key>` — SecurityAccess Level 1, send key
-   → positive response `02 67 02`
+1. Note the active iBMS UI tab (and sub-nav) at each screenshot timestamp.
+2. Segment the trace into windows where the set of polled DIDs is stable.
+3. Intersect each window's DIDs with the "Driving DIDs" expected for the
+   active tab (see "iBMS UI tab structure" above).
+4. For each candidate DID, compare its response payload to the matching
+   CSV's column count + scale and to live-UI values; promote to
+   CONFIRMED if both check out.
 
-This partially resolves the prior TODO on whether UDS test mode uses 0x10
-extended session or a 0x31 routine — at minimum the *unlock* uses extended
-session + SecAccess L1, not a routine.
+CSV row *values* are not usable for correlation (BMS RTC is unset). CSV
+*schema* (column names, widths, units) is the reliable cross-reference.
 
-### Captured SecurityAccess seed/key pairs
+### SecAccess L1 — captured pairs and cryptanalysis
 
-Data points for reversing `uds_udan_key_calculator_YJC.go`. Seeds are
-non-deterministic (different on each connection); each key below was accepted
-by the BMS (positive `02 67 02` response).
+The Level-1 unlock key is computed by `uds_udan_key_calculator_YJC.go`
+inside `app/iBMSUpper.exe`. Captured (seed, key) pairs:
 
-| Seed (hex)      | Key (hex)       | Capture                  |
-|-----------------|-----------------|--------------------------|
-| `0D 4A F9 74`   | `38 20 62 9F`   | `bms-connection.asc`     |
-| `66 80 20 47`   | `92 0F 02 BA`   | `bms-connection-2.asc`   |
-| `9C 43 69 8E`   | `9A 00 4F 4E`   | `bms-connection-3.asc`   |
-| `2A 4B 8D D2`   | `3B 87 BE E1`   | `bms-connection-4.asc`   |
-| `2A 64 C4 19`   | `16 37 31 4D`   | `bms-connection-5.asc`   |
-| `09 E6 16 7A`   | `17 26 91 AD`   | `bms-connection-6.asc`   |
-| `9F 9C 21 C7`   | `E1 42 86 06`   | `bms-connection-7.asc`   |
-| `DD F5 53 1B`   | `13 1F 61 69`   | `bms-connection-8.asc`   |
-| `F8 FD 0C 44`   | `B1 3E 9A 09`   | (earlier capture)        |
+| Seed (hex)    | Key (hex)     | Source capture          |
+|---------------|---------------|-------------------------|
+| `0D 4A F9 74` | `38 20 62 9F` | `bms-connection.asc`    |
+| `66 80 20 47` | `92 0F 02 BA` | `bms-connection-2.asc`  |
+| `9C 43 69 8E` | `9A 00 4F 4E` | `bms-connection-3.asc`  |
+| `2A 4B 8D D2` | `3B 87 BE E1` | `bms-connection-4.asc`  |
+| `2A 64 C4 19` | `16 37 31 4D` | `bms-connection-5.asc`  |
+| `09 E6 16 7A` | `17 26 91 AD` | `bms-connection-6.asc`  |
+| `9F 9C 21 C7` | `E1 42 86 06` | `bms-connection-7.asc`  |
+| `DD F5 53 1B` | `13 1F 61 69` | `bms-connection-8.asc`  |
+| `F8 FD 0C 44` | `B1 3E 9A 09` | earlier capture         |
 
-Cryptanalysis attempted on the 8 new pairs (`util/crack_bms_seedkey.py`,
-`util/crack_bms_seedkey2.py`). RULED OUT:
+Seeds are non-deterministic per session; each listed key was accepted
+(positive `02 67 02` response).
 
-- `key = seed XOR C`, `seed ± C`, `seed · C mod 2³²` for any 32-bit constant
-- `key = ROL(seed, r) XOR C` for all 32 rotations (and equivalent two-stage rotate/xor compositions)
+**Ruled out** (via `util/crack_bms_seedkey.py` / `crack_bms_seedkey2.py`):
+
+- `key = seed XOR C`, `seed ± C`, `seed · C mod 2³²` for any 32-bit `C`
+- `key = ROL(seed, r) XOR C` for all 32 rotations + two-stage rotate/xor
 - `key = bitrev(seed) XOR C`, `byteswap(seed) XOR C`, `~seed XOR C`
 - Per-nibble S-box (contradicts in nibble 0)
-- LFSR shift-and-XOR with common CRC polynomials (CRC32, CRC16-CCITT, CRC16-Modbus, etc.) over 8–64 rounds
-- **Any GF(2)-linear function of the seed**: the differences `Δkᵢ = kᵢ⊕k₀`
-  are not a linear function of `Δsᵢ = sᵢ⊕s₀`, so the algorithm contains a
-  genuinely nonlinear step (carry-propagating add, multiplication, or LUT).
+- LFSR shift-and-XOR with common CRC polynomials (CRC32, CRC16-CCITT,
+  CRC16-Modbus, etc.) over 8–64 rounds
+- **Any GF(2)-linear function of the seed**: the differences
+  `Δkᵢ = kᵢ⊕k₀` are not linear in `Δsᵢ = sᵢ⊕s₀`, so the algorithm
+  contains a genuinely nonlinear step (carry-propagating add,
+  multiplication, or LUT).
 
-CONSEQUENCE: blind brute-force on more captured pairs is unlikely to crack
-this. Practical next steps for `uds_udan_key_calculator_YJC.go`:
+CONSEQUENCE: brute force on additional captured pairs alone is unlikely
+to succeed. Practical next steps:
 
-1. Decompile the Go binary `app/iBMSUpper.exe` directly — the key calculator
-   is a few hundred bytes of Go in a binary we already have. This is the
-   cheapest path.
-2. Look for a published/leaked UDAN seed-to-key routine (vendor `UDAN`,
-   product family iBMS, hardware string `A650_C121.*`).
-3. Dump the BMS firmware (NXP S32K + GD25Q64/W25N01G flash) and locate the
+1. **Decompile `app/iBMSUpper.exe` directly** — a few hundred bytes of
+   Go in a binary we already have. Cheapest path.
+2. Search for a leaked/published UDAN seed-to-key routine (vendor UDAN,
+   hardware string `A650_C121.*`).
+3. Dump the BMS firmware (NXP S32K + GD25Q64 / W25N01G) and locate the
    `27 01` handler's verify routine.
 
-### Live readings observed (idle, no charger, ~76.8% SOC)
+### Bootstrap RequestDownload (UNKNOWN)
 
-| Field             | Value                            |
-|-------------------|----------------------------------|
-| Shown SOC         | 76.8 %                           |
-| Pack voltage      | 78.5 V                           |
-| Pack current      | 0.0 A                            |
-| Cell voltages     | 3.926–3.928 V (delta < 5 mV)     |
-| Cell temperatures | 21–23 °C                         |
-| Running mode      | **Calibrating**                  |
-| Wake signal       | KL15                             |
-| Alarm state       | No Fault                         |
-| Charger           | Not Connected                    |
+Every iBMS connection includes a 1528-byte write to BMS memory at
+`0x00003A00` (3 × ~516 B `TransferData` blocks, then `TransferExit`),
+inserted into the bootstrap sequence after the SecAccess unlock and
+before any UI polling. The payload is too small to be firmware.
+TENTATIVE hypotheses:
 
-"Calibrating" is a distinct Running mode visible in the System state —
-separate from the UDS extended/programming sessions and from F700TestModeSwitch.
-TENTATIVE: this is the BMS's normal idle/measurement mode rather than a
-special diagnostic state.
+- A bootstrap / authentication blob the tool installs into RAM
+- Part of the SecAccess L1 unlock dance (post-key challenge)
+- A calibration lookup table re-uploaded each session
 
-## iBMS UI — Tab Structure
-
-The iBMS PC Utility presents data in five top-level tabs, several of which
-have a right-hand sub-navigation. Useful for interpreting captures: a polling
-burst in a trace maps to whichever (tab, sub-nav) pair was active at that
-instant.
-
-| Top tab          | Right sub-nav                                                                                                                | Contents                                                                                                                                            |
-|------------------|------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
-| System overview  | —                                                                                                                            | SOH, SOC, total volt, pack current, System config, Peak data, Charge info, DTU, Stats summary                                                       |
-| Cell info        | —                                                                                                                            | Per-cell voltage grid (mV) with balancing / open-wire / short flags; per-probe temperatures                                                         |
-| Charge info      | —                                                                                                                            | Charging plug temps, Charger → BMS connection state, CC / CP measurements, self-diag, lock state                                                    |
-| BMS              | Hlss state · HV detection · Hall state · Shunt state · Signal detection · On-board volt · On-board temp · BMU info · X700    | Relay / contactor state, HV rail voltages, Hall current sensing, shunt current, signal IO, on-board rails / temps, BMU listing, X700 IoT config     |
-| SOC              | Cap. config · SOC calib. config · HighSoc · LowSoc                                                                           | SOC parameter calibration tables; fault thresholds (Threshold / Recovery / Delay / Recovery delay) per Sys and Cal params                            |
-
-The SOC tab also has inner tabs (SOC / Total volt / Current / Cell volt / Temp)
-for protection thresholds against each measured quantity, and exposes
-**Sync / Import / Export / Read / Write** buttons. Read / Export are
-presumably gated only by an active connection; **Write** almost certainly
-requires the SecAccess L1 unlock.
-
-The 0x06 / 0x08 / 0x87 / 0x9x message IDs documented in §"CAN Protocol —
-Message Types" are the iBMS *internal* message tags. Mapping each tag to a
-wire-level UDS DID (open TODO) is now constrained: by aligning a capture's
-polling bursts against the active tab, the candidate DIDs for each tag
-narrow sharply.
-
-## UDS Read Patterns by UI Context
-
-CONFIRMED via time-correlating a navigation-tour capture against screenshots
-of the iBMS UI. Baseline polling runs at approximately 1 Hz; tab-specific
-reads layer on top when their corresponding UI section is open.
-
-### Connection bootstrap (one-shot at session start, ~0.5 s)
-
-Sequence executed once when the iBMS tool connects to this BMS:
-
-| Step | Request                              | Purpose                                                       |
-|------|--------------------------------------|---------------------------------------------------------------|
-| 1    | `22 A5 00`                           | Discovery probe (also used in the candidate-ID sweep)         |
-| 2    | `22 01 06`                           | UNKNOWN 2-byte value (poll continues during session)          |
-| 3    | `22 F1 95`                           | Firmware version string (one-shot only)                       |
-| 4    | `22 A5 0F`                           | Hardware/build string (also continues during session)         |
-| 5    | `22 28 00`                           | System state snapshot (12 B incl. SOC, SOH, HV1, current — see Confirmed mappings below) |
-| 6    | `10 03`                              | DiagnosticSessionControl → extended                           |
-| 7    | `27 01` / `27 02`                    | SecurityAccess Level 1 (seed/key exchange)                    |
-| 8    | `34 00 24 00 00 3A 00 05 F8`         | RequestDownload: 1528 bytes to memory address `0x00003A00`    |
-| 9    | `36 01` / `36 02` / `36 03`          | TransferData blocks (3 × ~516 B request payloads)             |
-| 10   | `37`                                 | TransferExit                                                  |
-| 11   | `22 A5 03`, `22 A5 05`, `22 A5 0D`   | Additional one-shot reads to populate the UI                  |
-
-UNKNOWN: **the RequestDownload step.** 1528 bytes written to a fixed memory
-address on every connection is too small to be firmware. TENTATIVE
-hypotheses: (a) a bootstrap / auth blob the tool installs into RAM,
-(b) part of the SecAccess L1 unlock dance, (c) a calibration lookup table
-re-uploaded each session.
-
-### Steady-state baseline polling (~30 DIDs at ~1 Hz)
-
-Present continuously throughout any iBMS session regardless of active tab.
-TENTATIVE: drives the "System overview" tab and the top-of-window summary
-fields (SOH, total volt, pack current, SOC, alarm state).
-
-| DID range                                                                                                       | Response (B)    | TENTATIVE category                            |
-|-----------------------------------------------------------------------------------------------------------------|-----------------|-----------------------------------------------|
-| `0x0100`–`0x0105`                                                                                               | 3–43            | Cell / pack voltage block (incl. 43 B array)  |
-| `0x0200`, `0x0202`, `0x0203`, `0x0205`, `0x0206`, `0x0208`, `0x0209`, `0x020B`                                  | 3–23            | Current / temperature / status block          |
-| `0x0620`, `0x0621`, `0x0648`                                                                                    | 3–21            | UNKNOWN sub-block                             |
-| `0x0E21`, `0x0F50`, `0x0F60`                                                                                    | 4–9             | UNKNOWN                                       |
-| `0x2800`, `0x2801`, `0x2810`, `0x2820`, `0x2828`, `0x2830`, `0x2832`, `0x2838`, `0x283A`, `0x2850`              | 3–23            | TENTATIVE: extremum / SOC / cycle-count info  |
-| `0x4000`                                                                                                        | 34              | UNKNOWN                                       |
-| `0xA500`, `0xA503`, `0xA505`, `0xA50D`, `0xA50F`                                                                | 4–31            | Identity / status block (A50F = build string) |
-
-### Confirmed UDAN-ID ↔ UDS-DID mappings
-
-Five mappings established by time-correlating a navigation-tour capture
-against the iBMS UI live values. CSV row values in the historical exports
-do **not** match the trace (BMS state has changed since the CSV was
-generated, and the BMS clock is wrong) — confirmation is by
-schema-shape + live-UI-value match rather than CSV-value match.
-
-| UDAN msg ID                 | Wire DID  | Resp (B) | Payload format                                                    | Evidence                                                                  |
-|-----------------------------|-----------|----------|-------------------------------------------------------------------|---------------------------------------------------------------------------|
-| `0x08 Voltages`             | `0x0101`  | 43       | 20 × big-endian uint16, mV                                        | 3923–3930 mV across 20 cells; matches UI 3926–3928 mV                     |
-| `0x09 Temperatures`         | `0x0102`  | 10       | 7 × uint8 with constant offset (TENTATIVE `°C = raw − 40`)        | Raw `41 41 41 41 40 41 41` → ~22 °C; matches UI 21–23 °C                  |
-| `0x93 System state`         | `0x2800`  | 15       | u16 BE block; SOC×10, SOH×10, HV1×10, current, …                  | SOH `0x03E8`=100.0 % and HV1 `0x0311`=78.5 V are exact UI matches         |
-| `0x95 (Dis)charged time`    | `0x2801`  | 19       | 4 × big-endian uint32, seconds                                    | One field ticks 1/s during the trace; acc-discharge ≈ 160 h matches UI ≈ 167 h |
-| `0x89 (Dis)charged energy`  | `0x2810`  | 23       | mixed; trailing pair of BE uint32 = capacities × 0.01 Ah          | 7762 → 77.62 Ah charge, 7877 → 78.77 Ah discharge; cycle-count `0x0007` matches UI |
-
-Per-DID payload detail follows.
-
-#### DID `0x0101` — Voltages (`0x08`)
-
-Big-endian uint16 array, units of mV. Wire-level source for both the
-System overview Peak-data summary and the Cell info per-cell grid.
-Sample (idle, ~76.8 % SOC):
-`3925 3925 3926 3926 3925 3924 3928 3927 3925 3925 3925 3923 3928 3926 3929 3929 3925 3927 3930 3929` mV.
-
-#### DID `0x0102` — Temperatures (`0x09`)
-
-7 bytes, one per probe. uint8 with a small constant offset (likely
-`°C = raw − 40` — a common CAN-message offset — but cannot be pinned
-from a trace where all probes are within 1 °C of each other). Sample
-`41 41 41 41 40 41 41` → ~22 °C across 7 probes, matching UI 21–23 °C.
-
-#### DID `0x2800` — System state (`0x93`)
-
-12 data bytes after the `62 28 00` header. Three of six BE uint16 fields
-identified by live-UI match:
-
-| Offset | BE u16   | Field                          | Live value     |
-|--------|----------|--------------------------------|----------------|
-| 0      | `0x0312` | Real SOC × 10                  | 78.6 %         |
-| 2      | `0x03E8` | **SOH × 10**                   | 100.0 %        |
-| 4      | `0x0311` | **HV1 / Pack voltage × 10**    | 78.5 V         |
-| 6      | `0xFFED` | TENTATIVE: signed pack current | ≈ −0.2 A idle  |
-| 8      | small    | UNKNOWN counter / flag         | 5–7            |
-| 10     | varies   | UNKNOWN                        | ~`0x33xx`      |
-
-The headline live state lives in `0x2800` but the full "System state"
-page in the iBMS UI is fed by the **entire `0x28xx` family** polled in
-parallel (`0x2800`/`0x2801`/`0x2810`/`0x2820`/`0x2828`/`0x2830`/
-`0x2832`/`0x2838`/`0x283A`/`0x2850`). UDAN message ID `0x93` is the
-iBMS-internal label for the aggregate, with `0x2800` as its primary block.
-
-#### DID `0x2801` — (Dis)charged time (`0x95`)
-
-16 data bytes = 4 × BE uint32, all in seconds:
-
-| Offset | BE u32 (sample) | Field                                                                   |
-|--------|-----------------|-------------------------------------------------------------------------|
-| 0      | 832,857,443     | TENTATIVE: lifetime counter (ms? epoch-like?); ticks 1/s                |
-| 4      | 1,329           | Session uptime (zero at session boot, ticks 1/s)                        |
-| 8      | 3,873,795       | Acc. charge time (constant during this trace — tractor not charging)   |
-| 12     | 576,772         | Acc. discharge / usage time (≈ 160 h; UI showed ≈ 167 h)                |
-
-**Heartbeat byte:** byte 3 of the payload (low byte of the offset-0 u32)
-increments by 1 every ~1 s. This is the byte exported as the
-`Heartbeat` column in `System state 0x93.csv`.
-
-#### DID `0x2810` — (Dis)charged energy (`0x89`)
-
-20 data bytes; structure (TENTATIVE except where noted):
-
-| Offset | Width | Sample         | Field                                                              |
-|--------|-------|----------------|--------------------------------------------------------------------|
-| 0–1    | u16   | `0x0014`       | Cell count = 20                                                    |
-| 2–3    | u16   | `0x0007`       | **Cycle count = 7** (matches UI exactly)                           |
-| 4–7    | u32   | `0x0F564100`   | UNKNOWN (possibly avg cell × scale, or pack-V derivative)          |
-| 8–11   | u32   | varies         | UNKNOWN (instantaneous quantity)                                   |
-| 12–15  | u32   | `0x00001E52`   | **Acc. charge capacity × 0.01 Ah** → 77.62 Ah                      |
-| 16–19  | u32   | `0x00001EC5`   | **Acc. discharge capacity × 0.01 Ah** → 78.77 Ah                   |
-
-#### Ruled out
-
-- **`0x4000`** (31 data B) is **not** System state. Payload is mostly zero
-  with scattered `0xFF` bytes. TENTATIVE: the **fault-flags block**,
-  matching the CSV columns `Chg Self-Diag Fault` … `Other Dchg Fault`
-  (all currently `NoFault`).
-- **`0x0205`** (7 data B) is **not** Temperatures. Returns the constant
-  sequence `[0, 1, 2, 4, 5, 6, 7]` — a fixed probe-index / channel map,
-  not live temperatures.
-- **`0x0100`** is constant (`4611`=18.43 V, `5000`, `700`, …) —
-  TENTATIVE: pack-level threshold / calibration limits, not live state.
-- **`0x0202`** payload is the fixed sequence
-  `00 01 02 03 … 0a 0b 0c 0d 0e 0f 14 15 16 17` — a cell-index table,
-  not live state.
-
-### Cell info tab (additive layer)
-
-Adds when the Cell info top-level tab is opened:
-
-| DID(s)                  | Response (B) | TENTATIVE meaning                                |
-|-------------------------|--------------|--------------------------------------------------|
-| `0x0EA0`, `0x0EA1`      | 8 / 13       | Per-cell balancing flags                         |
-| `0x0ED0`–`0x0ED2`       | 7 each       | Per-cell open-wire / fault flags                 |
-| `0x0ED6`, `0x0ED7`      | 3 each       | Per-cell short flags                             |
-| `0x2803`, `0x2804`      | 7 / 8        | Cell-level extremum / index info                 |
-| `0x0960`, `0x0961`      | 4 each       | UNKNOWN                                          |
-
-### BMS tab (Hlss / HV / Hall / Shunt / Signal / On-board / BMU / X700)
-
-Adds when the BMS top-level tab is opened (regardless of sub-nav — all
-sub-pane DIDs are read in parallel):
-
-| DID(s)                                            | Response (B)       | TENTATIVE meaning                       |
-|---------------------------------------------------|--------------------|-----------------------------------------|
-| `0x0900`, `0x0901`, `0x0902`                      | 10 / 17 / 17       | Hlss state + HV detection rails         |
-| `0x0E00`                                          | 15                 | Hall state                              |
-| `0x0E40`                                          | 10                 | Shunt state                             |
-| `0x0E70`, `0x0E71`, `0x0E72`                      | 11 / 11 / 3        | Signal detection                        |
-| `0x0EF0`, `0x0F10`, `0x0F30`                      | 5 / 6 / 7          | On-board voltage / temperature rails    |
-| `0x1600`, `0x1620`                                | 25 / 10            | BMU info                                |
-| `0xA501`, `0xA502`, `0xA506`, `0xA507`, `0xA50E`  | 7 / 8 / 15 / 43 / 5 | X700 IoT subsystem fields              |
-| `0x0641`–`0x0647`                                 | 3 each             | UNKNOWN (per-channel something, 7 values) |
-
-### SOC tab "Read" — one-shot dump of calibration tables
-
-Pressing the **Read** button on the SOC tab triggers an exhaustive
-one-shot read of ~80 DIDs in the `0x30xx` / `0x40xx` ranges (plus
-`0x0E11`, `0x0E61`). Almost all responses are 35 bytes (32 B of data
-after the `62 XX XX` header). These populate the Cap.config /
-SOC calib.config / HighSoc / LowSoc threshold tables visible in the UI
-after the Read completes.
-
-DID groups observed (each polled exactly once per Read):
-- `0x3010`
-- `0x3030`–`0x305F`, `0x3060`–`0x3061`, `0x3070`–`0x3071`, `0x3080`–`0x3093`
-- `0x30A0`–`0x30D7`, `0x30E0`–`0x30E6`
-- `0x3140`–`0x3153`
-- `0x4011`–`0x4012`, `0x4019`–`0x401A`
-
-The numerically-paired DIDs (e.g. `0x3030`/`0x3031`, `0x3040`/`0x3041`)
-TENTATIVE: charge-side vs discharge-side, or high-side vs low-side, of
-the same parameter.
+Resolution requires (a) decompiling the iBMS Go binary to find what
+prepares this blob, or (b) comparing the blob bytes across multiple
+sessions to see whether the payload is per-session or static.
 
 ### Late-session routine burst (UNKNOWN trigger)
 
-After the SOC calibration read, a burst of routine-control calls appears
-alongside additional DID reads at ~1 Hz. Tab context UNKNOWN — possibly
-triggered by a Sync / Write button or an SOC inner tab (Total volt /
-Current / Cell volt / Temp) not captured in screenshots.
+~80 seconds into the navigation-tour capture, a parallel burst of
+RoutineControl calls appears alongside additional DID reads at ~1 Hz:
 
-| Request                                | Response (B) | TENTATIVE                  |
-|----------------------------------------|--------------|----------------------------|
-| `31 01 F0 09`–`31 01 F0 11` (6 RIDs)   | 3–4 each     | StartRoutine, six routines |
-| `22 09 05`, `22 09 62`                 | 10 / 4       | UNKNOWN                    |
-| `22 06 4E`, `22 06 70`, `22 06 71`     | 3 each       | UNKNOWN                    |
+| Request                                  | Response (B) |
+|------------------------------------------|--------------|
+| `31 01 F0 09`–`31 01 F0 11` (6 RIDs)     | 3–4 each     |
+| `22 09 05`, `22 09 62`                   | 10 / 4       |
+| `22 06 4E`, `22 06 70`, `22 06 71`       | 3 each       |
 
-## X700 IoT Subsystem
+Not visible in any captured screenshot. TENTATIVE: triggered by a Sync /
+Write button or one of the SOC tab inner sub-tabs (Total volt / Current /
+Cell volt / Temp) that wasn't screenshotted.
 
-CONFIRMED that the Solectrac pack's BMS exposes an "X700" sub-section in
-the iBMS UI (under BMS tab → right sub-nav). X700 is also listed among the
-UDAN product models, but here it appears as a *subsystem within this
-UDS-family BMS* responsible for cellular / cloud telemetry.
+### Open questions / TODO
 
-Fields exposed (mostly empty in the observed unit, but the schema is fixed):
+- **Active-charge capture.** Connect the charger, capture a session, and:
+  (a) confirm the `0x94 Charging` DID-cluster field layout,
+  (b) test whether `0x4000` byte order matches the Alarm CSV column order,
+  (c) catch the F194F3 broadcast PGN on the OBD-II side (predicted in
+  `DOCUMENTATION.md`).
+- **Active-fault capture or injection.** Needed to lock down per-byte
+  semantics of `0x4000`.
+- **Thermal-spread capture.** Needed to nail down the `0x0102`
+  temperature offset (currently TENTATIVE `°C = raw − 40`).
+- **SecAccess L1 algorithm.** Decompile `app/iBMSUpper.exe` — see
+  "SecAccess L1" above.
+- **Bootstrap RequestDownload payload.** See above.
+- **Late-session routine burst trigger.** See above.
+- **Remaining tentative payload fields:** `0x2800` offsets 6/8/10;
+  `0x2810` offsets 4–11; `0x0EA0`/`0x0EA1` (balancing); `0x0ED0`–`0x0ED7`
+  (open-wire / short flags); `0x09xx` BMS-tab block (Hlss / HV / Hall).
+- **Unmapped UDAN tags** from the iBMSUpper symbol table:
+  - `0x0A` Heat and Pole Temperatures, `0x0B` Heat Pole MOS Temperatures —
+    likely **features absent** on the Solectrac pack (no heat-pole MOS
+    observed).
+  - `0x79`, `0x86` Balancing state — UNKNOWN, but **no balancing visible
+    in the capture** (cell delta < 7 mV), so possibly inactive rather than
+    not implemented.
+  - `0x88` (Dis)charged energy, `0x9A` Voltages, `0x9B` Peak data —
+    likely **alt names** for already-mapped data (`0x89` → `0x2810`,
+    `0x08` → `0x0101`, `0x06` → `0x2820`/`0x2828`/`0x2830`/`0x2838`).
+  - `0x97` Enable/disable data — UNKNOWN.
+  - `0x99` Charging state / ChgState — UNKNOWN; possibly fed by the
+    `0x09xx` cluster currently labeled TENTATIVE Charging.
 
-| Field                         | Purpose                          |
-|-------------------------------|----------------------------------|
-| HWID                          | Hardware identifier              |
-| FWVersion                     | X700 firmware version            |
-| HWVersion                     | X700 hardware version            |
-| DeviceName                    | Cloud-side device name           |
-| Host / Port                   | Cloud endpoint                   |
-| APN UserName / APN Password   | Cellular APN credentials         |
-| MQTT UserName / MQTT Password | MQTT broker credentials          |
-
-Related observed UI: the DTU panel on the System overview tab shows
-GPRS / LAC / MCC / MNC / Carrier / signal-strength fields, also currently
-empty. Consistent with the BMS having a built-in cellular modem capability
-that is not provisioned on the as-shipped Solectrac unit.
-
-TENTATIVE: UDANN message IDs 0x98 (WiFi info) and 0x9D (WiFi / DTU)
-documented above are likely how this data is read / written over UDS;
-explicit DID mapping UNKNOWN.
-
-## Remote/Force Control Functions
-
-The software can remotely command the BMS via protobuf messages:
-
-- `RemoteControlMessage` — top-level control envelope
-  - `WorkModeControlMessage` — system lock/unlock, system reset
-  - `MosForceControlMessage` — force MOS switch states (per MOS index)
-  - `ForceControlState` — enum: `MosStateEnum`
-- `F700WriteForceContrl` — write force control to F700 BMS
-- `P700MOSForceContrl` — force MOS control on P700
-- `U600ElecLockForceContrl` — electric lock force control
-- `U600HLSSForceContrl` — HLSS force control
-- `ChgForceControl` / `ChgForceControlTime` — charger force control
-
-## Protobuf Message Types
-
-Main data messages (all implement ProtoMessage/ProtoReflect):
-- `ChargeMessage` — charge request current/voltage, connect state, fault flags
-- `DiagnosisMessage` — alarm count, diagnosis info
-- `ExtremumMessage` — max/min cell voltage & temp, SOC parameters
-- `TotalPackageMessage` — wraps ChargeMessage, DiagnosisMessage, ExtremumMessage, RemoteControlMessage, CloudServiceConfigMessage
-- `MosForceControlMessage` — MOS index, force control value, timestamp
-- `WorkModeControlMessage` — system lock/unlock, system reset
-- `RemoteControlMessage` — control type, cell balance state, plus above
-- `CloudServiceConfigMessage` — cloud service configuration
-
-## MCU Targets Mentioned
-
-- S32K142, S32K314 — NXP S32K automotive MCUs (both are ARM Cortex-M variants)
-- GD25Q64 — SPI NOR flash (Gigadevice, 64Mbit)
-- W25N01G — NAND flash (Winbond, 1Gbit)
-
-## Product Models
-
-F700/F702/F715/F717/F718/F719/F720/F721/F722/F723/F728/F729/F730/F732/F733/F735/F750/F751/F752/F753/F780/F781/F782/F783/F785/F786/F788
-E700/E720/E721/E730/E750/E751/E752/E753
-P700 (parallel BMS)
-U600 (another BMS variant)
-X700
-
-## Known CAN Interface Thread Log Prefixes
-
-- `[USBCAN]`, `[USBCAN_CX]`, `[USBCAN_GC]`, `[USBCAN_GC_PRO]`, `[USBCAN_2E_U]`, `[USBCAN_E_U]`
-- `[CANDTU]`
-- `[PCAN]`
-- `[isCAN]`
-- `[zqwl_CAN]`
-
-## TODO / Still Unknown
-
-- ~~Exact CAN arbitration ID(s) used for UDS communication (7E0/7DF range vs extended 29-bit)~~ **PARTIALLY RESOLVED**: discovery sweep uses 11-bit standard IDs `0x740`, `0x7D0`, `0x36E` (and possibly `0x34E`); see "Connection Discovery Handshake" above. Response IDs and full per-model mapping still UNKNOWN.
-- ~~Exact byte sequence of the F700TestModeSwitch CAN frame~~ **RESOLVED**: Modbus FC 0x10 write to register 0x0E11; see "Test Mode" section above
-- Security access seed/key algorithm in uds_udan_key_calculator_YJC.go. Nine captured seed/key pairs recorded in §"Captured SecurityAccess seed/key pairs"; all simple/linear forms ruled out — the algorithm is nonlinear and won't fall to more captures alone. Path forward: decompile `app/iBMSUpper.exe` (the Go binary that computed these keys).
-- ~~Whether UDS test mode (P700/U600) uses 0x10 extended session or a custom routine (0x31); F700 does not use UDS at all~~ **PARTIALLY RESOLVED for the unlock step**: extended session (`10 03`) + SecAccess L1 (`27 01`/`27 02`). Whether *entering test mode* additionally requires a 0x31 routine or a `2E` write is still UNKNOWN.
-- ~~Mapping between the 0x8X message IDs and the wire-level UDS DIDs returned by `22 XX XX`~~ **5 mappings CONFIRMED**: `0x08`↔`0x0101` (Voltages), `0x09`↔`0x0102` (Temperatures), `0x93`↔`0x2800` (System state), `0x95`↔`0x2801` (Dis/charged time), `0x89`↔`0x2810` (Dis/charged energy). Still to map: `0x06` Peak data, `0x87` Alarm state, `0x94` Charging, plus the remaining `0x0Axx`/`0x0Bxx`/`0x79`/`0x86`/`0x88`/`0x97`/`0x99`/`0x9A`/`0x9B` family.
-- What does the connection-bootstrap RequestDownload write to memory address `0x00003A00` (1528 bytes, 3 × ~516 B TransferData blocks)? Possibly part of the SecAccess L1 unlock dance, an authentication blob, or a calibration table re-uploaded each session.
-- Which UI action triggers the late-session routine burst (`31 01 F0 09`–`31 01 F0 11` plus DIDs `0x0905`, `0x0962`, `0x064E`, `0x0670`, `0x0671`)? Not captured in screenshots — possibly an SOC inner tab (Total volt / Current / Cell volt / Temp) or a Sync/Write action.
-- Decode the still-tentative payloads: temperature offset for `0x0102` (need a capture with thermal spread); the remaining `0x2800` fields (offsets 6/8/10); `0x2810` offsets 4–11; `0x0EA0`/`0x0EA1` (balancing flags); `0x0ED0`–`0x0ED7` (open-wire/short flags); and the `0x09xx` BMS-tab block (Hlss / HV / Hall).
-- Promote `0x4000` from UNKNOWN to TENTATIVE "fault-flags block" (matches Alarm-state CSV column layout — all-zero in healthy state, scattered `0xFF` sentinels). Need a capture with an active fault to confirm.
-- Which F700 hardware variants use the alternate TestModeSwitch registers 0x0EDC and 0x0E13
-- Modbus slave address: default appears to be 0x01 but is configurable via `ReinitSlaveAddress`
-- CAN arbitration ID for UART-over-CAN Tx frames (runtime-configured, not hardcoded)
+  Net: most are probably duplicate names or absent features. Confirming
+  this catalog-wide needs (a) an active-charge / active-fault / balancing
+  capture, and (b) an attempt to read each unmapped UDAN tag's likely DID
+  range to see what (if anything) responds.
+- **F700 sibling family** (informational): which hardware variants use
+  TestModeSwitch alt registers `0x0EDC` / `0x0E13`.
