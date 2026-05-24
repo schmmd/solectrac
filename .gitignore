@@ -1,1 +1,5 @@
+.DS_STORE
+.lock
+.python-version
+uv.lock
 __pycache__
