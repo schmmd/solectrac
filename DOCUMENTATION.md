@@ -371,18 +371,29 @@ Smallest spread observed across all captures: 3 mV (124 frames in
 
 | Byte | data[]  | Meaning                                                     |
 |------|---------|-------------------------------------------------------------|
-| 1    | data[0] | 0x03 constant                                               |
-| 2    | data[1] | **Pack terminal voltage**: V = raw × 0.1 + 76.8             |
+| 1    | data[0] | **Frame variant**: 0x03 = normal, 0x02 = high-load cruise (see below) |
+| 2    | data[1] | **Pack terminal voltage**: V = raw × 0.1 + 76.8 (only valid when data[0] = 0x03) |
 | 3..4 | data[2..3] BE | **Signed pack current**: A = (be16 − 0x7D00) × 0.1    |
 | 5    | data[4] | **BMS-published SOC** (TENTATIVE; two-point fit at 80 %/90 %) |
 | 6    | data[5] | 0xFA constant — **leading SOH candidate** (250 raw × 0.4 %/bit = 100 %) |
 | 7    | data[6] | 0x14 (= 20) — series cell count                             |
 | 8    | data[7] | 0x00 constant                                               |
 
+**Frame variant (data[0]).** `0x03` in normal operation; flips to
+`0x02` when the tractor is driven at top speed in high gear, around
+the point motor RPM crosses into the 2800-RPM speed-cap region and
+throttle starts backing off into the limiter. When data[0] = `0x02`,
+data[1] reads `0xFC–0xFF` (decodes to the impossible 101.6–102.3 V via
+the normal scale), so data[1] is a J1939 "not available" sentinel in
+this mode — cell-sum from F113..F13C remains the trustworthy pack-V
+source. data[2..3] (current) remains valid in both variants. Variant
+`0x02` is not observed in regen or in lighter-load driving.
+
 **Pack terminal voltage** anchored by linear regression of data[1]
-versus 20 × mean(cell mV) across 24 captures (residuals < 0.55 V), and
-cross-checked against the FF50 charger frame which uses an identical
-encoding (R² = 0.986 across 2863 active-charging frames).
+versus 20 × mean(cell mV) across 24 captures with data[0] = 0x03
+(residuals < 0.55 V), and cross-checked against the FF50 charger frame
+which uses an identical encoding (R² = 0.986 across 2863
+active-charging frames).
 
 **Pack current** is signed BE-16 with a fixed bias of 0x7D00 (raw
 32000 = 0 A) at 0.1 A/bit. Convention: positive = drawing from pack,
@@ -554,7 +565,7 @@ real-time inverter feed).
 
 | Byte | data[]        | Meaning                                                          |
 |------|---------------|------------------------------------------------------------------|
-| 1    | data[0]       | Throttle pedal position, raw (0..0xCC observed; SPN 91 candidate) |
+| 1    | data[0]       | Throttle pedal position, raw 0..0xFF                              |
 | 2    | data[1]       | 0x00 constant — fault-bitmap candidate (UNKNOWN)                  |
 | 3..4 | data[2..3] LE | **Motor RPM**: rpm = (le16) − 0x0C80                       |
 | 5    | data[4]       | **Controller temperature**: °C = raw − 40 (TENTATIVE)             |
@@ -568,18 +579,20 @@ Reverse is signaled separately by data[7]. Physical source is the
 2-channel A/B quadrature encoder on the motor shaft — see "Motor
 speed encoder" below for the MC-side pinout.
 
-**Throttle pedal position (data[0]).** Consistent with J1939 SPN 91
-(Accel Pedal Position 1) at 0.4 %/bit with raw 250 = 100 %:
+**Throttle pedal position (data[0]).** Raw 0..0xFF spanning the pedal
+range, no SPN-91 0.4 %/bit scaling applied. Observed ceilings:
 
-    0x69 = 42 % (neutral-only captures, max observed)
-    0x96 = 60 % (reverse, real load)
-    0xCC = 82 % (forward, real load)
+    0x69 = 105 (throttle in neutral)
+    0x96 = 150 (reverse, real load)
+    0xFF = 255 (forward, real load, top speed in high gear)
 
-The F/R ceiling asymmetry strongly suggests a controller-side
+The 0xFF ceiling under forward load rules out the earlier "raw 250 =
+100 %" guess — full-scale is 0xFF, and the byte is a raw ADC-style
+reading rather than the J1939 SPN 91 encoding. The forward/reverse
+ceiling asymmetry (0xFF vs 0x96) points to a controller-side
 reverse-speed limiter applied before the byte goes on the wire. Idle
 resting offset ~3 (sensor noise); below raw ~14 the controller's dead
-band keeps RPM near 0. True 250-bit full-scale is a J1939-convention
-guess pending a "pedal mashed hard in F under load" capture.
+band keeps RPM near 0.
 
 **Controller and motor temperatures (data[4], data[5]) — TENTATIVE.** Both u8 with
 the J1939 −40 °C offset. Raw 0 = not present (suppressed). data[4] is
@@ -629,6 +642,10 @@ within each range:
 2800 RPM), not a gear stage — it does not change the ratio, only the
 maximum motor RPM and therefore the maximum ground speed within the
 selected range.
+
+The cap is **throttle-side only**: it limits inverter-commanded RPM,
+not coast/regen overspeed. Motor RPM > 3000 has been observed in
+F-mode (cap = 2800) while regen is active.
 
 This resolves the motor → wheel ground-speed derivation without
 needing to compute the gear ratio explicitly: read motor RPM from
@@ -1116,10 +1133,6 @@ Code 51 is listed out of numeric order in the manual.
   logical SAs emitted by one of the four documented ECUs (cluster is
   the natural candidate). Worth re-examining the captures with the
   4-node constraint as the prior.
-- **True throttle full-scale.** FF21CA data[0] = 0xCC = 204 observed
-  in forward under real load; J1939 SPN 91 convention is raw 250 =
-  100 % but not yet ground-truth. A "pedal mashed hard in F under
-  load" capture would settle it.
 - **Motor encoder PPR.** Not documented in any manual (service manual,
   CET operator manual, parts catalog, Curtis 1238 manual). The encoder
   connector pinout is now known — signal on pins 2 & 3, supply on
