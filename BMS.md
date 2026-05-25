@@ -81,9 +81,12 @@ are required before any write or routine call is honored.
 3.  06 27 02 <4-byte key>                    → 02 67 02                   SecAccess L1: send key
 ```
 
-The L1 key algorithm is custom (Go source `uds_udan_key_calculator_YJC.go`
-inside `app/iBMSUpper.exe`). Cryptanalysis on 9 captured pairs has ruled
-out all simple/linear forms — see "SecAccess L1" in the reverse-engineering notes appendix.
+The L1 key algorithm (CONFIRMED, fully reversed) is implemented in
+compiled C inside `app/iBMSUpper.exe` (cgo-called from
+`uds_udan_key_calculator_YJC.go`). Python reimplementation:
+`util/udan_seedkey.py` — verifies 9/9 captured pairs. See "SecAccess L1
+key algorithm" in the reverse-engineering notes appendix for the full
+derivation.
 
 ### Connection bootstrap
 
@@ -323,6 +326,95 @@ Facts about the UDAN iBMS PC Utility itself: what's in the binary, what
 adapters it supports, what its UI looks like, what it does on connect,
 and what file formats it produces. Reference material, not active
 investigation.
+
+### Working with the binary
+
+Recipe to unpack from the installer (re-runnable; outputs are
+`.gitignore`-able):
+
+```sh
+mkdir -p extract && innoextract -d extract 'docs/iBMSUpper-setup-x86(v3.1.7).exe'
+cp extract/app/iBMSUpper.exe extract/iBMSUpper.unpacked.exe
+upx -d extract/iBMSUpper.unpacked.exe         # 29 MB packed → 37 MB unpacked
+```
+
+The unpacked binary is a Windows PE32 (x86, 32-bit) Go 1.15.15 build
+with cgo. PE-side symbols are stripped, but Go's pclntab is intact at
+file offset `0x2014000` (15578 function entries). Recovery tool:
+
+```sh
+python3 util/parse_pclntab.py extract/iBMSUpper.unpacked.exe --filter <regex>
+```
+
+`r2 -A` is unusable on this binary (silent on stdout for unclear
+reasons in r2 6.1.4). The working pattern is:
+1. Locate function address via `parse_pclntab.py` (fast, no analysis).
+2. Disassemble directly with `r2 -2 -q -c 'e scr.color=0; s <addr>; pd N' file`.
+
+### Architecture: Go + cgo C functions
+
+The seed/key, both CRCs, and at least some I/O helpers are **compiled
+C functions called from Go via cgo**. Naming convention: a Go function
+named `_Cfunc_Foo` (e.g. `main._Cfunc_CalculateKey`, `main._Cfunc_Crc_CalculateCRC16`)
+is a thin marshalling stub; the real implementation is a C function the
+stub dispatches to via `runtime.asmcgocall` with a pointer to an
+args/return struct on the Go stack. To find the C function: disassemble
+the `_Cfunc_*` Go function, look for `mov eax, [<fixed addr>]` followed
+by `call <asmcgocall-helper>` — the fixed address holds a pointer to a
+C-side trampoline, which in turn calls the real C function. The
+trampoline uses the cgo `_cgo_topofstack` pattern: `call topofstack;
+mov edi, eax; ... do work ...; call topofstack; sub eax, edi; mov
+[args + eax + N], result` (handles Go stack moves during the cgo call).
+
+### Function-address map (for future reversing)
+
+Targets identified but not yet reversed (Go symbols + PE virtual
+addresses, recovered from pclntab):
+
+| Function                                  | VA         | What it does                                              |
+|-------------------------------------------|------------|-----------------------------------------------------------|
+| `main.UDSKeyCalculateForUDAN`             | `0x9b9e80` | Go wrapper: validate seed-len=4, call C, return key       |
+| `main._Cfunc_CalculateKey`                | `0x9b61a0` | cgo stub for the C key function                           |
+| C function (no Go symbol)                 | `0xa4bca0` | C-side cgo trampoline                                     |
+| C function (no Go symbol)                 | `0xa4bb90` | The actual key algorithm — REVERSED, see SecAccess L1      |
+| CRC-16-CCITT LUT (256 × u16)              | `0x2731960`| Same poly 0x1021 LUT used by both key CRC steps            |
+| `main._Cfunc_Crc_CalculateCRC16`          | `0x9b6210` | cgo stub — Modbus CRC (F700 protocol)                      |
+| `main._Cfunc_Crc_CalculateCRC32`          | `0x9b62c0` | cgo stub                                                  |
+| `main.(*ConnectionCan).unlock`            | `0x958ec0` | Full SecAccess unlock flow on UDS connection               |
+| `main.(*ConnectionCan).tryUnlock`         | `0x958ec0` | (verify VA, near unlock)                                  |
+| `main.(*DeviceData).P700UnlockSys`        | `0x8b54a0` | Public unlock entry for P700-family BMS (Solectrac uses this) |
+| `main.(*ConnectionCan).uploadData`        | `0x957800` | UDS RequestUpload (0x35) wrapper — generic memory read     |
+| `main.(*ConnectionCan).uploadData_UDM`    | `0x955440` | Variant — possibly for UDM/dataflash addressing            |
+| `main.(*ConnectionCan).ReadHistoryData`   | `0x88bb40` | Event/log history read from W25N01G NAND                   |
+| `main.(*GD25Q64).*` (~10 methods)         | `0x95f9e0+`| SPI NOR address arithmetic (page/sector/block/spare)       |
+| `main.(*W25N01G).*` (~12 methods)         | `0x95fc30+`| SPI NAND address arithmetic                                |
+| `main.UniversalBurn_P7_boot`              | `0x99a950` | Write firmware *to* bootloader region (P7 family)          |
+| `main.UniversalBurn_P7_app2boot`          | `0x99d0e0` | Transition app→boot                                       |
+| `main.UniversalBurn_P7_app`               | `0x99f880` | Write firmware *to* app region                            |
+| `main.(*ConnectionCan).P700CheckBootMode` | `0x88fb00` | Probe whether BMS is in bootloader mode                    |
+| `main.(*ConnectionCan).P700UpdateRun`     | `0x890a00` | Drive a firmware-update session                            |
+| `main.(*ConnectionCan).SetUpdatePage`     | `0x88b4c0` | Per-page write during update                              |
+
+A look-once string also notable: `UdsRequestUploadNRC7F3531` — confirms
+the tool issues UDS service `0x35` and handles negative-response code
+`7F 35 31` (request-out-of-range). So the BMS *does* implement
+RequestUpload; the address range that it accepts is the open question
+for any "read MCU flash via UDS" attempt.
+
+### UI login (separate from UDS SecAccess)
+
+The iBMS app's username/password screen is NOT gated by the UDS
+seed/key algorithm — it's a separate, app-level check. `main.LoginCache`
+(`0x882870`) reads a local JSON cache (fields `userName`, `passWord`,
+`userType` + timestamp). If empty, `main.LoginLocal` (`0x882b40`) calls
+the UDAN cloud at `udandtu-web-admin/client/...` over the configured
+host/port from `handlLoginAddress`/`handlLoginPort`. No hardcoded
+backdoor in either function. Failure strings:
+`"username/password authentication failed"` (remote rejection),
+`"invalid username/password version"` (cache schema mismatch).
+Local UDS / Modbus operations don't appear to require the UI to be
+logged in — the login gates cloud-routed features (uploads, OTA).
+
 
 ### iBMS PC Utility — software provenance
 
@@ -602,44 +694,84 @@ inside `app/iBMSUpper.exe`. Captured (seed, key) pairs:
 Seeds are non-deterministic per session; each listed key was accepted
 (positive `02 67 02` response).
 
-**Ruled out** (via `util/crack_bms_seedkey.py` / `crack_bms_seedkey2.py`):
+CONFIRMED key algorithm (reversed from `app/iBMSUpper.exe` v3.1.6):
 
-- `key = seed XOR C`, `seed ± C`, `seed · C mod 2³²` for any 32-bit `C`
-- `key = ROL(seed, r) XOR C` for all 32 rotations + two-stage rotate/xor
-- `key = bitrev(seed) XOR C`, `byteswap(seed) XOR C`, `~seed XOR C`
-- Per-nibble S-box (contradicts in nibble 0)
-- LFSR shift-and-XOR with common CRC polynomials (CRC32, CRC16-CCITT,
-  CRC16-Modbus, etc.) over 8–64 rounds
-- **Any GF(2)-linear function of the seed**: the differences
-  `Δkᵢ = kᵢ⊕k₀` are not linear in `Δsᵢ = sᵢ⊕s₀`, so the algorithm
-  contains a genuinely nonlinear step (carry-propagating add,
-  multiplication, or LUT).
+The Go-side path is `main.UDSKeyCalculateForUDAN` → cgo wrapper
+`main._Cfunc_CalculateKey` (file offset 0x9b61a0) → C trampoline at
+0xa4bca0 → real C function at **0xa4bb90**. The C function takes a
+pointer to 4 seed bytes and returns a uint32.
 
-CONSEQUENCE: brute force on additional captured pairs alone is unlikely
-to succeed. Practical next steps:
+Algorithm (verified against 9/9 captured pairs):
 
-1. **Decompile `app/iBMSUpper.exe` directly** — a few hundred bytes of
-   Go in a binary we already have. Cheapest path.
-2. Search for a leaked/published UDAN seed-to-key routine (vendor UDAN,
-   hardware string `A650_C121.*`).
-3. Dump the BMS firmware (NXP S32K + GD25Q64 / W25N01G) and locate the
-   `27 01` handler's verify routine.
+1. Nibble-shuffle the 4 seed bytes `S0..S3` into `bufA`:
+   ```
+   bufA[0] = (S0 & 0x0F) | (S3 & 0xF0)
+   bufA[1] = (S1 & 0x0F) | (S2 & 0xF0)
+   bufA[2] = (S1 & 0xF0) | (S2 & 0x0F)
+   bufA[3] = (S0 & 0xF0) | (S3 & 0x0F)
+   ```
+2. `crcA = crc16_ccitt(bufA, init=0x13F8)` — poly 0x1021, MSB-first,
+   table at binary VA 0x2731960 is the standard CRC-16-CCITT LUT.
+3. Bit-mask-shuffle the ORIGINAL seed (not bufA) into `bufB`:
+   ```
+   bufB[0] = (S0 & 0x3C) | (S3 & 0xC3)
+   bufB[1] = (S1 & 0x3C) | (S2 & 0xC3)
+   bufB[2] = (S2 & 0x3C) | (S1 & 0xC3)
+   bufB[3] = (S3 & 0x3C) | (S0 & 0xC3)
+   ```
+4. `crcB = crc16_ccitt(bufB, init=0x76ED)` — same poly / LUT as step 2.
+5. Key (4 bytes big-endian on the wire) =
+   `(crcA & 0xFF) (crcB & 0xFF) (crcA >> 8) (crcB >> 8)`.
 
-### Bootstrap RequestDownload (UNKNOWN)
+Reference implementation: `util/udan_seedkey.py`. Example:
+
+```
+$ python3 util/udan_seedkey.py 0D4AF974
+38 20 62 9F
+```
+
+The algorithm is GF(2)-**affine**: `key = M · seed ⊕ c` where `c =
+calc_key(0) = 0x888CCA87` and `M` is a fixed 32×32 binary matrix
+(verified: `key_i ⊕ key_j = calc_key(seed_i ⊕ seed_j) ⊕ c` for all
+36 pairs from the 9 captures). This is consistent with the algorithm
+being two CRC-16s (linear in GF(2)) with nonzero init constants
+(adding the affine offset) over linearly-shuffled inputs.
+
+Earlier cryptanalysis ruled out pure linearity (`key = M · seed`, no
+constant) and many specific forms (XOR/add/multiply by constant,
+rotations, bit-reverse, byte-swap, complement, per-nibble S-box, LFSR
+with common polynomials), but the GF(2)-linear test was run in the
+homogeneous form — adding a free affine constant would have solved
+it from the 9 captures alone, since 4 well-chosen seeds suffice to
+pin down all 32 columns of `M`.
+
+### Bootstrap RequestDownload (UNKNOWN purpose, CONFIRMED static)
 
 Every iBMS connection includes a 1528-byte write to BMS memory at
 `0x00003A00` (3 × ~516 B `TransferData` blocks, then `TransferExit`),
 inserted into the bootstrap sequence after the SecAccess unlock and
 before any UI polling. The payload is too small to be firmware.
-TENTATIVE hypotheses:
+
+The payload is **static across sessions** (CONFIRMED): the first frames of
+each `TransferData` chunk are byte-identical across five separate
+connection captures (`bms-connection.asc`, `-2`, `-3`, `-4`, `-5`):
+
+```
+36 01 → 01 00 3A BC ...
+36 02 → 34 37 07 2B ...
+36 03 → 0A C6 80 7B ...
+```
+
+This rules out a per-session challenge / session ticket and supports a
+fixed blob (calibration table or stored auth credential).
+
+TENTATIVE remaining hypotheses:
 
 - A bootstrap / authentication blob the tool installs into RAM
-- Part of the SecAccess L1 unlock dance (post-key challenge)
 - A calibration lookup table re-uploaded each session
 
-Resolution requires (a) decompiling the iBMS Go binary to find what
-prepares this blob, or (b) comparing the blob bytes across multiple
-sessions to see whether the payload is per-session or static.
+Resolution now requires decompiling the iBMS Go binary to find what
+prepares this blob (the per-session-vs-static question is settled).
 
 ### Late-session routine burst (UNKNOWN trigger)
 
@@ -660,16 +792,20 @@ Cell volt / Temp) that wasn't screenshotted.
 
 - **Active-charge capture.** Connect the charger, capture a session, and:
   (a) confirm the `0x94 Charging` DID-cluster field layout,
-  (b) test whether `0x4000` byte order matches the Alarm CSV column order,
-  (c) catch the F194F3 broadcast PGN on the OBD-II side (predicted in
-  `DOCUMENTATION.md`).
+  (b) test whether `0x4000` byte order matches the Alarm CSV column order.
 - **Active-fault capture or injection.** Needed to lock down per-byte
-  semantics of `0x4000`.
-- **Thermal-spread capture.** Needed to nail down the `0x0102`
-  temperature offset (currently TENTATIVE `°C = raw − 40`).
-- **SecAccess L1 algorithm.** Decompile `app/iBMSUpper.exe` — see
-  "SecAccess L1" above.
-- **Bootstrap RequestDownload payload.** See above.
+  semantics of `0x4000`. Note: the on-pack historical CSV log only ever
+  records two fault types (`ChgOV`, `ChgPackOV`) across all 240 rows, so
+  the on-NAND history alone won't map most byte positions — a live wire
+  capture with the fault active is required.
+- **Thermal offset.** `0x0102` is currently TENTATIVE `°C = raw − 40`.
+  Wire-vs-UI alignment in `bms-screenshots.asc` (raw `41 41 41 41 40 41 41`)
+  against Screenshots (2)/(3)/(4) shows all 7 probes displayed as 1°C,
+  which is inconsistent with both `raw − 40` and `raw − 64` — the single
+  `0x40` outlier should produce a distinct °C value but doesn't. Needs a
+  capture with non-uniform probe temperatures to disambiguate.
+- **Bootstrap RequestDownload payload.** Confirmed static across sessions
+  (see above); remaining open question is what the blob *is*.
 - **Late-session routine burst trigger.** See above.
 - **Remaining tentative payload fields:** `0x2800` offsets 6/8/10;
   `0x2810` offsets 4–11; `0x0EA0`/`0x0EA1` (balancing); `0x0ED0`–`0x0ED7`
@@ -688,9 +824,13 @@ Cell volt / Temp) that wasn't screenshotted.
   - `0x99` Charging state / ChgState — UNKNOWN; possibly fed by the
     `0x09xx` cluster currently labeled TENTATIVE Charging.
 
-  Net: most are probably duplicate names or absent features. Confirming
-  this catalog-wide needs (a) an active-charge / active-fault / balancing
-  capture, and (b) an attempt to read each unmapped UDAN tag's likely DID
-  range to see what (if anything) responds.
+  Net: most are probably duplicate names or absent features. Indirect
+  support: the BMS's own historical CSV export contains exactly 8 files,
+  one per already-mapped tag (`0x06`, `0x08`, `0x09`, `0x87`, `0x89`,
+  `0x93`, `0x94`, `0x95`) — no CSV for any of the unmapped tags above.
+  The pack itself doesn't log these tags. Definitive confirmation still
+  needs (a) an active-charge / active-fault / balancing capture, and (b)
+  an attempt to read each unmapped UDAN tag's likely DID range to see
+  what (if anything) responds.
 - **F700 sibling family** (informational): which hardware variants use
   TestModeSwitch alt registers `0x0EDC` / `0x0E13`.
