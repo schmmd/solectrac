@@ -70,11 +70,26 @@ class IsoTpTimeout(IsoTpError):
 class IsoTp:
     """Single-target ISO-TP 15765-2 over classic CAN, 11-bit IDs, 8-byte frames."""
 
-    def __init__(self, bus: can.BusABC, req_id: int, resp_id: int, pad: int = 0x00):
+    def __init__(
+        self,
+        bus: can.BusABC,
+        req_id: int,
+        resp_id: int,
+        pad: int = 0x00,
+        reader: Optional["can.BufferedReader"] = None,
+        writer: Optional["can.Listener"] = None,
+    ):
         self.bus = bus
         self.req_id = req_id
         self.resp_id = resp_id
         self.pad = pad
+        # When ``reader`` is set, a Notifier owns ``bus.recv()`` so we must
+        # consume from the BufferedReader instead — otherwise the Notifier
+        # thread and our recv() race for incoming frames.
+        self.reader = reader
+        # When ``writer`` is set, also log our outgoing requests; most CAN
+        # backends don't echo TX frames back through ``bus.recv()``.
+        self.writer = writer
 
     def _pad(self, data: bytes) -> bytes:
         if len(data) >= 8:
@@ -86,15 +101,23 @@ class IsoTp:
             arbitration_id=self.req_id,
             data=self._pad(data),
             is_extended_id=False,
+            is_rx=False,
+            timestamp=time.time(),
         )
         self.bus.send(msg)
+        if self.writer is not None:
+            self.writer.on_message_received(msg)
 
     def _recv_frame(self, deadline: float) -> can.Message:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise IsoTpTimeout("no response frame")
-            msg = self.bus.recv(timeout=min(remaining, FRAME_TIMEOUT))
+            timeout = min(remaining, FRAME_TIMEOUT)
+            if self.reader is not None:
+                msg = self.reader.get_message(timeout=timeout)
+            else:
+                msg = self.bus.recv(timeout=timeout)
             if msg is None:
                 continue
             if msg.is_extended_id or msg.arbitration_id != self.resp_id:
@@ -229,14 +252,30 @@ def read_did(tp: IsoTp, did: int) -> bytes:
 
 
 class LiveTransport:
-    def __init__(self, bus: can.BusABC, desc: str, req_id: int = REQ_ID, resp_id: int = RESP_ID):
+    def __init__(
+        self,
+        bus: can.BusABC,
+        desc: str,
+        req_id: int = REQ_ID,
+        resp_id: int = RESP_ID,
+        reader: Optional["can.BufferedReader"] = None,
+        writer: Optional["can.Listener"] = None,
+        notifier: Optional["can.Notifier"] = None,
+    ):
         self.bus = bus
         self._desc = desc
-        self.tp = IsoTp(bus, req_id, resp_id)
+        self._reader = reader
+        self._writer = writer
+        self._notifier = notifier
+        self.tp = IsoTp(bus, req_id, resp_id, reader=reader, writer=writer)
 
     def drain(self):
-        while self.bus.recv(timeout=0.05) is not None:
-            pass
+        if self._reader is not None:
+            while self._reader.get_message(timeout=0.05) is not None:
+                pass
+        else:
+            while self.bus.recv(timeout=0.05) is not None:
+                pass
 
     def read_did(self, did: int) -> bytes:
         return read_did(self.tp, did)
@@ -245,6 +284,12 @@ class LiveTransport:
         return self._desc
 
     def close(self):
+        # Order matters: stop the Notifier first so no further frames are
+        # dispatched to the writer, then flush the writer, then close the bus.
+        if self._notifier is not None:
+            self._notifier.stop()
+        if self._writer is not None:
+            self._writer.stop()
         self.bus.shutdown()
 
 
