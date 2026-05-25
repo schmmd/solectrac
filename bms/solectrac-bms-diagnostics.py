@@ -27,6 +27,7 @@ Usage:
     ./solectrac-bms-diagnostics.py --replay data/bms/bms-screenshots.asc
     ./solectrac-bms-diagnostics.py --replay data/bms/bms-screenshots.asc \\
         --replay-speed 5 --no-loop
+    ./solectrac-bms-diagnostics.py --output session.asc          # record bus
 
 Then open http://127.0.0.1:8000/ (or pass --open to launch the browser).
 """
@@ -778,6 +779,8 @@ def poller_thread(transport, st: BmsState, lock: threading.Lock,
 
 def open_transport(args):
     if args.replay:
+        if args.output:
+            raise SystemExit("--output cannot be combined with --replay")
         return ReplayTransport(
             args.replay, speed=args.replay_speed, loop=not args.no_loop
         )
@@ -797,7 +800,17 @@ def open_transport(args):
         desc = f"slcan {args.channel} @ {BITRATE // 1000} kbit/s"
     else:
         raise SystemExit(f"unknown interface: {args.interface}")
-    return LiveTransport(bus, desc)
+
+    reader = None
+    writer = None
+    notifier = None
+    if args.output:
+        writer = can.ASCWriter(args.output)
+        reader = can.BufferedReader()
+        notifier = can.Notifier(bus, [writer, reader])
+        desc += f"  → {args.output}"
+
+    return LiveTransport(bus, desc, reader=reader, writer=writer, notifier=notifier)
 
 
 # ---------------------------------------------------------------------------
@@ -1491,6 +1504,11 @@ def main():
                         "(default: can0 — for slcan use e.g. /dev/tty.usbmodem1101)")
     p.add_argument("--rate", type=float, default=1.0,
                    help="polling rate in Hz (default: 1.0)")
+    # Output recording
+    p.add_argument("--output", metavar="FILE",
+                   help="record all CAN frames (live bus traffic + our UDS "
+                        "requests) to an ASC file while running. Live "
+                        "transports only — incompatible with --replay.")
     # Replay
     p.add_argument("--replay", metavar="FILE",
                    help="replay UDS responses from a captured CAN log "
