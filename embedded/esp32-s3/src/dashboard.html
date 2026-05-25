@@ -177,7 +177,7 @@ function update(d){
   document.getElementById('pval').textContent=pkw!=null?pkw.toFixed(1):'–';
   document.getElementById('punit').textContent=pkw!=null?'kW ('+Math.round(pkw/15*100)+'%)':'kW';
   document.getElementById('dir').innerHTML=
-    [['F',1],['N',0],['R',-1]].map(function(x){
+    [['R',-1],['N',0],['F',1]].map(function(x){
       return'<div class="dirbtn '+(m.direction===x[1]?'on':'')+'">'+x[0]+'</div>';
     }).join('');
   document.getElementById('mid').innerHTML=
