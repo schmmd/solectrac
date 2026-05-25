@@ -481,12 +481,13 @@ Discharging, Fault, Sleep); not observed in captured data.
 
 Layout matches the standard J1939 limits-frame template:
 
-| Bytes | Likely meaning                          | Observed                                                  |
-|-------|-----------------------------------------|-----------------------------------------------------------|
-| 0..1  | Discharge current limit, 0.01 A/bit     | 0x38A4 (145.0 A) driving / 0x2710 (100.0 A) charging      |
-| 2..3  | Charge current limit, 0.01 A/bit        | 0x2710 (100.0 A) typically; 0x3070 (124.0 A) seen driving |
-| 4..5  | Voltage limit, 0.2 V/bit (guess)        | 0x0000 (charger inserted) / 0x0176 (driving)              |
-| 6..7  | (unknown)                               | 0x0000                                                    |
+| Bytes | Likely meaning                              | Observed                                                  |
+|-------|---------------------------------------------|-----------------------------------------------------------|
+| 0..1  | Discharge current limit, 0.01 A/bit         | 0x38A4 (145.0 A) driving / 0x2710 (100.0 A) charging      |
+| 2..3  | Charge current limit, 0.01 A/bit            | 0x2710 (100.0 A) typically; 0x3070 (124.0 A) seen driving |
+| 4     | Mode flag — CONFIRMED                       | 0x00 charging / 0x01 driving                              |
+| 5     | Pack-voltage echo (non-linear, banded)      | 0x00 charging / banded values during driving (see below)  |
+| 6..7  | (unknown)                                   | 0x0000                                                    |
 
 Bytes 0..1 stay pinned at 145.0 A throughout drive captures even when
 actual pack current on F100F3 peaks above 230 A during high-gear
@@ -497,6 +498,32 @@ protection living on separate voltage-sag and temperature thresholds.
 Bytes 2..3 are not always 0x2710 as previously noted; at least one
 driving capture shows 0x3070 (124.0 A), so the slot does carry
 meaningful values rather than being a permanent sentinel.
+
+Byte 5 is a pack-voltage echo with a non-linear, banded encoding. Across 5,921
+driving frames in 24 captures, b5 deterministically predicts F100F3 V_pack:
+within-bucket V_pack standard deviation is 0.00–0.20 V, and treating b5 as a
+categorical predictor yields R² = 0.9994 (η²). The discharge-voltage-limit and
+contactor-diagnostic theories are ruled out: a static limit would not
+tick-by-tick track instantaneous V_pack, and contactor state is discrete rather
+than admitting a near-perfect functional dependence.
+
+The mapping is not a single linear curve, however. Three observed bands:
+
+| b5 range  | V_pack         | Regime                           |
+|-----------|----------------|----------------------------------|
+| 0x5A–0x61 | 76.9–78.5 V    | Heavy-load sag                   |
+| 0x6F–0x77 | 81.6–83.3 V    | Sustained drive                  |
+| 0x56–0x59 | 101.7–102.2 V  | Idle / pre-current-draw          |
+
+The two driving bands share roughly the same ~0.22 V/bit slope but different
+intercepts; the high-voltage idle band has a similar slope and a third
+intercept. A single linear formula `V_pack ≈ b5 × 0.2212 + 57.01` fits only
+the 0x6F–0x77 band; pooled across all driving samples its R² collapses to
+0.04. The values 0x4A and 0x4D, previously listed as init/teardown
+transients, actually slot into the heavy-load band at plausible V_pack and
+are not anomalous. The encoding scheme that produces the banded behaviour
+isn't pinned down. Not surfaced as a separate channel — the full-precision
+pack voltage is already on `state.pack_v`.
 
 #### F108F3 — BMS active fault bitmap — CONFIRMED via injection
 
