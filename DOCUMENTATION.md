@@ -481,17 +481,22 @@ Discharging, Fault, Sleep); not observed in captured data.
 
 Layout matches the standard J1939 limits-frame template:
 
-| Bytes | Likely meaning                          | Observed                                       |
-|-------|-----------------------------------------|------------------------------------------------|
-| 0..1  | Discharge current limit, 0.1 A/bit      | 0x2710 (charger inserted) / 0x38A4 (driving)   |
-| 2..3  | Charge current limit, 0.1 A/bit         | 0x2710 in every capture                        |
-| 4..5  | Voltage limit, 0.2 V/bit (guess)        | 0x0000 (charger inserted) / 0x0176 (driving)   |
-| 6..7  | (unknown)                               | 0x0000                                         |
+| Bytes | Likely meaning                          | Observed                                                  |
+|-------|-----------------------------------------|-----------------------------------------------------------|
+| 0..1  | Discharge current limit, 0.01 A/bit     | 0x38A4 (145.0 A) driving / 0x2710 (100.0 A) charging      |
+| 2..3  | Charge current limit, 0.01 A/bit        | 0x2710 (100.0 A) typically; 0x3070 (124.0 A) seen driving |
+| 4..5  | Voltage limit, 0.2 V/bit (guess)        | 0x0000 (charger inserted) / 0x0176 (driving)              |
+| 6..7  | (unknown)                               | 0x0000                                                    |
 
-0x2710 = 10000 is almost certainly a J1939 "not available" sentinel
-(the more conventional 0xFFFF wasn't used here). Pinning this down
-needs a charge capture from low SOC where meaningful charge-current
-limits are published.
+Bytes 0..1 stay pinned at 145.0 A throughout drive captures even when
+actual pack current on F100F3 peaks above 230 A during high-gear
+acceleration (one capture peaked at 233.9 A while F107 never widened).
+So this field is not an enforced instantaneous ceiling — most plausibly
+a continuous/nameplate rating broadcast as an advisory, with real
+protection living on separate voltage-sag and temperature thresholds.
+Bytes 2..3 are not always 0x2710 as previously noted; at least one
+driving capture shows 0x3070 (124.0 A), so the slot does carry
+meaningful values rather than being a permanent sentinel.
 
 #### F108F3 — BMS active fault bitmap — CONFIRMED via injection
 
