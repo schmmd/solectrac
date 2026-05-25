@@ -1164,9 +1164,9 @@ def render_pack(state: State, mains_v: float, efficiency: float,
             used = 0.0
         limit = limit_ch.value if limit_ch is not None else None
         if limit is not None and limit > 0:
-            frac = max(0.0, min(1.0, used / limit))
+            frac = max(0.0, used / limit)
             bar_w = 14
-            filled = int(round(frac * bar_w))
+            filled = min(bar_w, int(round(frac * bar_w)))
             bar = Text("█" * filled + "░" * (bar_w - filled))
             if frac >= 0.9:
                 style = "bold red"
