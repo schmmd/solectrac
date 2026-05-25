@@ -220,8 +220,20 @@ function refresh(){
   fetch('/json').then(function(r){return r.json();}).then(update)
     .catch(function(){document.getElementById('foot').textContent='Error — retrying…';});
 }
-refresh();
-setInterval(refresh,200);
+// When hosted inside the Android WebView, window.SolectracBridge is injected
+// by MainActivity. We then receive pushed JSON via dispatchSolectracUpdate
+// (called from the BLE reassembler) instead of polling /json.
+window.dispatchSolectracUpdate=function(s){
+  try{update(JSON.parse(s));}
+  catch(e){document.getElementById('foot').textContent='Bad payload';}
+};
+if(window.SolectracBridge){
+  document.getElementById('foot').textContent='Waiting for BLE…';
+  try{window.SolectracBridge.ready();}catch(e){}
+}else{
+  refresh();
+  setInterval(refresh,200);
+}
 </script>
 </body>
 </html>

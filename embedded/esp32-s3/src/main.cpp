@@ -21,15 +21,27 @@
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include "driver/twai.h"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
+#ifndef WIFI_SSID
+#error "Set WIFI_SSID env var before building"
+#endif
+#ifndef WIFI_PASS
+#error "Set WIFI_PASS env var before building"
+#endif
+
 #define CAN_TX_PIN GPIO_NUM_8
 #define CAN_RX_PIN GPIO_NUM_14
 
-// WiFi runs as a soft-AP only — the board broadcasts its own hotspot and
-// clients (phone, laptop) join it directly. AP IP is 192.168.4.1.
+// WiFi runs in dual AP+STA mode: the board always broadcasts its own hotspot
+// (so it's reachable in the field), and concurrently tries to join the
+// configured home network for bench use. AP IP is 192.168.4.1.
 #define AP_SSID "solectrac"
 #define AP_PASS "electricity"
 
@@ -269,7 +281,7 @@ void updateLed() {
         ledWrite(g_led_on ? 32 : 0, 0, 0);
         return;
     }
-    if (!g_ap_running) {
+    if (!g_ap_running && WiFi.status() != WL_CONNECTED) {
         if (toggle) { g_led_last_toggle = now; g_led_on = !g_led_on; }
         ledWrite(g_led_on ? 24 : 0, g_led_on ? 12 : 0, 0);
         return;
@@ -306,6 +318,9 @@ static bool allZero(const uint8_t* d) {
 // ── CAN decoder ───────────────────────────────────────────────────────────────
 
 void decodeCAN(uint32_t can_id, const uint8_t* raw, uint8_t len) {
+    g_frames_rx++;
+    g_last_frame_ms = millis();
+
     uint8_t d[8] = {};
     memcpy(d, raw, len < 8 ? len : 8);
 
@@ -510,7 +525,9 @@ static void addFloat(JsonObject& obj, const char* key, float v, int decimals = 2
     }
 }
 
-String buildJson() {
+// `minimal` strips fields the HTML dashboard doesn't render — used to cut BLE
+// payload size. The full set is still served at /json.
+String buildJson(bool pretty = true, bool minimal = false) {
     JsonDocument doc;
 
     doc["uptime"] = millis() / 1000.0;
@@ -529,14 +546,16 @@ String buildJson() {
                 case TWAI_STATE_RECOVERING: can["state"] = "recovering"; break;
                 default:                    can["state"] = "unknown";    break;
             }
-            can["tec"]        = si.tx_error_counter;
-            can["rec"]        = si.rx_error_counter;
-            can["rx_missed"]  = si.rx_missed_count;
-            can["bus_errors"] = si.bus_error_count;
+            if (!minimal) {
+                can["tec"]        = si.tx_error_counter;
+                can["rec"]        = si.rx_error_counter;
+                can["rx_missed"]  = si.rx_missed_count;
+                can["bus_errors"] = si.bus_error_count;
+            }
         }
     }
     can["frames_rx"]      = g_frames_rx;
-    can["frames_decoded"] = g_frames_decoded;
+    if (!minimal) can["frames_decoded"] = g_frames_decoded;
     if (g_frames_rx > 0)
         can["last_frame_age_s"] = (millis() - g_last_frame_ms) / 1000.0;
 
@@ -544,25 +563,27 @@ String buildJson() {
     auto pack = doc["pack"].to<JsonObject>();
     addFloat(pack, "voltage_v",    g_pack.voltage_v, 2);
     addFloat(pack, "current_a",    g_pack.current_a, 1);
-    if (g_pack.current_raw >= 0)   pack["current_raw"] = g_pack.current_raw;
+    if (!minimal && g_pack.current_raw >= 0) pack["current_raw"] = g_pack.current_raw;
     addFloat(pack, "power_w",      g_pack.power_w,   1);
-    if (g_pack.soc_raw)            pack["soc_raw"]  = g_pack.soc_raw;
+    if (!minimal && g_pack.soc_raw) pack["soc_raw"] = g_pack.soc_raw;
     addFloat(pack, "soc_pct",      g_pack.soc_pct,   1);
-    addFloat(pack, "v_estimate",   g_pack.v_estimate, 3);
+    if (!minimal) addFloat(pack, "v_estimate", g_pack.v_estimate, 3);
     auto cells_obj = pack["cells"].to<JsonObject>();
     if (g_pack.cell_max_mv >= 0)   cells_obj["max_mv"]    = g_pack.cell_max_mv;
     if (g_pack.cell_min_mv >= 0)   cells_obj["min_mv"]    = g_pack.cell_min_mv;
     if (g_pack.cell_spread_mv >= 0)cells_obj["spread_mv"] = g_pack.cell_spread_mv;
     if (g_pack.cell_max_n)         cells_obj["max_n"]     = g_pack.cell_max_n;
     if (g_pack.cell_min_n)         cells_obj["min_n"]     = g_pack.cell_min_n;
-    if (g_pack.cell_spread_mv_reported >= 0)
+    if (!minimal && g_pack.cell_spread_mv_reported >= 0)
         cells_obj["spread_mv_reported"] = g_pack.cell_spread_mv_reported;
     auto temp = cells_obj["temp_summary"].to<JsonObject>();
     if (g_pack.temp_max_c != INT8_MIN) temp["max_c"]    = g_pack.temp_max_c;
     if (g_pack.temp_min_c != INT8_MIN) temp["min_c"]    = g_pack.temp_min_c;
-    if (g_pack.temp_max_n)             temp["max_n"]    = g_pack.temp_max_n;
-    if (g_pack.temp_min_n)             temp["min_n"]    = g_pack.temp_min_n;
-    if (g_pack.temp_spread_c >= 0)     temp["spread_c"] = g_pack.temp_spread_c;
+    if (!minimal) {
+        if (g_pack.temp_max_n)             temp["max_n"]    = g_pack.temp_max_n;
+        if (g_pack.temp_min_n)             temp["min_n"]    = g_pack.temp_min_n;
+        if (g_pack.temp_spread_c >= 0)     temp["spread_c"] = g_pack.temp_spread_c;
+    }
 
     // Session energy summary
     auto sess = doc["session"].to<JsonObject>();
@@ -577,8 +598,10 @@ String buildJson() {
     float active_hours = g_session_active_ms / 3600000.0f;
     if (active_hours > 0.01f) {                            // ≥ ~36 s of data
         avg_power_w = (g_session_wh_drawn - g_session_wh_charged) / active_hours;
-        sess["avg_power_w"] = roundf(avg_power_w * 10.0f) / 10.0f;
-        sess["active_s"]    = g_session_active_ms / 1000;
+        if (!minimal) {
+            sess["avg_power_w"] = roundf(avg_power_w * 10.0f) / 10.0f;
+            sess["active_s"]    = g_session_active_ms / 1000;
+        }
     }
 
     if (!isnan(g_pack.soc_pct)) {
@@ -597,26 +620,30 @@ String buildJson() {
     }
 
     // Per-cell arrays (20 voltages, 7 temperatures; null if not yet received)
-    auto cells = cells_obj["voltages"].to<JsonArray>();
-    for (int i = 0; i < NUM_CELLS; i++) {
-        if (!isnan(g_cell_v[i]))
-            cells.add(roundf(g_cell_v[i] * 1000.0f) / 1000.0f);
-        else
-            cells.add(nullptr);
-    }
-    auto temps = cells_obj["temp_readings"].to<JsonArray>();
-    for (int i = 0; i < NUM_TEMPS; i++) {
-        if (!isnan(g_temp_c[i]))
-            temps.add((int)g_temp_c[i]);
-        else
-            temps.add(nullptr);
+    if (!minimal) {
+        auto cells = cells_obj["voltages"].to<JsonArray>();
+        for (int i = 0; i < NUM_CELLS; i++) {
+            if (!isnan(g_cell_v[i]))
+                cells.add(roundf(g_cell_v[i] * 1000.0f) / 1000.0f);
+            else
+                cells.add(nullptr);
+        }
+        auto temps = cells_obj["temp_readings"].to<JsonArray>();
+        for (int i = 0; i < NUM_TEMPS; i++) {
+            if (!isnan(g_temp_c[i]))
+                temps.add((int)g_temp_c[i]);
+            else
+                temps.add(nullptr);
+        }
     }
 
     // BMS state
     if (g_bms_state.valid) {
         auto st = doc["bms"]["state"].to<JsonObject>();
-        st["byte0"]          = g_bms_state.byte0;
-        st["byte1"]          = g_bms_state.byte1;
+        if (!minimal) {
+            st["byte0"] = g_bms_state.byte0;
+            st["byte1"] = g_bms_state.byte1;
+        }
         st["output_enable"]  = g_bms_state.output_enable  ? 1 : 0;
         st["main_contactor"] = g_bms_state.main_contactor ? 1 : 0;
         st["operating"]      = g_bms_state.operating      ? 1 : 0;
@@ -628,7 +655,7 @@ String buildJson() {
     }
 
     // BMS current limits
-    if (g_bms_limit.valid) {
+    if (!minimal && g_bms_limit.valid) {
         auto lim = doc["bms"]["limit"].to<JsonObject>();
         addFloat(lim, "discharge_a", g_bms_limit.discharge_a, 2);
         addFloat(lim, "charge_a",    g_bms_limit.charge_a,    2);
@@ -652,11 +679,11 @@ String buildJson() {
     // Motor
     if (g_motor.valid) {
         auto mot = doc["motor"].to<JsonObject>();
-        mot["rpm_signed"]    = g_motor.rpm_signed;
+        if (!minimal) mot["rpm_signed"] = g_motor.rpm_signed;
         mot["rpm_magnitude"] = g_motor.rpm_magnitude;
         mot["direction"]     = g_motor.direction;
         mot["range_gear"]    = g_motor.range_gear;
-        mot["throttle_raw"]  = g_motor.throttle_raw;
+        if (!minimal) mot["throttle_raw"] = g_motor.throttle_raw;
         // Ground speed from RPM × range (Turf/Industrial tire calibration,
         // per Operator Manual p34; Agri tires would need different coeffs).
         if (g_motor.range_gear >= 1 && g_motor.range_gear <= 3) {
@@ -676,13 +703,15 @@ String buildJson() {
     // Charger
     if (g_charger.valid) {
         auto chg = doc["charger"].to<JsonObject>();
-        chg["status"] = g_charger.status;
-        chg["v_raw"]  = g_charger.v_raw;
-        chg["i_raw"]  = g_charger.i_raw;
-        chg["flags"]  = g_charger.flags;
-        chg["output_disabled"] = g_charger.output_disabled ? 1 : 0;
-        chg["line_ok"]         = g_charger.line_ok         ? 1 : 0;
-        chg["no_line"]         = g_charger.no_line         ? 1 : 0;
+        if (!minimal) {
+            chg["status"] = g_charger.status;
+            chg["v_raw"]  = g_charger.v_raw;
+            chg["i_raw"]  = g_charger.i_raw;
+            chg["flags"]  = g_charger.flags;
+            chg["output_disabled"] = g_charger.output_disabled ? 1 : 0;
+        }
+        chg["line_ok"] = g_charger.line_ok ? 1 : 0;
+        chg["no_line"] = g_charger.no_line ? 1 : 0;
         addFloat(chg, "voltage_v", g_charger.voltage_v, 2);
         addFloat(chg, "current_a", g_charger.current_a, 1);
     }
@@ -690,34 +719,37 @@ String buildJson() {
     // BMS→charger command
     if (g_chgr_cmd.valid) {
         auto cmd = doc["chgr_cmd"].to<JsonObject>();
-        cmd["enable"] = g_chgr_cmd.enable;
+        if (!minimal) cmd["enable"] = g_chgr_cmd.enable;
         addFloat(cmd, "voltage_v", g_chgr_cmd.voltage_v, 1);
         addFloat(cmd, "current_a", g_chgr_cmd.current_a, 1);
-        if (g_chgr_cmd.v_raw) cmd["v_raw"] = g_chgr_cmd.v_raw;
-        if (g_chgr_cmd.i_raw) cmd["i_raw"] = g_chgr_cmd.i_raw;
+        if (!minimal && g_chgr_cmd.v_raw) cmd["v_raw"] = g_chgr_cmd.v_raw;
+        if (!minimal && g_chgr_cmd.i_raw) cmd["i_raw"] = g_chgr_cmd.i_raw;
     }
 
-    // Vehicle controller
-    if (g_vc_state != 0xFF)
-        doc["vc"]["state"] = g_vc_state;
+    if (!minimal) {
+        // Vehicle controller
+        if (g_vc_state != 0xFF)
+            doc["vc"]["state"] = g_vc_state;
 
-    // Dashboard
-    if (g_dash_alive != 0xFF)
-        doc["dash"]["alive"] = g_dash_alive;
+        // Dashboard
+        if (g_dash_alive != 0xFF)
+            doc["dash"]["alive"] = g_dash_alive;
 
-    // DM1 (raw FMI/OC/CM and lamp bytes — fault code is also in faults.mc)
-    if (g_dm1.valid) {
-        auto dm1 = doc["dm1"].to<JsonObject>();
-        dm1["lamp_byte0"] = g_dm1.lamp_byte0;
-        dm1["lamp_byte1"] = g_dm1.lamp_byte1;
-        dm1["dtc_spn"]    = g_dm1.dtc_spn;
-        dm1["dtc_fmi"]    = g_dm1.dtc_fmi;
-        dm1["dtc_cm"]     = g_dm1.dtc_cm;
-        dm1["dtc_oc"]     = g_dm1.dtc_oc;
+        // DM1 (raw FMI/OC/CM and lamp bytes — fault code is also in faults.mc)
+        if (g_dm1.valid) {
+            auto dm1 = doc["dm1"].to<JsonObject>();
+            dm1["lamp_byte0"] = g_dm1.lamp_byte0;
+            dm1["lamp_byte1"] = g_dm1.lamp_byte1;
+            dm1["dtc_spn"]    = g_dm1.dtc_spn;
+            dm1["dtc_fmi"]    = g_dm1.dtc_fmi;
+            dm1["dtc_cm"]     = g_dm1.dtc_cm;
+            dm1["dtc_oc"]     = g_dm1.dtc_oc;
+        }
     }
 
     String out;
-    serializeJsonPretty(doc, out);
+    if (pretty) serializeJsonPretty(doc, out);
+    else        serializeJson(doc, out);
     return out;
 }
 
@@ -745,14 +777,8 @@ static bool   slcan_open = false;
 void slcanSendFrame(const twai_message_t& msg) {
     if (!slcan_open) return;
     char line[32];
-    int n;
-    if (msg.extd) {
-        n = snprintf(line, sizeof(line), "T%08" PRIX32 "%u",
+    int n = snprintf(line, sizeof(line), "T%08" PRIX32 "%u",
                      msg.identifier, msg.data_length_code);
-    } else {
-        n = snprintf(line, sizeof(line), "t%03" PRIX32 "%u",
-                     msg.identifier & 0x7FF, msg.data_length_code);
-    }
     for (int i = 0; i < msg.data_length_code; i++)
         n += snprintf(line + n, sizeof(line) - n, "%02X", msg.data[i]);
     line[n++] = '\r';
@@ -869,6 +895,107 @@ void socketcandPoll() {
     }
 }
 
+// ── BLE (Nordic UART Service) ─────────────────────────────────────────────────
+// Pushes a compact (minimal) JSON snapshot to a single BLE central whenever it
+// differs from what we last sent. Framing on the wire is:
+//
+//     [u16 big-endian length] [length bytes of JSON]
+//
+// sent across N notifications of up to BLE_CHUNK_BYTES each. The Android
+// client reassembles by counting bytes against the length prefix. Connection
+// is unpaired — anyone in range with the NUS UUID can subscribe.
+//
+// MTU: we request 517 server-side; the actual MTU is whatever the client
+// negotiates. BLE_CHUNK_BYTES is conservative so a default-MTU client (23)
+// would still receive valid (if smaller) packets — but the Android app calls
+// requestMtu(517) on connect.
+//
+// RX characteristic is exposed for future command/control (e.g. reset session
+// counters); currently writes are accepted and ignored.
+
+#define NUS_SVC_UUID  "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_TX_UUID   "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_RX_UUID   "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+#define BLE_CHUNK_BYTES        180
+#define BLE_PUSH_INTERVAL_MS   200    // diff cadence — actual send only on change
+#define BLE_INTER_CHUNK_DELAY  5
+
+static BLEServer*         g_ble_server = nullptr;
+static BLECharacteristic* g_ble_tx     = nullptr;
+static volatile bool      g_ble_connected = false;
+static String             g_ble_last_payload;
+static uint32_t           g_ble_last_push_ms = 0;
+
+class BleServerCb : public BLEServerCallbacks {
+    void onConnect(BLEServer*) override {
+        g_ble_connected   = true;
+        g_ble_last_payload = "";   // force a full resend on (re)connect
+    }
+    void onDisconnect(BLEServer* s) override {
+        g_ble_connected   = false;
+        g_ble_last_payload = "";
+        s->getAdvertising()->start();   // resume advertising for the next client
+    }
+};
+
+void bleInit() {
+    BLEDevice::init("solectrac");
+    BLEDevice::setMTU(517);
+
+    g_ble_server = BLEDevice::createServer();
+    g_ble_server->setCallbacks(new BleServerCb());
+
+    BLEService* svc = g_ble_server->createService(NUS_SVC_UUID);
+    g_ble_tx = svc->createCharacteristic(NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+    g_ble_tx->addDescriptor(new BLE2902());
+    svc->createCharacteristic(NUS_RX_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+    svc->start();
+
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(NUS_SVC_UUID);
+    adv->setScanResponse(true);
+    BLEDevice::startAdvertising();
+}
+
+static void bleSendFramed(const String& payload) {
+    if (!g_ble_connected || !g_ble_tx) return;
+    size_t total = payload.length();
+    if (total > 65535) return;
+
+    // 8 KB scratch is plenty: minimal JSON for this dashboard runs ~600 B.
+    static uint8_t buf[2 + 8192];
+    size_t framed = 2 + total;
+    if (framed > sizeof(buf)) return;
+    buf[0] = (uint8_t)((total >> 8) & 0xFF);
+    buf[1] = (uint8_t)(total & 0xFF);
+    memcpy(buf + 2, payload.c_str(), total);
+
+    size_t off = 0;
+    while (off < framed) {
+        size_t n = framed - off;
+        if (n > BLE_CHUNK_BYTES) n = BLE_CHUNK_BYTES;
+        g_ble_tx->setValue(buf + off, n);
+        g_ble_tx->notify();
+        off += n;
+        if (off < framed) delay(BLE_INTER_CHUNK_DELAY);
+    }
+}
+
+void bleTick() {
+    if (!g_ble_connected) return;
+    uint32_t now = millis();
+    if (now - g_ble_last_push_ms < BLE_PUSH_INTERVAL_MS) return;
+    g_ble_last_push_ms = now;
+
+    String j = buildJson(false /*pretty*/, true /*minimal*/);
+    if (j != g_ble_last_payload) {
+        bleSendFramed(j);
+        g_ble_last_payload = j;
+    }
+}
+
 // ── Setup & loop ──────────────────────────────────────────────────────────────
 
 void setup() {
@@ -895,12 +1022,12 @@ void setup() {
         if (err == ESP_OK) g_can_initialized = true;
     }
 
-    // Soft-AP only: clients join the board's hotspot directly at 192.168.4.1.
-    // Disable modem sleep so the radio stays hot — saves ~50–150 ms per request
-    // at the cost of ~70 mA, fine on a tractor 12 V supply.
-    WiFi.mode(WIFI_AP);
+    // Bring up the soft-AP first so the board is always reachable in the field
+    // at 192.168.4.1 even if there's no home network in range. STA connect
+    // happens in the background; we don't block boot waiting on it.
+    WiFi.mode(WIFI_AP_STA);
     g_ap_running = WiFi.softAP(AP_SSID, AP_PASS);
-    WiFi.setSleep(WIFI_PS_NONE);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
 
     // Wildcard DNS on the soft-AP: any hostname (solectrac.local, solectrac,
     // captive-portal probes, etc.) resolves to the board's AP IP. Needed
@@ -917,21 +1044,23 @@ void setup() {
     socketcand_server.begin();
     socketcand_server.setNoDelay(true);
     MDNS.addService("socketcand", "tcp", SOCKETCAND_PORT);
+
+    bleInit();
 }
 
 void loop() {
     twai_message_t msg;
     while (twai_receive(&msg, 0) == ESP_OK) {
-        g_frames_rx++;
-        g_last_frame_ms = millis();
-        if (msg.extd)
+        if (msg.extd) {
             decodeCAN(msg.identifier, msg.data, msg.data_length_code);
-        slcanSendFrame(msg);
-        socketcandSendFrame(msg);
+            slcanSendFrame(msg);
+            socketcandSendFrame(msg);
+        }
     }
     slcanPoll();
     socketcandPoll();
     dns_server.processNextRequest();
     server.handleClient();
+    bleTick();
     updateLed();
 }
