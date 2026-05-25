@@ -1199,7 +1199,7 @@ DECODERS = [
      "derived (not transmitted): instantaneous pack power, signed; "
      "+ = discharging, - = charging. Emitted on every F100F3 frame."),
     ("pack.soc_raw", "F100", "F3", "4", "u8 (raw)",
-     "", "tentative",
+     "", "verified",
      "BMS-published SoC raw byte; saturates at 250 in soc-100-idle.asc"),
     ("pack.soc_pct", "F100", "F3", "4", "u8 * 0.4 - 0.8",
      "%", "verified",
