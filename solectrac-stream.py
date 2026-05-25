@@ -254,24 +254,21 @@ CHARGER_V_OFFSET_V = PACK_VOLTAGE_OFFSET_V
 CHARGER_I_LSB_A = 0.1
 RPM_BIAS = 0x0C80
 LIMIT_CURRENT_LSB_A = 0.01     # F107 bytes 0-1 / 2-3 BE, 0.01 A/bit
-# Throttle pedal scaling for FF21CA byte 0. Empirically the raw byte
-# behaves like J1939 SPN 91 (Accelerator Pedal Position 1) at 0.4 %/bit
-# (i.e. raw 250 / 0xFA = 100%). Maxima observed in the corpus:
-#   - asc/full-throttle-*.asc (neutral, no load): raw 0x69 = 105 -> 42%
-#   - real-world-on-driving-mowing-off.asc (forward, real load): 0xCC = 204 -> 82%
-#   - real-world-on-driving-mowing-off.asc (reverse, real load): 0x96 = 150 -> 60%
-# The forward/reverse asymmetry on the same pedal hardware suggests a
-# controller-side reverse-speed limiter applied before the byte goes on
-# the wire. Idle offset ~3 (sensor noise with foot off); controller
-# dead-low ~14 (below this, motor RPM stays at 0; matches the Kelly
-# TPS_dead_low concept from the hydraulic pump doc). The previous 0..100%
-# direct-percent model was contradicted by the real-world capture and
-# the 250-bit-full-scale assumption is itself a J1939-convention guess
-# pending a "pedal mashed hard in F under load" capture for ground truth.
-# Percent display is NOT clamped at 100% so a raw value above 250 will
-# render as >100% rather than silently saturating.
-THROTTLE_DEAD_LOW = 3          # idle resting offset (subtracted from raw)
-THROTTLE_PCT_PER_BIT = 0.4     # J1939 SPN 91 convention: raw 250 = 100%
+# Throttle pedal scaling for FF21CA byte 0. Raw 0..0xFF; the byte is a
+# raw ADC-style reading, not the J1939 SPN 91 0.4 %/bit encoding the
+# earlier hypothesis assumed. Maxima observed in the corpus:
+#   - asc/full-throttle-*.asc (neutral, no load): raw 0x69 = 105
+#   - real-world-on-driving-mowing-off.asc (forward, real load): 0xCC = 204
+#   - real-world-on-driving-mowing-off.asc (reverse, real load): 0x96 = 150
+#   - driving-2800rpm-highgear-loader.asc (forward, top speed in high
+#     gear, real load): 0xFF = 255  (full-scale ground truth)
+# The forward/reverse asymmetry on the same pedal hardware (0xFF vs
+# 0x96) points to a controller-side reverse-speed limiter applied
+# before the byte goes on the wire. Idle offset ~3 (sensor noise with
+# foot off); controller dead-low ~14 (below this, motor RPM stays at 0;
+# matches the Kelly TPS_dead_low concept from the hydraulic pump doc).
+THROTTLE_DEAD_LOW = 3                          # idle resting offset (subtracted from raw)
+THROTTLE_PCT_PER_BIT = 100.0 / (0xFF - THROTTLE_DEAD_LOW)  # raw 0xFF = 100%
 # Motor RPM -> ground speed coefficients per range, calibrated for the
 # Turf/Industrial tire option (23x8.5-12 front, 33x13.5-16.5 rear).
 # Source: CET Operator Manual page 34 travel-speed table
@@ -755,7 +752,7 @@ def decode(msg: "can.Message", state: State, now: float) -> None:
 
     elif src == SRC_MOTOR and pgn == PGN_FF21:
         # Layout (across 45,086 frames in 30 captures):
-        #   byte 0 = throttle pedal (raw, ~0..0x69)
+        #   byte 0 = throttle pedal (raw 0..0xFF)
         #   byte 1 = always 0x00 (reserved padding)
         #   bytes 2-3 = RPM magnitude (LE u16, biased)
         #   byte 4 = controller temp (J1939 +40 C offset, 0=absent)
@@ -1548,11 +1545,9 @@ def render_motor(state: State, now: float) -> Panel:
     if thr is None:
         t.add_row("throttle", Text("---", style="dim"))
     else:
-        # Byte 0 scaled per J1939 SPN 91 (0.4 %/bit, raw 250 = 100%) with
-        # a 3-unit idle dead-low subtracted (sensor noise with foot off).
-        # No upper clamp: a raw value above 250 renders as >100% rather
-        # than silently saturating (true full-scale is a guess pending
-        # ground truth).
+        # Raw 0..0xFF mapped to 0..100% with a 3-unit idle dead-low
+        # subtracted (sensor noise with foot off). No upper clamp: a raw
+        # value above 0xFF (shouldn't happen) would render as >100%.
         pct = max(0.0, (int(round(thr)) - THROTTLE_DEAD_LOW) * THROTTLE_PCT_PER_BIT)
         bar_w = 20
         filled = max(0, min(bar_w, int(round(pct * bar_w / 100))))
