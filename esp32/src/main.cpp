@@ -25,19 +25,11 @@
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-#ifndef WIFI_SSID
-#error "Set WIFI_SSID env var before building"
-#endif
-#ifndef WIFI_PASS
-#error "Set WIFI_PASS env var before building"
-#endif
-
 #define CAN_TX_PIN GPIO_NUM_8
 #define CAN_RX_PIN GPIO_NUM_14
 
-// WiFi runs in dual AP+STA mode: the board always broadcasts its own hotspot
-// (so it's reachable in the field), and concurrently tries to join the
-// configured home network for bench use. AP IP is 192.168.4.1.
+// WiFi runs as a soft-AP only — the board broadcasts its own hotspot and
+// clients (phone, laptop) join it directly. AP IP is 192.168.4.1.
 #define AP_SSID "solectrac"
 #define AP_PASS "electricity"
 
@@ -277,7 +269,7 @@ void updateLed() {
         ledWrite(g_led_on ? 32 : 0, 0, 0);
         return;
     }
-    if (!g_ap_running && WiFi.status() != WL_CONNECTED) {
+    if (!g_ap_running) {
         if (toggle) { g_led_last_toggle = now; g_led_on = !g_led_on; }
         ledWrite(g_led_on ? 24 : 0, g_led_on ? 12 : 0, 0);
         return;
@@ -903,12 +895,11 @@ void setup() {
         if (err == ESP_OK) g_can_initialized = true;
     }
 
-    // Bring up the soft-AP first so the board is always reachable in the field
-    // at 192.168.4.1 even if there's no home network in range. STA connect
-    // happens in the background; we don't block boot waiting on it.
-    WiFi.mode(WIFI_AP_STA);
+    // Soft-AP only: clients join the board's hotspot directly at 192.168.4.1.
+    // Disable modem sleep so the radio stays hot — saves ~50–150 ms per request
+    // at the cost of ~70 mA, fine on a tractor 12 V supply.
+    WiFi.mode(WIFI_AP);
     g_ap_running = WiFi.softAP(AP_SSID, AP_PASS);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
     WiFi.setSleep(WIFI_PS_NONE);
 
     // Wildcard DNS on the soft-AP: any hostname (solectrac.local, solectrac,
