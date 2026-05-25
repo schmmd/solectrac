@@ -429,10 +429,11 @@ Always read both bytes BE with the bias.
 
     SOC % = data[4] × 0.4 − 0.8
 
-calibrated against two direct dashboard-screen readings: raw 202 at
-80 % and raw 227 at 90 %. Slope = 10/25 = 0.4, intercept = −0.8. Raw
-saturates at 250 (= 99.2 %) in `soc-100-idle.asc`. Calibration points
-still sit in the top ~20 % of the range; linearity below 80 % wants a
+calibrated against three direct dashboard-screen readings: raw 177 at
+70 %, raw 202 at 80 %, and raw 227 at 90 %. Slope = 10/25 = 0.4,
+intercept = −0.8; all three points are exactly collinear. Raw
+saturates at 250 (= 99.2 %) in `soc-100-idle.asc`. Calibration still
+sits in the top ~30 % of the range; linearity below 70 % wants a
 deeper-discharge capture.
 
 **SOH candidate (data[5])** TENTATIVE. data[5] is 0xFA = 250 across
@@ -459,10 +460,26 @@ situation where SOH demonstrably differs from 100 % (older
 firmware/pack, or an injected spoof watched on the vendor GUI to
 verify the byte tracks).
 
-#### F104F3 — Pack temperature min/max summary
+#### F104F3 — Pack temperature min/max summary — CONFIRMED
 
-Pack-wide hottest/coldest module-temperature summary, analogous to
-F102. Byte-level decode UNKNOWN.
+Pack-wide hottest/coldest module-temperature summary, analogous to F102.
+
+| Byte | data[]  | Meaning                                          |
+|------|---------|--------------------------------------------------|
+| 1    | data[0] | **Max module temperature**: °C = raw − 40         |
+| 2    | data[1] | **Min module temperature**: °C = raw − 40         |
+| 3    | data[2] | Max-temp **probe number, 1-based**                |
+| 4    | data[3] | Min-temp **probe number, 1-based**                |
+| 5    | data[4] | **Temperature spread, °C** (max − min, no offset) |
+
+Cross-validated two ways:
+
+- Per-probe temperatures from F155..F15E reduce to the same max/min/spread
+  on every capture.
+- The BMS-internal peak DIDs 0x2830 (top-4 max temps, value byte at the
+  start of each 3-byte tuple) and 0x2838 (top-4 min temps) carry the same
+  values: F104F3 data[0] tracks 0x2830 top-1 raw value at r ≈ 1.0, and
+  F104F3 data[1] tracks 0x2838 top-1 raw value the same way.
 
 #### F106F3 — BMS state — TENTATIVE
 

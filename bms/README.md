@@ -283,6 +283,46 @@ These are polled by the iBMS but not yet mapped to a known UDAN message:
 
 ---
 
+## Cross-reference: DIDs mirrored on the vehicle J1939 bus
+
+Several pack-state DIDs the BMS publishes over the diagnostic port are
+also broadcast on the main vehicle CAN (OBD2 port) as J1939 PGNs from
+source-address 0xF3 (the BMS's own SA on the broadcast bus). See
+`DOCUMENTATION.md` "BMS (SA 0xF3)" for the full PGN decodes.
+
+Confirmed mirrors (correlation r ≈ 1.0 between the diagnostic-port DID
+value and the broadcast-frame byte across a time-synced dual-bus
+capture):
+
+| BMS-internal DID (diag port)               | Broadcast PGN (vehicle bus)          | Quantity                                  |
+|--------------------------------------------|--------------------------------------|-------------------------------------------|
+| `0x2800` bytes 0..1 BE (SOC × 10)          | `F100F3` data[4]                     | SOC                                       |
+| `0x2800` bytes 4..5 BE (HV1 / pack V × 10) | `F100F3` data[1]                     | Pack terminal voltage                     |
+| `0x2800` bytes 6..7 BE (pack current)      | `F100F3` data[2..3], `FF2112` data[0]| Signed pack current (motor ctlr mirrors)  |
+| `0x0101` (20 × cell mV, BE u16)            | `F113F3`..`F13CF3` (per-cell PGNs)   | Per-cell voltages                         |
+| `0x0102` (7 × probe T)                     | `F155F3`..`F15EF3` (per-probe PGNs)  | Module temperatures                       |
+| `0x2820` top-1 max-cell tuple              | `F102F3` data[1..2] BE + data[5]     | Max cell mV + 1-based cell number         |
+| `0x2828` top-1 min-cell tuple              | `F102F3` data[3..4] BE + data[6]     | Min cell mV + 1-based cell number         |
+| `0x2830` top-1 max-temp tuple              | `F104F3` data[0] + data[2]           | Max module °C + 1-based probe number      |
+| `0x2838` top-1 min-temp tuple              | `F104F3` data[1] + data[3]           | Min module °C + 1-based probe number      |
+| `0x4000` (alarms / active faults)          | `F108F3` (active fault bitmap)       | Fault flags (different encodings; see DOCUMENTATION.md)  |
+
+The diagnostic-port DIDs expose the **full** BMS internal state (cell
+extrema as top-4 sorted tuples, calibration tables, identity blocks,
+balancing/open-wire flags, etc.), while the J1939 broadcast surface
+only re-publishes the summary signals listed above. Anything in the
+"DIDs observed but not yet identified" section or the `0x30xx`/`0x40xx`
+calibration cluster has **no known broadcast equivalent**.
+
+Methodology: `util/capture_dual_can.py` records both buses to one
+ASC with a shared host clock; `util/correlate_did.py` walks every DID
+response and ranks per-byte Pearson correlation against every OBD2
+broadcast byte. The mirrors above all hit r ≈ 1.0; lower-confidence
+correlations are easily contaminated by mostly-static bytes in idle
+captures and are not listed.
+
+---
+
 ## Polling patterns
 
 | Phase                         | Frequency | DIDs                                                                  |
