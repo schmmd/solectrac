@@ -18,10 +18,10 @@ The default UDS session is read-only — no SecAccess unlock is required for
 any of the DIDs this tool reads.
 
 Usage:
-    ./solectrac-bms-diagnostics.py                          # canalystii ch0
-    ./solectrac-bms-diagnostics.py --interface socketcand   # solectrac.local
+    ./solectrac-bms-diagnostics.py                          # socketcand → solectrac.local
     ./solectrac-bms-diagnostics.py --interface socketcand \\
         --host solectrac.local --socketcand-port 28600 --channel can0
+    ./solectrac-bms-diagnostics.py --interface canalystii --channel 0
     ./solectrac-bms-diagnostics.py --interface slcan \\
         --channel /dev/tty.usbmodem1101
     ./solectrac-bms-diagnostics.py --replay data/bms/bms-screenshots.asc
@@ -784,22 +784,13 @@ def open_transport(args):
         return ReplayTransport(
             args.replay, speed=args.replay_speed, loop=not args.no_loop
         )
-    if args.interface == "canalystii":
-        bus = can.Bus(interface="canalystii", channel=args.channel_index, bitrate=BITRATE)
-        desc = f"canalystii ch{args.channel_index} @ {BITRATE // 1000} kbit/s"
-    elif args.interface == "socketcand":
-        bus = can.Bus(
-            interface="socketcand",
-            channel=args.channel,
-            host=args.socketcand_host,
-            port=args.socketcand_port,
-        )
-        desc = f"socketcand {args.socketcand_host}:{args.socketcand_port}/{args.channel}"
-    elif args.interface == "slcan":
-        bus = can.Bus(interface="slcan", channel=args.channel, bitrate=BITRATE)
-        desc = f"slcan {args.channel} @ {BITRATE // 1000} kbit/s"
-    else:
-        raise SystemExit(f"unknown interface: {args.interface}")
+    kwargs = dict(interface=args.interface, channel=args.channel, bitrate=BITRATE)
+    if args.host:
+        kwargs["host"] = args.host
+    if args.socketcand_port:
+        kwargs["port"] = args.socketcand_port
+    bus = can.Bus(**kwargs)
+    desc = f"{args.interface} {args.channel} @ {BITRATE // 1000} kbit/s"
 
     reader = None
     writer = None
@@ -1487,21 +1478,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # CAN backend
-    p.add_argument(
-        "--interface",
-        choices=("canalystii", "socketcand", "slcan"),
-        default="canalystii",
-        help="CAN backend (default: canalystii)",
-    )
-    p.add_argument("--channel-index", type=int, default=0,
-                   help="canalystii channel index (default: 0)")
-    p.add_argument("--socketcand-host", default="solectrac.local",
-                   help="socketcand host (default: solectrac.local)")
-    p.add_argument("--socketcand-port", type=int, default=28600,
-                   help="socketcand port (default: 28600)")
+    p.add_argument("--interface", default="socketcand",
+                   help="python-can interface (e.g. socketcand, canalystii, "
+                        "slcan; default: socketcand)")
     p.add_argument("--channel", default="can0",
-                   help="socketcand channel name or slcan serial device "
-                        "(default: can0 — for slcan use e.g. /dev/tty.usbmodem1101)")
+                   help="bus channel: socketcand channel name, canalystii "
+                        "channel index, or slcan serial device (default: can0)")
+    p.add_argument("--host", default="solectrac.local",
+                   help="remote host for network interfaces, e.g. socketcand "
+                        "(default: solectrac.local)")
+    p.add_argument("--socketcand-port", type=int, default=28600,
+                   help="socketcand port (default: 28600); HTTP server port "
+                        "is --port")
     p.add_argument("--rate", type=float, default=1.0,
                    help="polling rate in Hz (default: 1.0)")
     # Output recording
