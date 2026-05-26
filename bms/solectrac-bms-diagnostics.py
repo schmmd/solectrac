@@ -607,8 +607,10 @@ def decode_cells(data: bytes, st: BmsState):
 
 
 def decode_temps(data: bytes, st: BmsState):
-    # BMS.md: "°C = raw − 40" (TENTATIVE offset)
-    st.temp_c = [b - 40 for b in data]
+    # UDS DIDs use a +50 offset (UDAN-internal), not the SAE J1939 +40.
+    # Confirmed by disassembling main.U600TemperatureType.MarshalJSON in
+    # the iBMS PC Utility: `add eax, 0xffffffce` (= −50).
+    st.temp_c = [b - 50 for b in data]
 
 
 def decode_peak_v(data: bytes) -> list:
@@ -627,7 +629,7 @@ def decode_peak_t(data: bytes) -> list:
     for i in range(0, len(data), 3):
         if i + 3 > len(data):
             break
-        out.append((data[i] - 40, data[i + 1], data[i + 2]))
+        out.append((data[i] - 50, data[i + 1], data[i + 2]))
     return out
 
 
@@ -959,7 +961,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="sub" id="ov-cells-summary"></div>
     </div>
     <div class="panel" style="margin-top:12px;">
-      <h3>NTC temperatures (°C, raw − 40)</h3>
+      <h3>NTC temperatures (°C, raw − 50)</h3>
       <div class="temps" id="ov-temps"></div>
     </div>
     <div class="grid cols-2" style="margin-top:12px;">
