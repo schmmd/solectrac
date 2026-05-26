@@ -102,7 +102,7 @@ class MainActivity : AppCompatActivity(), BleClient.Listener {
         // Hide the half-rendered dashboard whenever we're not connected — show a
         // plain "Disconnected" overlay instead.
         b.disconnectedOverlay.visibility = if (connected) View.GONE else View.VISIBLE
-        b.disconnectedOverlay.text = when (state) {
+        b.disconnectedText.text = when (state) {
             BleClient.State.SCANNING   -> "Scanning…"
             BleClient.State.CONNECTING -> "Connecting…"
             BleClient.State.ERROR      -> "Disconnected"
