@@ -326,6 +326,12 @@ explicit `data[N]` (0-based) annotations where helpful.
     F117 = cells 16..19
     F118..F13C reserved (cells 20..167); 0xFFFF / 0 sentinel on this pack.
 
+Per-PGN cell index mapping cross-validated by Pearson correlation of
+each aligned u16 BE slot against the 20 cell mV values returned by
+DID `0x0101` over a drive cycle (n=794 paired samples, pack delta
+≥5 mV throughout, peak 11 mV): all 20 slots picked their natural-order
+PGN slot as the top match.
+
 Cells read ~3.6–3.7 V at ~40 % SOC, ~4.16 V/cell at 100 %.
 
 #### F155..F15E — Module temperatures — CONFIRMED
@@ -606,7 +612,7 @@ telemetry) and FECA (DM1, fault codes). FF21CA is suppressed entirely
 while charging — the controller goes silent when traction contactors
 (Albright SW200) are open.
 
-#### FF21CA — Motor telemetry — CONFIRMED (RPM, throttle, temp, state)
+#### FF21CA — Motor telemetry — CONFIRMED (RPM, throttle, temps, state)
 
 Broadcast at ~85 Hz. Full 29-bit ID is `0x0CFF21CA` (priority 3, not
 the default 6 — higher priority than BMS broadcasts, consistent with a
@@ -617,8 +623,8 @@ real-time inverter feed).
 | 1    | data[0]       | Throttle pedal position, raw 0..0xFF                              |
 | 2    | data[1]       | 0x00 constant — fault-bitmap candidate (UNKNOWN)                  |
 | 3..4 | data[2..3] LE | **Motor RPM**: rpm = (le16) − 0x0C80                       |
-| 5    | data[4]       | **Controller temperature**: °C = raw − 40 (TENTATIVE)             |
-| 6    | data[5]       | **Motor temperature**: °C = raw − 40 (TENTATIVE)                  |
+| 5    | data[4]       | **Controller temperature**: °C = raw − 40                          |
+| 6    | data[5]       | **Motor temperature**: °C = raw − 40                               |
 | 7    | data[6]       | 0x00 constant — fault-bitmap candidate (UNKNOWN)                  |
 | 8    | data[7]       | **Packed transmission state** (high nibble = range, low = F/N/R)  |
 
@@ -643,10 +649,27 @@ reverse-speed limiter applied before the byte goes on the wire. Idle
 resting offset ~3 (sensor noise); below raw ~14 the controller's dead
 band keeps RPM near 0.
 
-**Controller and motor temperatures (data[4], data[5]) — TENTATIVE.** Both u8 with
+**Controller and motor temperatures (data[4], data[5]) — CONFIRMED.** Both u8 with
 the J1939 −40 °C offset. Raw 0 = not present (suppressed). data[4] is
 the Curtis 1238E controller (inverter electronics) and data[5] is the
 traction motor housing.
+
+Confirmed by thermal-response signature over a 24-minute sustained-load
+capture (highway-gear drive + mowing) with BMS pack temperature pinned
+at 15 °C the whole time:
+
+- data[4] rose 19 → 32 °C (+13 °C), data[5] rose 15 → 23 °C (+8 °C).
+  Both monotonic with load — rules out non-thermal interpretations
+  (counter, status, gear).
+- data[4] responds tick-by-tick to load (25–28 °C oscillation during
+  heavy work) and reaches the higher peak; data[5] is smoother and
+  trails. That matches a small inverter heatsink (fast thermal time
+  constant, higher steady-state) vs. a large motor housing (slow time
+  constant, cooler) — confirming the label assignment.
+- Starting values land at ambient (data[5] = 15 °C = pack temp;
+  data[4] a few °C warm from prior idle), and peaks stay well below
+  the fault thresholds (75 °C controller, 125 °C motor) — confirming
+  the +40 offset.
 
 **Packed transmission state (data[7]).**
 
@@ -897,6 +920,7 @@ off-highway cluster, also marketed under COBO's "Unideck" sub-brand).
 | Software revision                 | 102                         |
 | Year of manufacture               | 2022 (Solectrac label 2021-08-23) |
 | Display                           | 128 × 64 dot-matrix LCD + 2 cross-coil gauges + 21 LEDs |
+| LCD temperature readout           | Pack temp from F104F3 data[0] (BMS max module temp, °C) |
 | Housing                           | 230 × 120 mm                |
 | Supply                            | 12 V (accessory)            |
 | Protocols                         | CAN J1939 / ISOBUS          |
