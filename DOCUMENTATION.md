@@ -117,8 +117,8 @@ A and C are switched/unswitched +12 V (DTCs 140/142/143/144 all
 prescribe "12 V between A↔B and C↔B" as the integrity check). The
 remaining field-connector pins F/G/H/J/K/L are unassigned in
 troubleshooting steps and are the most likely physical home of the
-**second (debug) CAN pair** — see "Second 2-pin CAN port" under the
-CAN topology section.
+**second (diagnostics) CAN pair** — see "Second 2-pin CAN port" under
+the CAN topology section.
 
 Schematic 5.7 in the FT 25G service manual uses BMS-internal terminal letters
 that do **not** map 1:1 to the field connector — it shows main CAN on pins H/J
@@ -235,15 +235,13 @@ draws. Unplugging the BMS field connector raises the reading to the textbook
 **60 Ω**, confirming the extra terminator is **internal to the BMS**. Drivers
 tolerate the 3-terminator config and captures are clean.
 
-### Second 2-pin CAN port
+### Second 2-pin CAN port — BMS diagnostics bus — CONFIRMED
 
-A separate 2-pin connector on the tractor remains un-tapped. The
-leading hypothesis is that it carries the **BMS debug CAN** pair shown
-on schematic 5.7 as `CANDE-H` / `CANDE-L`, explicitly labelled "TO
-BMS DEBUG CONNECTOR PIN-1 / PIN-2". The BMS thus exposes two CAN
-pairs: the main vehicle bus (above) and this debug pair. If tapped,
-expect BMS-internal diagnostic chatter — likely the same protocol that
-the host-side **UDAAN** tool consumes.
+A separate 2-pin connector on the tractor carries the **BMS
+diagnostics bus** — shown on schematic 5.7 as `CANDE-H` / `CANDE-L`,
+labelled "TO BMS DEBUG CONNECTOR PIN-1 / PIN-2". The BMS exposes two
+CAN pairs: the main vehicle bus (above) and this diagnostics pair. It
+is the channel the host-side **UDAAN** tool consumes.
 
 **Resistance confirms it is a separate, BMS-only bus.** Measured
 key-off with nothing plugged in, the 2-pin connector reads **120 Ω
@@ -254,10 +252,20 @@ conditions, §"Bus termination" above). Unplugging the BMS field
 connector causes the 2-pin reading to go **open** (overload), which
 proves the only node electrically present on that pair is the BMS —
 no other module in the harness taps it. The single 120 Ω is therefore
-the BMS's internal terminator on its debug pair, and the 2-pin
+the BMS's internal terminator on its diagnostics pair, and the 2-pin
 connector is its physical termination at the harness end (no second
 terminator until a tool is plugged in). All consistent with the
-schematic 5.7 `CANDE-H`/`CANDE-L` debug-pair interpretation.
+schematic 5.7 `CANDE-H`/`CANDE-L` diagnostics-pair interpretation.
+
+**Traffic content matches the same picture.** Time-synced dual-bus
+captures (diagnostics + main) show the diagnostics pair carries only
+UDS traffic to the BMS (request `0x740`, response `0x748`) plus a
+single all-zero `0x7FD` frame at each key-on (origin UNKNOWN); zero
+J1939 broadcasts appear on it. The main vehicle bus carries zero UDS
+frames — `0x740`/`0x748` are exclusive to the diagnostics pair. UDS
+responses only occur with the key on, and stop a few seconds after
+key-off. Full UDS protocol, DID map, and bootstrap details are in
+[`bms/README.md`](bms/README.md).
 
 ## J1939 decodings
 
@@ -890,7 +898,8 @@ real, three possibilities:
 2. 0xD0 / 0xF4 are *logical* source addresses emitted by one of the
    four documented nodes (cluster is the natural candidate — it
    aggregates accessory state).
-3. The frames are bridged from the BMS debug CAN by the BMS firmware.
+3. The frames are bridged from the BMS diagnostics bus by the BMS
+   firmware.
 
 Service manual schematic **5.9 (Seat OPC)** wires the OPC entirely
 through discrete signals (CSS, DIS, CT, charge-drive interlock relay,
@@ -1168,11 +1177,10 @@ Code 51 is listed out of numeric order in the manual.
 - **Full running-mode enumeration.** Vendor GUI implies at least
   Calibrating, Charging, Discharging, Fault, Sleep beyond the
   init/standby/ready states observed.
-- **Second 2-pin CAN port — traffic content unknown.** Identified as
-  the BMS debug pair via schematic 5.7 + 120 Ω measurement (see the
-  "Second 2-pin CAN port" section in CAN bus topology). What's on the
-  wire hasn't been captured — confirmation = tap the connector and
-  see if it resembles BMS-internal diagnostic chatter.
+- **0x7FD wake frame on the BMS diagnostics bus.** One 8-byte all-zero
+  frame at CAN ID `0x7FD` appears on the diagnostics pair within ~10 ms
+  of each key-on (not at key-off). Origin and purpose UNKNOWN; ID is
+  outside the standard OBD-II `0x7E0`–`0x7EF` range.
 - **UDAAN tool — identified, downloadable; one practical blocker.**
   UDAAN is the **UDAN iBMS Upper Utility** from Anhui UDAN Technology
   Co., Ltd. (Chinese BMS firmware/tool vendor; the physical pack is
