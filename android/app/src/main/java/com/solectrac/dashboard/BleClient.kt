@@ -48,7 +48,6 @@ class BleClient(
     private val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? = btManager.adapter
 
-    private var scanner = adapter?.bluetoothLeScanner
     private var scanCallback: ScanCallback? = null
     private var gatt: BluetoothGatt? = null
     private var txChar: BluetoothGattCharacteristic? = null
@@ -90,7 +89,9 @@ class BleClient(
     // ── Scanning ──────────────────────────────────────────────────────────────
 
     private fun beginScan() {
-        val s = scanner
+        // Re-fetch scanner each time: BT stack restarts or adapter toggles can
+        // invalidate the cached reference, leading to silent scan failures.
+        val s = adapter?.bluetoothLeScanner
         if (adapter?.isEnabled != true || s == null) {
             notifyState(State.ERROR, "Bluetooth off")
             return
@@ -107,18 +108,30 @@ class BleClient(
         val cb = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val dev = result.device ?: return
+                // Guard against duplicate results racing into connectTo.
+                if (gatt != null) return
                 Log.i(TAG, "Found ${dev.address} rssi=${result.rssi}")
                 stopScanInternal()
                 connectTo(dev)
             }
             override fun onScanFailed(errorCode: Int) {
+                Log.w(TAG, "Scan failed code=$errorCode")
+                stopScanInternal()
+                wantConnected = false
                 notifyState(State.ERROR, "Scan failed ($errorCode)")
-                scheduleReconnect()
             }
         }
         scanCallback = cb
         notifyState(State.SCANNING, "Scanning for solectrac…")
-        s.startScan(listOf(filter), settings, cb)
+        try {
+            s.startScan(listOf(filter), settings, cb)
+        } catch (t: Throwable) {
+            Log.w(TAG, "startScan threw", t)
+            scanCallback = null
+            wantConnected = false
+            notifyState(State.ERROR, "Scan start failed")
+            return
+        }
 
         // Safety timeout: stop scan after 20 s and back off.
         handler.postDelayed(scanTimeout, 20_000)
@@ -127,14 +140,18 @@ class BleClient(
     private val scanTimeout = Runnable {
         if (gatt == null && wantConnected) {
             stopScanInternal()
+            // No auto-retry: device may simply be off. Wait for the user to
+            // tap Scan rather than burning battery scanning forever.
+            wantConnected = false
             notifyState(State.DISCONNECTED, "No device found")
-            scheduleReconnect()
         }
     }
 
     private fun stopScanInternal() {
         handler.removeCallbacks(scanTimeout)
-        scanCallback?.let { scanner?.stopScan(it) }
+        scanCallback?.let { cb ->
+            try { adapter?.bluetoothLeScanner?.stopScan(cb) } catch (_: Throwable) {}
+        }
         scanCallback = null
     }
 
